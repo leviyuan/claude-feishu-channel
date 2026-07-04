@@ -1839,7 +1839,10 @@ export class Session {
       this.handleContextCompacted(notice)
     })
     p.on('rate_limits_updated', (rateLimits: any) => {
-      updateUsageFromRateLimits(rateLimits)
+      // usage.ts 的缓存是 codex 专属(planType/primary/secondary 形状)。claude
+      // 的 rate_limit_info 形状不同但同样 truthy,写入会把 codex 快照覆盖成
+      // 全 null 的假 ok 数据 —— 只放行 codex 进程的事件。
+      if (p.provider === 'codex') updateUsageFromRateLimits(rateLimits)
     })
     p.on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)

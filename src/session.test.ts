@@ -9,6 +9,7 @@ const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
 const { fixedModelChoices, normalizeFixedModelSelection } = await import('./session-model')
 const { config } = await import('./config')
+const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
 interface FetchCall {
   method: string
@@ -853,5 +854,41 @@ describe('Session SDK-initiated bg-task resume turns', () => {
 
     expect(session.orphanAssistantSegments).toEqual([])
     expect(session.orphanAssistantCurrent).toBe('')
+  })
+})
+
+describe('Session usage cache cross-backend isolation', () => {
+  test('claude 的 rate_limit_event payload 不得覆盖 codex 用量缓存', () => {
+    // 先用一条 codex 形状的 payload 播种缓存(模块级单例)。
+    const seeded = updateUsageFromRateLimits({
+      planType: 'plus',
+      primary: { usedPercent: 42, resetsAt: 1_700_000_000, windowDurationMins: 300 },
+    })
+    expect(seeded.state).toBe('ok')
+
+    const session = new Session('probe', 'chat_id') as any
+    const claudeProc = new FakeAgentProc('claude')
+    session.wireProc(claudeProc)
+    // claude 的 rate_limit_info 形状(无 planType/primary/secondary):
+    // truthy 但与 codex 完全不同,穿过共享 handler 会被包成空窗口 ok 快照。
+    claudeProc.emit('rate_limits_updated', { status: 'allowed', unified_status: 'allowed' })
+
+    // 缓存对象必须原封不动(恒等,而非结构相等)。
+    expect(peekUsage()).toBe(seeded)
+  })
+
+  test('codex 的 rate_limits_updated 照常更新用量缓存', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const codexProc = new FakeAgentProc('codex')
+    session.wireProc(codexProc)
+    codexProc.emit('rate_limits_updated', {
+      planType: 'pro',
+      primary: { usedPercent: 7, resetsAt: 1_700_000_000, windowDurationMins: 300 },
+    })
+
+    const snap = peekUsage() as any
+    expect(snap?.state).toBe('ok')
+    expect(snap?.subscriptionType).toBe('pro')
+    expect(snap?.fiveHour?.percent).toBe(7)
   })
 })
