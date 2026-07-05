@@ -460,12 +460,45 @@ export const CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS = true
 /** Default setting sources when no project profile overrides them. */
 const DEFAULT_SETTING_SOURCES: readonly string[] = ['user']
 
+/** Valid SDK setting sources; anything else in an explicit list is dropped. */
+const VALID_SETTING_SOURCES = new Set(['user', 'project', 'local'])
+
 /** Resolve SDK `settingSources` from a project profile's comma-separated
- * string (e.g. `"project"`), falling back to `['user']`. */
-export function settingSourcesFromProfile(profile: ProjectProfile | undefined): string[] {
-  if (!profile?.settingSources) return [...DEFAULT_SETTING_SOURCES]
-  const list = profile.settingSources.split(',').map(s => s.trim()).filter(Boolean)
-  return list.length ? list : [...DEFAULT_SETTING_SOURCES]
+ * string. Falls back to `['user']`.
+ *
+ * Special value `auto` (exclusive — may appear in a list but ignores the rest):
+ * if `<workDir>/.claude` or `<workDir>/CLAUDE.md` exists, expand to
+ * `['user','project','local']` (parity with launching claude in that dir);
+ * otherwise `['user']`. Both branches keep `user`, so `auto` never triggers the
+ * project-only "dropped ~/.claude/settings.json → hang" trap.
+ *
+ * Explicit lists are whitelist-filtered to valid sources; unknown tokens are
+ * dropped (logged), never forwarded to the SDK. */
+export function settingSourcesFromProfile(
+  profile: ProjectProfile | undefined,
+  workDir?: string,
+): string[] {
+  const raw = profile?.settingSources
+  if (!raw) return [...DEFAULT_SETTING_SOURCES]
+  const tokens = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  if (tokens.length === 0) return [...DEFAULT_SETTING_SOURCES]
+
+  if (tokens.includes('auto')) {
+    const extra = tokens.filter(t => t !== 'auto')
+    if (extra.length) {
+      log(`claude-agent-process: setting_sources "auto" is exclusive — ignoring [${extra.join(',')}]`)
+    }
+    const hasProjectConfig = !!workDir
+      && (existsSync(join(workDir, '.claude')) || existsSync(join(workDir, 'CLAUDE.md')))
+    return hasProjectConfig ? ['user', 'project', 'local'] : ['user']
+  }
+
+  const valid = tokens.filter(t => VALID_SETTING_SOURCES.has(t))
+  const dropped = tokens.filter(t => !VALID_SETTING_SOURCES.has(t))
+  if (dropped.length) {
+    log(`claude-agent-process: setting_sources dropping unknown token(s) [${dropped.join(',')}]`)
+  }
+  return valid.length ? valid : [...DEFAULT_SETTING_SOURCES]
 }
 
 /** Resolve SDK `tools` from a project profile's comma-separated built-in
@@ -662,7 +695,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? false} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
     }
-    const settingSources = settingSourcesFromProfile(profile)
+    const settingSources = settingSourcesFromProfile(profile, this.opts.workDir)
     const toolsOption = toolsFromProfile(profile)
     const strictMcpConfig = profile?.strictMcp === true
     const mcpServers = profile?.loadProjectMcp ? readProjectMcpServers(this.opts.workDir) : undefined

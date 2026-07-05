@@ -1,7 +1,7 @@
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, writeFileSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
   config: {
@@ -825,6 +825,18 @@ describe('Claude transcript context tokens', () => {
 })
 
 describe('Claude project profile overrides', () => {
+  const ssTmpDirs: string[] = []
+  function tmpProjectDir(entries: { claudeDir?: boolean; claudeMd?: boolean } = {}): string {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-ss-'))
+    ssTmpDirs.push(dir)
+    if (entries.claudeDir) mkdirSync(join(dir, '.claude'))
+    if (entries.claudeMd) writeFileSync(join(dir, 'CLAUDE.md'), '# proj\n')
+    return dir
+  }
+  afterAll(() => {
+    for (const d of ssTmpDirs) rmSync(d, { recursive: true, force: true })
+  })
+
   test('settingSourcesFromProfile falls back to user when absent', () => {
     expect(settingSourcesFromProfile(undefined)).toEqual(['user'])
     expect(settingSourcesFromProfile({})).toEqual(['user'])
@@ -838,6 +850,41 @@ describe('Claude project profile overrides', () => {
   test('settingSourcesFromProfile falls back when only blanks given', () => {
     expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user'])
     expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user'])
+  })
+
+  test('settingSourcesFromProfile auto detects project .claude → three sources', () => {
+    const dir = tmpProjectDir({ claudeDir: true })
+    expect(settingSourcesFromProfile({ settingSources: 'auto' }, dir)).toEqual(['user', 'project', 'local'])
+  })
+
+  test('settingSourcesFromProfile auto detects CLAUDE.md → three sources', () => {
+    const dir = tmpProjectDir({ claudeMd: true })
+    expect(settingSourcesFromProfile({ settingSources: 'auto' }, dir)).toEqual(['user', 'project', 'local'])
+  })
+
+  test('settingSourcesFromProfile auto with no project config → user', () => {
+    const dir = tmpProjectDir()
+    expect(settingSourcesFromProfile({ settingSources: 'auto' }, dir)).toEqual(['user'])
+  })
+
+  test('settingSourcesFromProfile auto without workDir → user', () => {
+    expect(settingSourcesFromProfile({ settingSources: 'auto' })).toEqual(['user'])
+  })
+
+  test('settingSourcesFromProfile AUTO is case-insensitive', () => {
+    const dir = tmpProjectDir({ claudeDir: true })
+    expect(settingSourcesFromProfile({ settingSources: 'AUTO' }, dir)).toEqual(['user', 'project', 'local'])
+  })
+
+  test('settingSourcesFromProfile "auto,project" stays auto (never drops user)', () => {
+    const hit = tmpProjectDir({ claudeDir: true })
+    expect(settingSourcesFromProfile({ settingSources: 'auto,project' }, hit)).toEqual(['user', 'project', 'local'])
+    const miss = tmpProjectDir()
+    expect(settingSourcesFromProfile({ settingSources: 'auto,project' }, miss)).toEqual(['user'])
+  })
+
+  test('settingSourcesFromProfile drops unknown tokens via whitelist', () => {
+    expect(settingSourcesFromProfile({ settingSources: 'user,bogus' })).toEqual(['user'])
   })
 
   test('toolsFromProfile falls back to claude_code preset when absent', () => {
