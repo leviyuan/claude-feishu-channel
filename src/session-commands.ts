@@ -206,12 +206,15 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       return true
     case 'restart':
       // rs 优化:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true),它已
-      // resetBackgroundTasks);空闲 = 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。
-      if (!s.isRunning()) {
+      // resetBackgroundTasks);claude 空闲 = 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。
+      // codex 空闲:codex 无 transcript,showResumeList→listClaudeSessions/onResumeSelect 是
+      // claude-only(列不出 codex 会话、点任何项也被 provider 拦死),直接 fall-through 走
+      // restart(true) resume 已按 provider 持久化的 lastSessionId(getSessionResume)。
+      if (!s.isRunning() && s.selectedProvider !== 'codex') {
         await s.showResumeList()
         return true
       }
-      // 进行中:resume the prior conversation — kills the current proc and
+      // 进行中 / codex 空闲:resume the prior conversation — kills the current proc and
       // spawns a new one with `--resume <lastSessionId>`(放弃后台进程)。
       {
         const resumeThreadLabel = s.lastSessionId ? s.lastSessionId.slice(0, 8) : ''

@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-07-08 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-07-23 -->
 
 # src
 
@@ -34,6 +34,13 @@
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`permissionMode: default` + `canUseTool` 回调：`AskUserQuestion` 经 canUseTool 下发、host 拦下渲染卡片并回填 answers，其余工具秒放（复刻旧 bypassPermissions「不弹审批」语义；bypassPermissions 会 shadow canUseTool，AskUserQuestion 就废了）；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |
 | `claude-models.ts` | Claude model profile：内置 `glm`（GLM-5.2）一项，可被 `config.toml` 的 `[claude.models.*]` 覆盖/新增；`resolveClaudeSdkModel` 把 `claude:glm` 映射为 SDK 主模型 `opus` alias，真实上游模型（GLM-5.2/4.7）由 `~/.claude/settings.json` 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。 |
+| `token-source.ts` | Token Source 抽象层 —— agent 的额度/凭据来源真相源；声明式 provider：每个 source 是自包含模块（`token-source-<name>.ts`），加载即 `registerTokenSourceFactory` 登记；对外 `spawnEnv`/`resolveSpawnModel`/`readUsage`。加新 source = 新建模块 + builtins import 一行，不改枚举。 |
+| `token-source-builtins.ts` | 遍历 factory registry 从 `config` 构建 token sources（声明式）；import 各 provider 模块即触发注册，registry 可经 `reloadTokenSources` 热更新。 |
+| `token-source-codex.ts` | Codex 订阅 token source（ChatGPT login）；模型走 app-server `model/list`，额度走 account/rateLimits，enabled = `~/.codex/auth.json` 在。 |
+| `token-source-glm.ts` | GLM Coding Plan token source（anthropic 兼容端点）；模型走 `/v1/models`（GLM-5.2 加 `[1m]` 给 1M），额度走 quota/limit，enabled = config 有 base_url+token。 |
+| `token-source-models.ts` | 统一拉取订阅真实模型列表（codex `model/list` / glm `/v1/models`），失败抛错 → 调用方按 MISS 留空，绝不假数据。 |
+| `token-source-config.ts` | `config.toml` `[token_source.*]` 节的读写持久化层；改完 `reloadTokenSources` + `buildTokenSourcesFromConfig` 热更新 registry，不重启 daemon、不依赖 SSH。 |
+| `token-source-setup.ts` | 未配置 source 的「启用」入口（model 面板）：glm 引导发 `glm-setup <base_url> <token>`、codex 引导服务器 `codex login`；`glm-setup` 写 config + 热更新 + 刷 models。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
 | `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、task 和元素 ID 工具。 |
@@ -55,6 +62,7 @@
 | `glm-usage.ts` | GLM Coding Plan 用量快照（给 `hi` console 的 Claude/GLM 后端用）：直打 GLM 官方 `quota/limit` monitor API，凭据从 `~/.claude/settings.json` 的 env 读 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 判平台（open.bigmodel.cn / api.z.ai）；无凭据/非 GLM/限流/网络各自显式 MISS，绝不假数据，与 `usage.ts` 的 snapshot 模式对齐。 |
 | `sysinfo.ts` | 读取主机 CPU、内存、磁盘和 AI 相关 systemd service 状态，供控制台卡片展示。 |
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
+| `rollback-watchdog.ts` | Dead-man's switch（restart 自救）：restart 前用 systemd-run 起独立看门狗 unit（30min 倒计时，到点 `git reset --hard` + restart feishu-daemon）；会话 init 成功时 `clearRollbackWatchdog` 停掉它；防「新代码让会话起不来 → 飞书通道断 → 救不回」。 |
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |
 | `outbound-markers.ts` | 解析 assistant 输出中的 `[[send: /abs/path]]` 附件发送标记。 |
 | `inbound-markers.ts` | 与 `outbound-markers.ts` 对称,解析用户入站消息里的多条消息起始/收尾标记:`>>>`(≥3) 开始收集、`<<<`(≥3) 收尾合并,标记前缀从 body 去掉不转发给 agent;阈值 ≥3 是用户确认的本意(普通 `>`/`>>` 引用不误触,三级嵌套引用 `>>>` 会——可接受)。 |
