@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-07-23 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-07-26 -->
 
 # src
 
@@ -16,7 +16,7 @@
 | `session-agy.ts` | `agy <prompt>` 外部任务生命周期：进程启动/停止、stdout/stderr 捕获、状态卡更新、仓库快照和转发 Codex。 |
 | `session-worktree.ts` | `wt` session 侧编排：项目名/目录约定、额外 worktree instructions 注入、列表卡、建群/入群和解散回调。 |
 | `session-tasklist.ts` | `task` 面板的 session 回调：启用项目任务清单、删除确认和面板重绘。 |
-| `session-model.ts` | `model` 面板流程：通过 Codex app-server 动态拉取模型列表、选择模型和 reasoning effort、持久化 session 选择。 |
+| `session-model.ts` | `model` 三级面板流程（账号 → 模型 → effort）：账号和模型列表来自 `listTokenSources()`（声明式 token sources，非固定枚举）。`showModelPanel` 发第 1 级（账号）、`onProviderSelect` 发第 2 级（该账号模型）、`onModelSelect` 进第 3 级（effort）、`onModelEffortSelect` 落选并 `setModelSettings` 热切换 + `applyModelSelection` 持久化；同 provider 切 model/effort 不重启，跨 provider / Claude profile 变更在 turn 进行或排队时拒绝。 |
 | `session-compact.ts` | 手动 `compact` 命令流程：发起 app-server 上下文压缩、监听完成事件和 token usage 快照、更新状态卡。 |
 | `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑。 |
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
@@ -37,7 +37,8 @@
 | `token-source.ts` | Token Source 抽象层 —— agent 的额度/凭据来源真相源；声明式 provider：每个 source 是自包含模块（`token-source-<name>.ts`），加载即 `registerTokenSourceFactory` 登记；对外 `spawnEnv`/`resolveSpawnModel`/`readUsage`。加新 source = 新建模块 + builtins import 一行，不改枚举。 |
 | `token-source-builtins.ts` | 遍历 factory registry 从 `config` 构建 token sources（声明式）；import 各 provider 模块即触发注册，registry 可经 `reloadTokenSources` 热更新。 |
 | `token-source-codex.ts` | Codex 订阅 token source（ChatGPT login）；模型走 app-server `model/list`，额度走 account/rateLimits，enabled = `~/.codex/auth.json` 在。 |
-| `token-source-glm.ts` | GLM Coding Plan token source（anthropic 兼容端点）；模型走 `/v1/models`（GLM-5.2 加 `[1m]` 给 1M），额度走 quota/limit，enabled = config 有 base_url+token。 |
+| `token-source-glm.ts` | GLM Coding Plan token source（anthropic 兼容端点）；模型走 `/v1/models`（GLM-5.2 spawn 加 `[1m]` 给 1M），额度走 `quota/limit`，enabled 由 `resolveClaudeGlm` 判定（config.toml `[token_source.glm]` > settings.json env，与 `claude-native` 兜底 source 共享同一真相源、严格互斥）。 |
+| `token-source-native.ts` | Claude 本机兜底 token source —— 「装上即用」的默认通路。与 GLM source 严格互斥：本机命中 GLM（`resolveClaudeGlm` 为 true）时自禁用让位，否则启用代表「直接用本机 Claude Code 配置裸跑」（真 Anthropic / DeepSeek / 中转站 / 裸机都直接可用，不报「未配置」）。`spawnEnv` 零注入透传、`models` 是 SDK alias 四档（fable/opus/sonnet/haiku，具体模型由 settings.json 的 `ANTHROPIC_DEFAULT_*_MODEL` 解析）、`readUsage` 显式 `not_applicable` 绝不假数据。 |
 | `token-source-models.ts` | 统一拉取订阅真实模型列表（codex `model/list` / glm `/v1/models`），失败抛错 → 调用方按 MISS 留空，绝不假数据。 |
 | `token-source-config.ts` | `config.toml` `[token_source.*]` 节的读写持久化层；改完 `reloadTokenSources` + `buildTokenSourcesFromConfig` 热更新 registry，不重启 daemon、不依赖 SSH。 |
 | `token-source-setup.ts` | 未配置 source 的「启用」入口（model 面板）：glm 引导发 `glm-setup <base_url> <token>`、codex 引导服务器 `codex login`；`glm-setup` 写 config + 热更新 + 刷 models。 |
@@ -59,7 +60,7 @@
 | `update-cli.ts` | `lodestar-update` 入口，封装 npm 更新逻辑并检查 daemon 状态。 |
 | `version-cli.ts` | `lodestar-version` 入口，输出 Lodestar 和 Codex CLI 版本。 |
 | `usage.ts` | 临时 app-server 请求 Codex/ChatGPT 使用额度；保留最新快照，只在收到新值时覆盖。 |
-| `glm-usage.ts` | GLM Coding Plan 用量快照（给 `hi` console 的 Claude/GLM 后端用）：直打 GLM 官方 `quota/limit` monitor API，凭据从 `~/.claude/settings.json` 的 env 读 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 判平台（open.bigmodel.cn / api.z.ai）；无凭据/非 GLM/限流/网络各自显式 MISS，绝不假数据，与 `usage.ts` 的 snapshot 模式对齐。 |
+| `glm-usage.ts` | GLM Coding Plan 用量快照（给 `hi` console 的 Claude/GLM 后端用）：直打 GLM 官方 `quota/limit` monitor API，凭据从 `~/.claude/settings.json` 的 env 读 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 判平台（open.bigmodel.cn / api.z.ai）；无凭据/非 GLM/限流/网络各自显式 MISS，绝不假数据，与 `usage.ts` 的 snapshot 模式对齐。同时是 GLM 启用判定的**单一真相源**：导出 `resolveClaudeGlm`（config.toml `[token_source.glm]` > settings.json env，base_url 须命中 `isGlmBaseUrl` 才启用）与 `readClaudeSettingsEnv`，供 GLM source 与 `claude-native` 兜底 source 共享，保证两者严格互斥。 |
 | `sysinfo.ts` | 读取主机 CPU、内存、磁盘和 AI 相关 systemd service 状态，供控制台卡片展示。 |
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
 | `rollback-watchdog.ts` | Dead-man's switch（restart 自救）：restart 前用 systemd-run 起独立看门狗 unit（30min 倒计时，到点 `git reset --hard` + restart feishu-daemon）；会话 init 成功时 `clearRollbackWatchdog` 停掉它；防「新代码让会话起不来 → 飞书通道断 → 救不回」。 |
@@ -84,7 +85,7 @@
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
 - `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
-- `model` 命令为固定二元选项(codex=gpt-5.5/xhigh、claude=claude:glm/max),effort 锁死一键生效,不动态拉取 `model/list`。
+- `model` 命令是三级动态面板(账号 → 模型 → effort),账号和模型列表来自 `listTokenSources()`(声明式 token sources):codex 订阅走 app-server `model/list`、glm 走 `/v1/models`、native 是静态 SDK alias 四档。`native` 兜底项仅在 enabled(本机未命中 GLM)时露面,否则不显示灰项干扰选择。同 provider 切 model/effort 走 `setModelSettings` 热切换不重启,跨 provider 或 Claude profile(model/source)变更在 turn 进行/排队时拒绝。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
 - 处理附件、文件返回和项目目录时使用 `feishu.ts` 里的 sanitizer、upload/download/provision helper。

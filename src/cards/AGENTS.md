@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-07-08 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-07-26 -->
 
 # cards
 
@@ -14,7 +14,7 @@
 | `tool.ts` | 工具折叠面板、权限按钮、Read 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
 | `task-board.ts` | Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex 的 TodoWrite 一次就带完整列表,但 Claude Code 拆成 4 个单点工具,这里维护一份以 task id 为 key 的 board(`applyTaskTool` 跨调用累积),`taskBoardElement` 渲染整个板产出与 codex 一致的列表效果。board 由 `session-tools.ts` 在 Session 级持有。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
-| `console.ts` | `hi` 控制台、状态卡、菜单卡、模型/effort 选择卡、额度/主机信息格式化和关闭 streaming 设置。 |
+| `console.ts` | `hi` 控制台、状态卡、菜单卡、`model` 三级选择卡（`providerSelectionCard` 选账号 → `modelSelectionCard` 选模型 → `modelEffortSelectionCard` 选 effort → `modelResultCard` 结果，账号/模型列表由 `session-model.ts` 从 token sources 传入）、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
 | `task.ts` | `task` 清单面板卡，展示项目、清单名、绑定 GUID、分组状态、清单链接，以及启用/删除/确认删除按钮。 |
 | `background.ts` | SDK `task_*` 消息族(子 agent / 后台 bash / MCP / workflow)的状态累积 + 「后台游标卡」渲染:active/pending 双池(workflow/monitor 白名单 task_started 直入 active,其余前台 task 进 pending,对话推进时提升),吸附对话末尾,被新消息超越时沉降为历史快照,全终态固化留在原地。 |
@@ -38,7 +38,7 @@
 ### Working In This Directory
 - 保持 schema 2.0 JSON 结构清晰，所有共享 `element_id` 都从 `ELEMENTS` 取值，避免手写重复 ID。
 - 工具摘要和工具面板渲染集中在 `tool.ts`；新增工具类型时先更新摘要/正文渲染，再在 session 工具流程中接线。
-- 模型选择卡使用单个可替换的 `model_panel`，流程是模型列表面板 → effort 面板 → 成功结果面板。
+- 模型选择卡使用单个可替换的 `model_panel`，流程是账号面板 → 模型列表面板 → effort 面板 → 成功结果面板（三级选择 + 结果，账号/模型列表由 `session-model.ts` 从 token sources 传入）。
 - Bash 工具摘要会解析第一行 shell 注释里的 `desc` / `说明`；修改这段逻辑会影响飞书卡片中 shell 命令的可读性。
 - 控制台卡片中的 usage、context window、host info 都是传入快照的格式化结果，不要在卡片模板里发起网络或系统调用。
 - `worktree.ts` 的列表卡要优先适配手机宽度，按钮文本保持短，避免把操作按钮藏进折叠面板；已合并且未挂载的分支只放入归档摘要。
@@ -61,7 +61,7 @@
 - 工具面板以折叠 panel 展示 header 摘要，正文按工具类型渲染命令、diff、网页搜索、MCP、图片生成或 agent 信息。
 - AskUserQuestion 面板要保留历史回答、当前问题和自定义回答入口，并通过 action value 回到 session 权限流程。
 - `agy` 卡片固定包含 prompt、stats、result、forward placeholder/button 和 repo 这几类元素；完成后用 `replaceElement` 更新结果、仓库变更和转发按钮。
-- `model` 面板的按钮 action value 分别使用 `model_select` 和 `model_effort_select`，并带上 `panel_id` 防止旧卡回调污染当前选择。
+- `model` 面板是三级选择（账号 → 模型 → effort），按钮 action value 的 `kind` 分别为 `provider_select` / `model_select` / `model_effort_select`，并带 `panel_id`（以及 `source_id`）防止旧卡回调污染当前选择。
 - `task` 面板的按钮 action value 使用 `tasklist_enable`、`tasklist_delete_prompt` 和 `tasklist_delete_confirm`；删除前必须进入确认态，并携带当前绑定 GUID 防止旧卡删除新清单。
 - 控制台和状态卡统一通过 `streamingOffSettings` 在终态关闭 streaming 并写 summary。
 - `wt` 列表使用 `column_set` 保持状态和删除按钮同屏可见；创建/加入提示使用轻量 notice card。

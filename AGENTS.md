@@ -1,4 +1,4 @@
-<!-- Generated: 2026-05-15 | Updated: 2026-07-08 -->
+<!-- Generated: 2026-05-15 | Updated: 2026-07-26 -->
 
 # Lodestar 2.0
 
@@ -35,7 +35,7 @@
 - 停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service 的授权**只在当前 assistant 回合内一次性有效**，不得跨用户消息、跨中断恢复、跨上下文压缩或跨任务范围沿用；一旦用户发来新的消息，即使上一条消息要求过“重启”，后续也必须重新明确授权后才能再次操作 live service。
 - **禁止**为了“测试”“预览”“发一张看看”“先验证一下”这类目的而停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service。只有用户在当前用户消息中**明确点名**要执行对应操作（例如 `systemctl --user restart feishu-daemon.service`、停止当前 daemon、切换到某个 worktree daemon）时才可动手；任何泛化的“测一下”“发测试卡”都**不构成授权**。
 - 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`task`、`wt`/`worktree`、`wt <name>`/`worktree <name>`、`btw`(开临时群启动干净会话)、`bye`(散临时群)、`fk`/`fork`(从 turn 锚点分叉)、`bk`/`back`(终止当前 + 回滚到 turn 锚点)；`agy <prompt>` 启动外部一次性 agy 任务。`rs` 是 `restart` 别名:会话进行中 = 打断 + 弃后台 + `--resume` 恢复上一会话,空闲态 = 列项目最近 24h 会话供选择恢复。这些词在 `Session.runCommand` 中作为保留字处理。
-- `model` 是固定二元选项：Codex（`gpt-5.5`/`xhigh`）或 Claude（`claude:glm` = GLM-5.2/`max`），effort 锁死、选了即生效，不再动态拉取模型列表；选择按 session+provider 持久化到 XDG data，跨 provider 切换只在空闲或下次启动边界生效，turn 进行中或排队时直接拒绝。
+- `model` 是三级动态面板（账号 → 模型 → effort）：账号和模型列表由 token sources 提供（声明式 provider：codex 订阅 / GLM Coding Plan / `claude-native` 本机兜底，经 `token-source-builtins.ts` 加载即 `registerTokenSourceFactory` 登记）；每个 enabled source 露一项，`native` 仅在本机未命中 GLM 时启用让位 GLM（`resolveClaudeGlm` 单一真相源保证两者严格互斥）。选择按 session 持久化到 XDG data；同 provider 切 model/effort 走 `setModelSettings` 热切换不重启，跨 provider 或 Claude profile 变更在 turn 进行/排队时拒绝。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
 - `agy <prompt>` 在当前 session 工作目录内独占运行 `agy --print`，用独立 Card Kit 卡片展示 prompt、状态、输出、仓库变更和“转 Codex”按钮；不要把它混入普通 Codex turn 卡片。
 - `task` 打开项目任务清单面板；启用后创建/绑定 `<project>[lodestar]` 飞书任务清单，daemon 内置 worker 会扫描 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组并驱动规划、执行、审核和本地合并。
