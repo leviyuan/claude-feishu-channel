@@ -403,6 +403,28 @@ function fmtElapsed(ms: number): string {
   return `${h}h${m % 60}m`
 }
 
+const FOOTER_BUCKETS = [
+  { limit: 30_000, label: '<30s' },
+  { limit: 60_000, label: '<1m' },
+  { limit: 180_000, label: '<3m' },
+  { limit: 300_000, label: '<5m' },
+  { limit: 600_000, label: '<10m' },
+]
+
+/** 相对时长档位:<30s / <1m / <3m / <5m / <10m,超过 10m 后每 10 分钟一档(10m+、20m+…)。
+ *  返回当前档位标签 + 到下一档位边界的毫秒数。footer / 后台任务 header 用粗粒度档位
+ *  代替秒数 —— 档位只在边界变,所以更新只发生在档位边界,不是每秒 tick。*/
+export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: number } {
+  const ms = Math.max(0, elapsedMs)
+  for (const b of FOOTER_BUCKETS) {
+    if (ms < b.limit) return { label: b.label, nextDelayMs: b.limit - ms }
+  }
+  const step = 600_000
+  const idx = Math.floor((ms - 600_000) / step)
+  const nextBoundary = 600_000 + (idx + 1) * step
+  return { label: `${(idx + 1) * 10}m+`, nextDelayMs: nextBoundary - ms }
+}
+
 function ownerOf(t: BgTaskEntry): string {
   return t.subagentType ?? t.workflowName ?? TYPE_LABEL[t.type]
 }
@@ -416,8 +438,8 @@ function terminalElapsed(t: BgTaskEntry): number {
 /** 标题里的状态+时长标签(折叠时常驻可见)。running 显示「已运行 Ns」,终态「用时/失败 Ns」。 */
 function statusLabel(t: BgTaskEntry, now: number): string {
   switch (t.status) {
-    case 'running': return `🟡 运行中 ${fmtElapsed(now - t.startedAt)}`
-    case 'paused': return `⏸️ 已暂停 ${fmtElapsed(now - t.startedAt)}`
+    case 'running': return `🟡 运行中 (${elapsedBucket(now - t.startedAt).label})`
+    case 'paused': return `⏸️ 已暂停 (${elapsedBucket(now - t.startedAt).label})`
     case 'pending': return `⚪ 等待中`
     case 'completed': return `✅ 用时 ${fmtElapsed(terminalElapsed(t))}`
     case 'failed': return `❌ 失败 ${fmtElapsed(terminalElapsed(t))}`

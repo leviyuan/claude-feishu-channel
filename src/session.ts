@@ -31,6 +31,7 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
+import { elapsedBucket } from './cards/background'
 import {
   CLAUDE_EFFORT,
   agentProviderLabel,
@@ -105,10 +106,6 @@ function mergeCompactionNotices(
   return { ...start, ...end, phase: 'end' }
 }
 
-const FOOTER_STATUS_TICK_MS = 1000
-/** 后台游标卡周期刷新间隔:无 task_progress 事件的 shell 后台任务(如 codex exec)靠
- *  这个 tick 定时 replaceElement 刷 panel header 的运行时长,否则冻在开卡那刻。 */
-const BACKGROUND_REFRESH_TICK_MS = 2000
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
@@ -140,9 +137,11 @@ const MAX_MIDTURN_ROTATES = 5
  * presenting the session as ready. */
 const CLAUDE_STARTUP_GRACE_MS = 250
 
+/** footer 状态文案:状态词 + 相对时长档位(<30s / <1m / <3m / <5m / <10m / 10m+…)。
+ *  档位只在边界变,所以 footer 用自适应 setTimeout 在档位边界 push,不是每秒 tick。
+ *  见 startFooterTimer / startFooterStatus。*/
 function timedStatus(status: string, startedAt: number): string {
-  const elapsedS = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
-  return `${status} (${elapsedS}s)`
+  return `${status} (${elapsedBucket(Date.now() - startedAt).label})`
 }
 
 export class Session {
@@ -171,9 +170,10 @@ export class Session {
   backgroundCard: { messageId: string; cardId: string } | null = null
   /** task_progress 风暴的刷新节流 timer。 */
   private backgroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
-  /** 后台卡周期 tick:每 BACKGROUND_REFRESH_TICK_MS 刷一次活跃任务的 header 时长,
-   *  治无 task_progress 的 shell 后台任务时长冻结。活卡期间常驻,沉降/迁移时清。 */
-  private backgroundRefreshTick: ReturnType<typeof setInterval> | null = null
+  /** 后台卡自适应 tick:取活跃任务最近的档位边界(cards/background.ts elapsedBucket)
+   *  setTimeout 刷新一次 header 时长标签(<30s/<1m/…),治无 task_progress 的 shell 任务
+   *  时长冻结。活卡期间常驻,沉降/迁移时清。见 startBackgroundRefreshTick。 */
+  private backgroundRefreshTick: ReturnType<typeof setTimeout> | null = null
   /** openBackgroundCard 进行中标记 —— 防止并发 bg_task 事件在 await sendCard
    *  期间重复开卡(sendCard 未返回前 backgroundCard 仍 null,第二个事件会再开一张)。 */
   private openingBackground = false
@@ -669,17 +669,25 @@ export class Session {
       if (stopped) return
       void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt)))
     }
-    const handle = setInterval(render, FOOTER_STATUS_TICK_MS)
+    // footer 显示「状态词 + 相对档位」(见 timedStatus),档位只在边界变 —— 用自适应
+    // setTimeout 链在下一档位边界 push,不是每秒 tick。setStatus 切换状态也立即 push。
+    // elapsedSec 仍基于 startedAt,供 closeStatusCard 结束时显示总耗时。
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const scheduleNext = (): void => {
+      if (stopped) return
+      const { nextDelayMs } = elapsedBucket(Date.now() - startedAt)
+      timer = setTimeout(() => { render(); scheduleNext() }, nextDelayMs)
+    }
     render()
+    scheduleNext()
     return {
       setStatus(next: string): void {
         status = next
         render()
       },
       stop(): void {
-        if (stopped) return
         stopped = true
-        clearInterval(handle)
+        if (timer) clearTimeout(timer)
       },
       elapsedSec(): string {
         return ((Date.now() - startedAt) / 1000).toFixed(1)
@@ -1812,20 +1820,33 @@ export class Session {
     this.startBackgroundRefreshTick()
   }
 
-  /** 周期 tick:无 task_progress 事件的 shell 后台任务(如 codex exec)靠它刷新 header
-   *  运行时长。事件触发的节流刷新(scheduleBackgroundRefresh)负责详情 diff,tick 只补时长。 */
+  /** 后台卡 tick:running 任务 header 显示相对档位(见 cards.elapsedBucket),档位
+   *  只在边界变 —— 取所有活跃任务中最近的档位边界,setTimeout 到那时刷新一次再调度
+   *  下一个,不是固定 2s tick(那会无脑刷所有 panel,是后台卡调用大头)。事件驱动的
+   *  scheduleBackgroundRefresh 仍负责详情 diff;本 tick 只补跨档时的时长标签。*/
   private startBackgroundRefreshTick(): void {
     if (this.backgroundRefreshTick) return
-    this.backgroundRefreshTick = setInterval(() => {
-      if (!this.backgroundCard) return
-      if (!cards.hasActiveBgTask(this.backgroundTasks)) return
-      this.refreshBackgroundCardFull()
-    }, BACKGROUND_REFRESH_TICK_MS)
+    const schedule = (): void => {
+      if (!this.backgroundCard || !cards.hasActiveBgTask(this.backgroundTasks)) return
+      const now = Date.now()
+      let minDelay = Infinity
+      for (const t of this.backgroundTasks) {
+        if (cards.isBgTerminal(t)) continue
+        const { nextDelayMs } = elapsedBucket(now - t.startedAt)
+        if (nextDelayMs < minDelay) minDelay = nextDelayMs
+      }
+      if (!isFinite(minDelay)) return
+      this.backgroundRefreshTick = setTimeout(() => {
+        this.refreshBackgroundCardFull()
+        schedule()
+      }, minDelay)
+    }
+    schedule()
   }
 
   private stopBackgroundRefreshTick(): void {
     if (this.backgroundRefreshTick) {
-      clearInterval(this.backgroundRefreshTick)
+      clearTimeout(this.backgroundRefreshTick)
       this.backgroundRefreshTick = null
     }
   }
@@ -2995,20 +3016,26 @@ export class Session {
    * element and uses replaceElement so status updates appear immediately
    * instead of invoking Feishu's typewriter. */
   private startFooterStatus(turn: TurnState, status: string): void {
-    // log-only 之后 phase 切换(Thinking/Writing/Working)不许把每秒
-    // ticker 重新拉起来 —— 卡已标记拒写,计时纯属空转。
+    // log-only 之后 phase 切换(Thinking/Writing/Working)不再重渲 —— 卡已拒写。
     if (turn.rotateGivenUp) return
     if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status
     turn.footerStatusStartedAt = Date.now()
+    // footer 显示「状态词 + 相对档位」(见 cards/background.ts elapsedBucket),档位
+    // 只在边界变 —— 用自适应 setTimeout 链在下一档位边界 push,不是每秒 tick。
     const render = (): void => {
-      if (turn.footerStatusHandle == null || !turn.footerStatusLabel) return
-      const elapsedS = Math.max(0, Math.floor((Date.now() - turn.footerStatusStartedAt) / 1000))
-      void this.replaceFooterContent(turn.cardId, this.withModel(`${turn.footerStatusLabel}(${elapsedS}s)`))
+      if (turn.footerStatusLabel !== status) return
+      const { label } = elapsedBucket(Date.now() - turn.footerStatusStartedAt)
+      void this.replaceFooterContent(turn.cardId, this.withModel(`${status} (${label})`))
     }
-    turn.footerStatusHandle = setInterval(render, FOOTER_STATUS_TICK_MS)
+    const scheduleNext = (): void => {
+      if (turn.footerStatusLabel !== status) return
+      const { nextDelayMs } = elapsedBucket(Date.now() - turn.footerStatusStartedAt)
+      turn.footerStatusHandle = setTimeout(() => { render(); scheduleNext() }, nextDelayMs)
+    }
     render()
+    scheduleNext()
   }
 
   startThinkingFooter(turn: TurnState): void {
@@ -3025,7 +3052,7 @@ export class Session {
 
   stopFooterStatus(turn: TurnState | null): void {
     if (!turn) return
-    if (turn.footerStatusHandle) clearInterval(turn.footerStatusHandle)
+    if (turn.footerStatusHandle) clearTimeout(turn.footerStatusHandle)
     turn.footerStatusHandle = null
     turn.footerStatusStartedAt = 0
     turn.footerStatusLabel = null
