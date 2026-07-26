@@ -301,7 +301,7 @@ describe('backgroundLiveSummary — 聊天列表预览全文(建卡与刷新共�
 })
 
 describe('任务 panel —— 标题状态+时长,展开详情', () => {
-  test('running:header 写「责任人·描述 — 运行中 Ns」,时长随 now', () => {
+  test('running:header 写「责任人·描述 — 运行中 <档位>」,时长随 now', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
     const panel = backgroundTaskPanel(t, 45000) as any
     expect(panel.tag).toBe('collapsible_panel')
@@ -310,7 +310,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).toContain('Explore')
     expect(panel.header.title.content).toContain('搜索认证')
     expect(panel.header.title.content).toContain('运行中')
-    expect(panel.header.title.content).toContain('45s')
+    expect(panel.header.title.content).toContain('<1m')  // cc13607:45s 落 <1m 档
   })
 
   test('completed:header 写「用时 Ns」(用 usage.duration_ms)', () => {

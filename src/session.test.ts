@@ -248,8 +248,9 @@ describe('Session assistant rendering', () => {
       const footerWrites = calls
         .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
         .map(call => JSON.parse(call.body.element).content as string)
-      expect(footerWrites.some(content => content.startsWith('Writing...(0s)'))).toBe(true)
-      expect(footerWrites.some(content => content.startsWith('Working...(0s)'))).toBe(true)
+      // cc13607:footer 计时改相对档位(0s → <30s 档),不再是秒数
+      expect(footerWrites.some(content => content.startsWith('Writing... (<30s)'))).toBe(true)
+      expect(footerWrites.some(content => content.startsWith('Working... (<30s)'))).toBe(true)
       expect(calls.some(call => call.path.endsWith('/content'))).toBe(false)
     } finally {
       session.stopFooterStatus(turn)
