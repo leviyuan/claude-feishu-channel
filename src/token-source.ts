@@ -18,7 +18,7 @@ import type { TokenSourceConfig } from './config'
 export type TokenSourceAgent = 'claude' | 'codex'
 
 /** 已知 kinds(文档用;TokenSource.kind 是 string,加新 source 不必扩这里)。 */
-export type TokenSourceKind = 'codex-subscription' | 'glm-coding-plan'
+export type TokenSourceKind = 'codex-subscription' | 'glm-coding-plan' | 'claude-native'
 
 export interface TokenSourceCapabilities {
   /** 支持 resumeSessionAt / fork(claude=true, codex=false —— codex 无此能力) */
@@ -138,6 +138,12 @@ export function listTokenSources(): TokenSource[] {
 
 export function listTokenSourcesByAgent(agent: TokenSourceAgent): TokenSource[] {
   return listTokenSources().filter(s => s.agent === agent)
+}
+
+/** 某 agent 下所有「已启用」的 source(spawn / 默认选择 / 额度查询只认 enabled,
+ *  disabled 的不参与 —— 避免未配置的 source 把空凭据注入子进程)。 */
+export function listEnabledTokenSourcesByAgent(agent: TokenSourceAgent): TokenSource[] {
+  return listTokenSourcesByAgent(agent).filter(s => s.enabled)
 }
 
 export function defaultTokenSourceId(): string | null {

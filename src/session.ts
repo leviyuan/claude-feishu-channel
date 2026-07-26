@@ -41,7 +41,7 @@ import {
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
 } from './agent-process'
-import { getTokenSource, listTokenSourcesByAgent, defaultTokenSourceId, type TokenSource } from './token-source'
+import { getTokenSource, listEnabledTokenSourcesByAgent, type TokenSource } from './token-source'
 import { clearRollbackWatchdog } from './rollback-watchdog'
 import {
   ClaudeAgentProcess,
@@ -403,6 +403,14 @@ export class Session {
         this.selectedModel = derivedTs.defaultModel
         this.selectedEffort = 'max'
       }
+      // 迁移:旧版持久化的 GLM model slug(GLM-5.2 / GLM-4.7)在切到 native 后(本机撤了
+      // GLM 改配真 Anthropic),透传给真 Anthropic 会因模型名不被支持而启动失败 → 归一到
+      // native 默认 SDK alias(opus),由 settings.json 的 ANTHROPIC_DEFAULT_*_MODEL 解析。
+      if (derivedTs.id === 'claude-native'
+        && this.selectedModel
+        && !derivedTs.models.some(m => m.model === this.selectedModel)) {
+        this.selectedModel = derivedTs.defaultModel
+      }
     }
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
@@ -439,12 +447,16 @@ export class Session {
   /** 从持久化 selection 推导 tokenSourceId;无匹配返回 default 或 null(走旧路径)。 */
   private deriveTokenSourceId(selection: { tokenSourceId?: string; provider?: string; model?: string | null } | null): string | null {
     const explicit = selection?.tokenSourceId
-    if (typeof explicit === 'string' && getTokenSource(explicit)) return explicit
+    const explicitTs = typeof explicit === 'string' ? getTokenSource(explicit) : undefined
+    // 持久化的 source 仍 enabled → 沿用;disabled(凭据失效 / 被 Pro source 取代)→ 弃,fallback。
+    if (explicitTs?.enabled) return explicitTs.id
     const provider: AgentProvider = (selection?.provider as AgentProvider) ?? this.selectedProvider
-    const model = selection?.model ?? ''
-    // agent 固定:claude→glm、codex→codex-sub。model 是具体 slug,不再靠字符串猜 source。
-    const list = listTokenSourcesByAgent(provider === 'codex' ? 'codex' : 'claude')
-    return list[0]?.id ?? defaultTokenSourceId()
+    // 只认 enabled source:disabled 的不参与 spawn,避免未配置凭据注入子进程把 claude 搞挂。
+    // claude 侧 native 与 GLM 严格互斥,恒有一个 enabled;codex 侧 codex-sub 未登录时为空(走 ~/.codex)。
+    const list = listEnabledTokenSourcesByAgent(provider === 'codex' ? 'codex' : 'claude')
+    // provider 侧无 enabled source → 返回 null(走旧路径:claude 透传 / codex 走 ~/.codex),
+    // 不跨界 fallback 到别的 provider 的 default —— 否则 codex-sub 未登录会把 provider 误切成 claude。
+    return list[0]?.id ?? null
   }
 
   /** 当前 token source(账号);未配返回 undefined → 调用方走旧路径 fallback。 */
@@ -469,7 +481,10 @@ export class Session {
     // 无 ts 旧路径:走 ~/.codex/config.toml。
     // 热切换 setModelSettings 仍 no-op(thread/settings/update 踩坑避),需重启进程生效。
     if (this.selectedProvider === 'codex') {
-      if (!this.currentTokenSource()) return undefined
+      // 与 spawnAgent 一致只认 enabled source:disabled codex-sub(热重建后凭据失效)→ 不下发
+      // effort,让 codex 走 ~/.codex/config.toml,避免「model 不下发但 effort 覆盖」的不一致。
+      const ts = this.currentTokenSource()
+      if (!ts || !ts.enabled) return undefined
       return isCodexReasoningEffort(this.selectedEffort) ? this.selectedEffort : CODEX_EFFORT
     }
     return CODEX_EFFORT
@@ -558,7 +573,10 @@ export class Session {
     const sid = fs?.resumeSessionId ?? resumeSessionId
     const resumeSessionAt = fs?.resumeSessionAt
     const forkSession = !!fs
-    const ts = this.currentTokenSource()
+    // 只让 enabled source 参与 spawn:disabled(凭据未配 / 被 Pro source 取代)视为无 ts,
+    // 走旧路径(claude 透传本机 env、codex 走 ~/.codex),绝不把空凭据注入子进程。
+    const raw = this.currentTokenSource()
+    const ts = raw?.enabled ? raw : undefined
     const transformEnv = ts
       ? (base: Record<string, string | undefined>) => ts.spawnEnv(base)
       : undefined
@@ -1366,9 +1384,9 @@ export class Session {
     //   codex      → src/usage.ts(codex app-server rate-limit)
     const opts = await this.buildConsoleOpts(undefined)
     const selectedTs = this.currentTokenSource()
-    const ts = selectedTs?.agent === opts.provider
+    const ts = (selectedTs?.agent === opts.provider && selectedTs.enabled)
       ? selectedTs
-      : listTokenSourcesByAgent(opts.provider)[0]
+      : listEnabledTokenSourcesByAgent(opts.provider)[0]
     if (ts) {
       opts.unifiedUsage = await ts.readUsage()
     } else if (opts.provider === 'claude') {

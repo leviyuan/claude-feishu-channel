@@ -17,6 +17,7 @@ import {
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
 import './token-source-glm'
+import './token-source-native'
 
 /** 遍历已登记 factory 构建 source 实例,注册到 instance registry。
  *  daemon 启动调;飞书改 token source 配置后也可重调(热更新)。 */

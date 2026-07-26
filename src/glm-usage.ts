@@ -80,6 +80,48 @@ export function readClaudeSettingsEnv(): Record<string, string> {
   }
 }
 
+/** 判定一个 base_url 是否指向 GLM 官方平台 —— 启用判定(resolveClaudeGlm)与额度
+ *  查询(glmDomain)共用同一套 host 判定,避免「启用说是 GLM、额度说不是」的认知割裂。
+ *  只有官方端点(open./dev.bigmodel.cn、api.z.ai)才算 Pro provider 走 GLM source 的
+ *  特殊 slot 注入;挂在 bigmodel.cn 下的第三方中转走 native 透传(用户配啥用啥)。 */
+export function isGlmBaseUrl(baseUrl: string): boolean {
+  // 严格 hostname 比较(非子串):解析 URL 取 hostname —— 避免 `open.bigmodel.cn.evil.example`
+  // 或 URL 查询参数里含该文本被误判;hostname 大小写归一化。解析失败(无协议等)→ false。
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    return host === 'open.bigmodel.cn' || host === 'dev.bigmodel.cn' || host === 'api.z.ai'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 解析「Claude 侧 GLM source 是否启用」的统一真相源 —— GLM source 与 native
+ * 兜底 source 都调它,保证两者严格互斥(claude 侧永远恰好一个 enabled),不会
+ * 因判定逻辑漂移出现两个都 enabled / 都 disabled。
+ *
+ * 凭据来源优先级:config.toml [token_source.glm] > ~/.claude/settings.json env
+ * (且 env 的 base_url 必须命中 GLM host 才被借作 fallback —— 真 Anthropic 等非
+ * GLM provider 不会被误吞)。enabled = baseUrl 与 token 都齐全。
+ */
+export interface ResolvedClaudeGlm {
+  baseUrl: string
+  token: string
+  enabled: boolean
+}
+export function resolveClaudeGlm(cfg?: { base_url?: string; auth_token?: string }): ResolvedClaudeGlm {
+  const se = readClaudeSettingsEnv()
+  const envBaseUrl = se.ANTHROPIC_BASE_URL?.trim() ?? ''
+  const envToken = se.ANTHROPIC_AUTH_TOKEN?.trim() ?? ''
+  const envIsGlm = isGlmBaseUrl(envBaseUrl)
+  const baseUrl = cfg?.base_url?.trim() || (envIsGlm ? envBaseUrl : '')
+  const token = cfg?.auth_token?.trim() || (envIsGlm ? envToken : '')
+  // enabled 要求 baseUrl+token 齐全,且 baseUrl 必须是 GLM 官方端点 —— 否则 config 误填的非
+  // GLM 地址(真 Anthropic / 中转)会被当 GLM 启用:轻则注入错误 GLM slot/模型,重则字段
+  // fallback 把 config 的 base_url 与 settings.json 的 token 拼成不匹配的凭据。非 GLM config 走 native 透传。
+  return { baseUrl, token, enabled: !!(baseUrl && token) && isGlmBaseUrl(baseUrl) }
+}
+
 /** 从 ANTHROPIC_BASE_URL 取 protocol//host;非法返回 null。 */
 function baseDomain(baseUrl: string): string | null {
   try {
@@ -90,14 +132,10 @@ function baseDomain(baseUrl: string): string | null {
   }
 }
 
-/** 判定是否 GLM 平台host,返回 domain 或 null(非 GLM)。 */
+/** 判定是否 GLM 平台 host,返回 domain 或 null(非 GLM)。与 isGlmBaseUrl 共用判定。 */
 function glmDomain(baseUrl: string): string | null {
-  if (!baseUrl) return null
   const domain = baseDomain(baseUrl)
-  if (!domain) return null
-  if (baseUrl.includes('open.bigmodel.cn') || baseUrl.includes('dev.bigmodel.cn')) return domain
-  if (baseUrl.includes('api.z.ai')) return domain
-  return null
+  return domain && isGlmBaseUrl(baseUrl) ? domain : null
 }
 
 function clampPct(v: unknown): number | null {

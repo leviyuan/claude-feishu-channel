@@ -26,7 +26,7 @@ function codexEffort(e: unknown): AgentReasoningEffort | null {
     : null
 }
 
-const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
+export const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
 
 /** codex 订阅可用模型(app-server model/list),过滤 hidden,effort 用 per-model。 */
 export async function fetchCodexModels(): Promise<TokenSourceModel[]> {

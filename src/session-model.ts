@@ -23,14 +23,18 @@ export interface ModelPanelState {
 function providerChoices(s: Session): cards.ProviderChoice[] {
   const cur = s.currentTokenSource()
   const curModel = s.currentModelLabel()
-  return listTokenSources().map(ts => ({
-    provider: ts.agent as AgentProvider,
-    sourceId: ts.id,
-    display: ts.display + (cur?.id === ts.id && curModel ? ` · ${curModel}` : ''),
-    enabled: ts.enabled,
-    modelCount: ts.models.length,
-    selected: cur?.id === ts.id,
-  }))
+  return listTokenSources()
+    // native 是兜底项:仅在 enabled 时露面(本机未命中 Pro provider → 作为默认通路);
+    // disabled 说明本机已用 GLM,此时它没意义,不显示灰项干扰选择。
+    .filter(ts => ts.enabled || ts.kind !== 'claude-native')
+    .map(ts => ({
+      provider: ts.agent as AgentProvider,
+      sourceId: ts.id,
+      display: ts.display + (cur?.id === ts.id && curModel ? ` · ${curModel}` : ''),
+      enabled: ts.enabled,
+      modelCount: ts.models.length,
+      selected: cur?.id === ts.id,
+    }))
 }
 
 // ── 第2级:某账号下的具体模型(点 provider 后展示) ──────────
