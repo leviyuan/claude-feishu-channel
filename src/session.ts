@@ -31,7 +31,11 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
-import { elapsedBucket } from './cards/background'
+import {
+  liveElapsed,
+  LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS,
+  type LiveElapsedMode,
+} from './cards/background'
 import {
   CLAUDE_EFFORT,
   agentProviderLabel,
@@ -41,6 +45,7 @@ import {
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
 } from './agent-process'
+import { config } from './config'
 import { getTokenSource, listEnabledTokenSourcesByAgent, type TokenSource } from './token-source'
 import { clearRollbackWatchdog } from './rollback-watchdog'
 import {
@@ -137,11 +142,17 @@ const MAX_MIDTURN_ROTATES = 5
  * presenting the session as ready. */
 const CLAUDE_STARTUP_GRACE_MS = 250
 
-/** footer 状态文案:状态词 + 相对时长档位(<30s / <1m / <3m / <5m / <10m / 10m+…)。
- *  档位只在边界变,所以 footer 用自适应 setTimeout 在档位边界 push,不是每秒 tick。
+/** 读取 `[runtime].live_elapsed`;缺 runtime 时回退 bucket(测试 mock 常只 stub claude)。 */
+function liveElapsedMode(): LiveElapsedMode {
+  return config.runtime?.live_elapsed ?? 'bucket'
+}
+
+/** footer 状态文案:状态词 + 耗时标签。
+ *  bucket 模式:相对档位(<30s / <1m / …),只在边界 push;
+ *  second 模式:按秒显示,footer 每 1s push。
  *  见 startFooterTimer / startFooterStatus。*/
 function timedStatus(status: string, startedAt: number): string {
-  return `${status} (${elapsedBucket(Date.now() - startedAt).label})`
+  return `${status} (${liveElapsed(Date.now() - startedAt, liveElapsedMode()).label})`
 }
 
 export class Session {
@@ -170,8 +181,8 @@ export class Session {
   backgroundCard: { messageId: string; cardId: string } | null = null
   /** task_progress 风暴的刷新节流 timer。 */
   private backgroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
-  /** 后台卡自适应 tick:取活跃任务最近的档位边界(cards/background.ts elapsedBucket)
-   *  setTimeout 刷新一次 header 时长标签(<30s/<1m/…),治无 task_progress 的 shell 任务
+  /** 后台卡自适应 tick:bucket 取活跃任务最近档位边界,second 固定 2s。
+   *  setTimeout 刷新一次 header 时长标签,治无 task_progress 的 shell 任务
    *  时长冻结。活卡期间常驻,沉降/迁移时清。见 startBackgroundRefreshTick。 */
   private backgroundRefreshTick: ReturnType<typeof setTimeout> | null = null
   /** openBackgroundCard 进行中标记 —— 防止并发 bg_task 事件在 await sendCard
@@ -687,14 +698,14 @@ export class Session {
       if (stopped) return
       void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt)))
     }
-    // footer 显示「状态词 + 相对档位」(见 timedStatus),档位只在边界变 —— 用自适应
-    // setTimeout 链在下一档位边界 push,不是每秒 tick。setStatus 切换状态也立即 push。
+    // footer 显示「状态词 + 耗时」(见 timedStatus)。bucket 只在档位边界 push;
+    // second 固定 1s。setStatus 切换状态也立即 push。
     // elapsedSec 仍基于 startedAt,供 closeStatusCard 结束时显示总耗时。
     let timer: ReturnType<typeof setTimeout> | null = null
     const scheduleNext = (): void => {
       if (stopped) return
-      const { nextDelayMs } = elapsedBucket(Date.now() - startedAt)
-      timer = setTimeout(() => { render(); scheduleNext() }, nextDelayMs)
+      const { nextDelayMs } = liveElapsed(Date.now() - startedAt, liveElapsedMode())
+      timer = setTimeout(() => { render(); scheduleNext() }, Math.max(1, Math.ceil(nextDelayMs)))
     }
     render()
     scheduleNext()
@@ -1817,7 +1828,7 @@ export class Session {
 
   private async openBackgroundCard(): Promise<void> {
     if (this.backgroundCard) return
-    const card = cards.backgroundLiveCard(this.backgroundTasks)
+    const card = cards.backgroundLiveCard(this.backgroundTasks, Date.now(), liveElapsedMode())
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
       log(`session "${this.sessionName}": background card send failed`)
@@ -1838,26 +1849,29 @@ export class Session {
     this.startBackgroundRefreshTick()
   }
 
-  /** 后台卡 tick:running 任务 header 显示相对档位(见 cards.elapsedBucket),档位
-   *  只在边界变 —— 取所有活跃任务中最近的档位边界,setTimeout 到那时刷新一次再调度
-   *  下一个,不是固定 2s tick(那会无脑刷所有 panel,是后台卡调用大头)。事件驱动的
-   *  scheduleBackgroundRefresh 仍负责详情 diff;本 tick 只补跨档时的时长标签。*/
+  /** 后台卡 tick:running 任务 header 时长标签。
+   *  bucket:取所有活跃任务最近档位边界再刷新(省配额);
+   *  second:固定 2s tick。事件驱动的 scheduleBackgroundRefresh 仍负责详情 diff;
+   *  本 tick 只补无 progress 事件时的时长变化。*/
   private startBackgroundRefreshTick(): void {
     if (this.backgroundRefreshTick) return
     const schedule = (): void => {
       if (!this.backgroundCard || !cards.hasActiveBgTask(this.backgroundTasks)) return
+      const mode = liveElapsedMode()
       const now = Date.now()
       let minDelay = Infinity
       for (const t of this.backgroundTasks) {
         if (cards.isBgTerminal(t)) continue
-        const { nextDelayMs } = elapsedBucket(now - t.startedAt)
-        if (nextDelayMs < minDelay) minDelay = nextDelayMs
+        const delay = mode === 'second'
+          ? LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS
+          : liveElapsed(now - t.startedAt, mode).nextDelayMs
+        if (delay < minDelay) minDelay = delay
       }
       if (!isFinite(minDelay)) return
       this.backgroundRefreshTick = setTimeout(() => {
         this.refreshBackgroundCardFull()
         schedule()
-      }, minDelay)
+      }, Math.max(1, Math.ceil(minDelay)))
     }
     schedule()
   }
@@ -1886,12 +1900,13 @@ export class Session {
     const handle = this.backgroundCard
     if (!handle) return
     const now = Date.now()
+    const mode = liveElapsedMode()
     for (const t of this.backgroundTasks) {
       if (!this.backgroundDetailAdded.has(t.id)) {
         this.backgroundDetailAdded.add(t.id)
-        void cardkit.addElement(handle.cardId, cards.backgroundTaskPanel(t, now))
+        void cardkit.addElement(handle.cardId, cards.backgroundTaskPanel(t, now, mode))
       } else {
-        void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now))
+        void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now, mode))
       }
     }
     // 同步聊天列表预览(config.summary) —— 建卡后任务增减 / 结算都要反映到预览,
@@ -3040,17 +3055,17 @@ export class Session {
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status
     turn.footerStatusStartedAt = Date.now()
-    // footer 显示「状态词 + 相对档位」(见 cards/background.ts elapsedBucket),档位
-    // 只在边界变 —— 用自适应 setTimeout 链在下一档位边界 push,不是每秒 tick。
+    // footer 显示「状态词 + 耗时」(见 cards/background.ts liveElapsed)。
+    // bucket 只在档位边界 push;second 固定 1s。
     const render = (): void => {
       if (turn.footerStatusLabel !== status) return
-      const { label } = elapsedBucket(Date.now() - turn.footerStatusStartedAt)
+      const { label } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
       void this.replaceFooterContent(turn.cardId, this.withModel(`${status} (${label})`))
     }
     const scheduleNext = (): void => {
       if (turn.footerStatusLabel !== status) return
-      const { nextDelayMs } = elapsedBucket(Date.now() - turn.footerStatusStartedAt)
-      turn.footerStatusHandle = setTimeout(() => { render(); scheduleNext() }, nextDelayMs)
+      const { nextDelayMs } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
+      turn.footerStatusHandle = setTimeout(() => { render(); scheduleNext() }, Math.max(1, Math.ceil(nextDelayMs)))
     }
     render()
     scheduleNext()

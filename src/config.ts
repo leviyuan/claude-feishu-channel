@@ -8,6 +8,7 @@
  *
  *   [runtime]
  *   projects_root = "~/"      # optional, defaults to $HOME
+ *   live_elapsed = "bucket"   # optional: "bucket"(default) | "second"
  *
  *   [notify]                  # all optional
  *   bind = "127.0.0.1"        # default 127.0.0.1 (loopback only)
@@ -21,6 +22,9 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { CONFIG_FILE } from './paths'
 
+/** 活跃 footer / 后台卡 header 耗时展示模式(config `[runtime].live_elapsed`)。 */
+export type LiveElapsedMode = 'bucket' | 'second'
+
 export interface LodestarConfig {
   feishu: {
     app_id: string
@@ -28,6 +32,12 @@ export interface LodestarConfig {
   }
   runtime: {
     projects_root: string
+    /**
+     * 活跃 footer / 后台卡 header 的耗时展示。
+     * - `bucket`(默认):粗档位,只在档位边界 push,省飞书配额
+     * - `second`:按秒显示,footer 每 1s / 后台卡每 2s push(旧行为,配额更费)
+     */
+    live_elapsed: LiveElapsedMode
   }
   notify: {
     bind: string
@@ -163,6 +173,13 @@ function loadConfig(): LodestarConfig {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
   const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
+  const liveElapsedRaw = (t.runtime?.live_elapsed ?? 'bucket').trim().toLowerCase()
+  if (liveElapsedRaw !== 'bucket' && liveElapsedRaw !== 'second') {
+    throw new Error(
+      `lodestar: [runtime].live_elapsed must be "bucket" or "second", got "${t.runtime?.live_elapsed}"`,
+    )
+  }
+  const liveElapsed: LiveElapsedMode = liveElapsedRaw
   const notifyBind = t.notify?.bind ?? '127.0.0.1'
   const notifyPortRaw = t.notify?.port ?? '9876'
   const notifyPort = Number.parseInt(notifyPortRaw, 10)
@@ -258,7 +275,7 @@ function loadConfig(): LodestarConfig {
   const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
   return {
     feishu: { app_id: appId, app_secret: appSecret },
-    runtime: { projects_root: projectsRoot },
+    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
     claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },

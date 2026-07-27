@@ -138,6 +138,17 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 
 配置在 `~/.config/lodestar/config.toml`,`lodestar-setup` 会帮你生成,手改也行。两个常被问的:
 
+### 想让 footer / 后台卡按秒刷新耗时?
+
+默认 `bucket`:活跃 footer 与后台任务 header 用相对档位(`<30s` / `<1m` / …),只在档位边界 push,省飞书 cardkit 配额。需要旧式按秒进度时:
+
+```toml
+[runtime]
+live_elapsed = "second"   # "bucket"(默认) | "second"
+```
+
+`second` 时 footer 约每 1s、后台卡约每 2s push,文案为 `45s` 这种整秒。改完需重启 daemon。
+
 ### 想让某个外部项目跑在别的目录?
 
 默认群名就是 `projects_root` 下的目录名。但如果你的项目放在别处、不想搬进来,在 config.toml 指一下它的目录就行——**section 名就是飞书群名**(daemon 用群名去 `config.projects[群名]` 取 cwd),其它项目不受影响:
