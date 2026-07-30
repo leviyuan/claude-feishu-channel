@@ -18,6 +18,9 @@ import {
   backgroundMigratedMarker,
   emptyBgStore,
   BG_ELEMENTS,
+  elapsedBucket,
+  liveElapsed,
+  LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
   type BgTaskEntry,
   type BgStore,
 } from './background'
@@ -28,6 +31,41 @@ const mk = (over: Partial<BgTaskEntry> & Pick<BgTaskEntry, 'id' | 'status'>): Bg
   startedAt: 0,
   steps: [],
   ...over,
+})
+
+describe('elapsedBucket', () => {
+  test('maps live elapsed time to stable labels and exact next boundaries', () => {
+    expect(elapsedBucket(-1)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+    expect(elapsedBucket(0)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+    expect(elapsedBucket(29_999)).toEqual({ label: '<30s', nextDelayMs: 1 })
+    expect(elapsedBucket(30_000)).toEqual({ label: '<1m', nextDelayMs: 30_000 })
+    expect(elapsedBucket(59_999)).toEqual({ label: '<1m', nextDelayMs: 1 })
+    expect(elapsedBucket(60_000)).toEqual({ label: '<3m', nextDelayMs: 120_000 })
+    expect(elapsedBucket(180_000)).toEqual({ label: '<5m', nextDelayMs: 120_000 })
+    expect(elapsedBucket(300_000)).toEqual({ label: '<10m', nextDelayMs: 300_000 })
+    expect(elapsedBucket(600_000)).toEqual({ label: '10m+', nextDelayMs: 600_000 })
+    expect(elapsedBucket(1_199_999)).toEqual({ label: '10m+', nextDelayMs: 1 })
+    expect(elapsedBucket(1_200_000)).toEqual({ label: '20m+', nextDelayMs: 600_000 })
+  })
+
+  test('normalizes non-finite input instead of producing a zero-delay timer loop', () => {
+    expect(elapsedBucket(Number.NaN)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+    expect(elapsedBucket(Number.POSITIVE_INFINITY)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+  })
+})
+
+describe('liveElapsed', () => {
+  test('bucket mode delegates to elapsedBucket', () => {
+    expect(liveElapsed(45_000, 'bucket')).toEqual(elapsedBucket(45_000))
+    expect(liveElapsed(45_000)).toEqual(elapsedBucket(45_000))
+  })
+
+  test('second mode returns whole-second labels and a 1s tick', () => {
+    expect(liveElapsed(0, 'second')).toEqual({ label: '0s', nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS })
+    expect(liveElapsed(999, 'second')).toEqual({ label: '0s', nextDelayMs: 1000 })
+    expect(liveElapsed(1_500, 'second')).toEqual({ label: '1s', nextDelayMs: 1000 })
+    expect(liveElapsed(45_000, 'second')).toEqual({ label: '45s', nextDelayMs: 1000 })
+  })
 })
 
 describe('applyBgTaskStarted — 白名单直入 active / 前台落 pending', () => {
@@ -311,6 +349,13 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).toContain('搜索认证')
     expect(panel.header.title.content).toContain('运行中')
     expect(panel.header.title.content).toContain('<1m')  // cc13607:45s 落 <1m 档
+  })
+
+  test('running + second 模式:header 写精确秒数', () => {
+    const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
+    const panel = backgroundTaskPanel(t, 45000, 'second') as any
+    expect(panel.header.title.content).toContain('(45s)')
+    expect(panel.header.title.content).not.toContain('<1m')
   })
 
   test('completed:header 写「用时 Ns」(用 usage.duration_ms)', () => {

@@ -17,7 +17,7 @@
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、`model` 三级选择卡（`providerSelectionCard` 选账号 → `modelSelectionCard` 选模型 → `modelEffortSelectionCard` 选 effort → `modelResultCard` 结果，账号/模型列表由 `session-model.ts` 从 token sources 传入）、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
 | `task.ts` | `task` 清单面板卡，展示项目、清单名、绑定 GUID、分组状态、清单链接，以及启用/删除/确认删除按钮。 |
-| `background.ts` | SDK `task_*` 消息族(子 agent / 后台 bash / MCP / workflow)的状态累积 + 「后台游标卡」渲染:active/pending 双池(workflow/monitor 白名单 task_started 直入 active,其余前台 task 进 pending,对话推进时提升),吸附对话末尾,被新消息超越时沉降为历史快照,全终态固化留在原地。 |
+| `background.ts` | SDK `task_*` 消息族(子 agent / 后台 bash / MCP / workflow)的状态累积 + 「后台游标卡」渲染:active/pending 双池(workflow/monitor 白名单 task_started 直入 active,其余前台 task 进 pending,对话推进时提升),吸附对话末尾,被新消息超越时沉降为历史快照,全终态固化留在原地。含 `elapsedBucket` / `liveElapsed`(footer 与活跃 header 的 bucket/second 耗时模式)。 |
 | `temp.ts` | 临时会话 `fk`/`bk`/`rs` 卡片:`fk`/`bk` 的用户输入(turn 锚点)列表卡、`rs` 空闲模式的项目最近会话列表卡、`bk` 回滚后的 Write 记录卡;按钮 `value.kind`(`temp_fork_select`/`temp_back_select`/`temp_resume_select`)在 `daemon.ts` `handleCardAction` 里 dispatch。 |
 | `turn.test.ts` | Bun 测试，覆盖 turn card、模型选择、工具摘要、权限元素和 console/status card 的关键渲染。 |
 | `agy.test.ts` | Bun 测试，覆盖 agy 卡片结构、状态行、输出清理、仓库摘要和转发按钮。 |

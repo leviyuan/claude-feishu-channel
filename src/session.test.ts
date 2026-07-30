@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
   modelSelections, sentCards, sentRawTexts, sentTexts, urgentPushes,
@@ -7,9 +7,12 @@ import {
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
+const { config } = await import('./config')
 const { resetTokenSourceRegistry } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
+
+const DETERMINISTIC_FOOTER_HANDLE = 0xdeadbeef as unknown as ReturnType<typeof setTimeout>
 
 interface FetchCall {
   method: string
@@ -219,6 +222,11 @@ describe('Session token accounting', () => {
 
 describe('Session assistant rendering', () => {
   test('buffers assistant deltas and inserts one completed markdown element without content streaming', async () => {
+    // 本测断言 bucket 档位文案;本地 config 可能是 second,且全量 suite 里
+    // mock.module('./config') 可能缺 runtime —— 先补 runtime 再钉死 bucket。
+    const cfg = config as any
+    const previousRuntime = cfg.runtime
+    cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'bucket' }
     const session = new Session('probe', 'chat_id') as any
     const turn = turnState()
     session.currentTurn = turn
@@ -254,6 +262,8 @@ describe('Session assistant rendering', () => {
       expect(calls.some(call => call.path.endsWith('/content'))).toBe(false)
     } finally {
       session.stopFooterStatus(turn)
+      if (previousRuntime === undefined) delete cfg.runtime
+      else cfg.runtime = previousRuntime
       await cardkit.dispose(turn.cardId)
     }
   })
@@ -1069,5 +1079,67 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
     expect(session.backgroundRefreshTimer).toBeNull() // timer 引用已清
     expect(session.backgroundDetailAdded.size).toBe(0)
     expect(session.openingBackground).toBe(false)
+  })
+})
+
+describe('Session live_elapsed second mode', () => {
+  test('second live_elapsed mode uses 1s footer and 2s background ticks', async () => {
+    // claude-agent-process.test 的 mock.module('./config') 会在全量 suite 里
+    // 把 config 换成缺 runtime 的 stub;这里先补上 runtime 再改 mode。
+    const cfg = config as any
+    const previousRuntime = cfg.runtime
+    cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'second' }
+    const session = new Session('second-scheduling', 'chat_id') as any
+    const turn = turnState('card_second_scheduling')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const delays: number[] = []
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation((
+      (_callback: (...args: any[]) => void, delay?: number) => {
+        delays.push(Number(delay ?? 0))
+        return DETERMINISTIC_FOOTER_HANDLE
+      }
+    ) as typeof setTimeout)
+
+    try {
+      session.startThinkingFooter(turn)
+      expect(delays).toHaveLength(1)
+      expect(delays[0]).toBe(1000)
+      session.stopFooterStatus(turn)
+
+      session.backgroundCard = { messageId: 'msg_second', cardId: 'card_second' }
+      session.backgroundTasks = [{
+        id: 'bg', type: 'shell', description: 'bg', status: 'running',
+        startedAt: Date.now() - 300_001, steps: [],
+      }]
+      session.startBackgroundRefreshTick()
+      expect(delays.at(-1)).toBe(2000)
+
+      // startFooterStatus 先 Date.now() 记 startedAt,再 Date.now() 算 elapsed。
+      // 第一次返回 base,后续返回 base+45s → 文案 Writing... (45s)。
+      session.stopFooterStatus(turn)
+      const base = Date.now()
+      let nowCalls = 0
+      const nowSpy = spyOn(Date, 'now').mockImplementation(() => {
+        nowCalls += 1
+        return nowCalls === 1 ? base : base + 45_000
+      })
+      try {
+        session.startWritingFooter(turn)
+      } finally {
+        nowSpy.mockRestore()
+      }
+      await cardkit.flush(turn.cardId)
+      const footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(footerWrites.at(-1)).toContain('Writing... (45s)')
+    } finally {
+      session.stopFooterStatus(turn)
+      session.stopBackgroundRefreshTick()
+      timeoutSpy.mockRestore()
+      if (previousRuntime === undefined) delete cfg.runtime
+      else cfg.runtime = previousRuntime
+      await cardkit.dispose(turn.cardId)
+    }
   })
 })

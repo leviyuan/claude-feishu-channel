@@ -411,11 +411,21 @@ const FOOTER_BUCKETS = [
   { limit: 600_000, label: '<10m' },
 ]
 
+/** 活跃 footer / 后台卡 header 的耗时展示模式。
+ *  - `bucket`: 粗档位 (`<30s`/`<1m`/…)，只在档位边界 push（默认，省飞书配额）
+ *  - `second`: 旧行为，按秒显示并每秒/每 2s push */
+export type LiveElapsedMode = 'bucket' | 'second'
+
+/** second 模式下 footer 固定 1s tick；后台卡固定 2s（对齐旧 FOOTER_STATUS_TICK_MS /
+ *  BACKGROUND_REFRESH_TICK_MS，后台稍慢以少打一点 cardkit）。 */
+export const LIVE_ELAPSED_SECOND_FOOTER_TICK_MS = 1000
+export const LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS = 2000
+
 /** 相对时长档位:<30s / <1m / <3m / <5m / <10m,超过 10m 后每 10 分钟一档(10m+、20m+…)。
  *  返回当前档位标签 + 到下一档位边界的毫秒数。footer / 后台任务 header 用粗粒度档位
  *  代替秒数 —— 档位只在边界变,所以更新只发生在档位边界,不是每秒 tick。*/
 export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: number } {
-  const ms = Math.max(0, elapsedMs)
+  const ms = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0
   for (const b of FOOTER_BUCKETS) {
     if (ms < b.limit) return { label: b.label, nextDelayMs: b.limit - ms }
   }
@@ -423,6 +433,25 @@ export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: 
   const idx = Math.floor((ms - 600_000) / step)
   const nextBoundary = 600_000 + (idx + 1) * step
   return { label: `${(idx + 1) * 10}m+`, nextDelayMs: nextBoundary - ms }
+}
+
+/**
+ * Live elapsed for footer / background headers.
+ * `bucket` → coarse label + delay to next boundary;
+ * `second` → `Ns` label + fixed 1s delay (callers may override for background).
+ */
+export function liveElapsed(
+  elapsedMs: number,
+  mode: LiveElapsedMode = 'bucket',
+): { label: string; nextDelayMs: number } {
+  if (mode === 'second') {
+    const ms = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0
+    return {
+      label: `${Math.floor(ms / 1000)}s`,
+      nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
+    }
+  }
+  return elapsedBucket(elapsedMs)
 }
 
 function ownerOf(t: BgTaskEntry): string {
@@ -435,11 +464,18 @@ function terminalElapsed(t: BgTaskEntry): number {
   return 0
 }
 
-/** 标题里的状态+时长标签(折叠时常驻可见)。running 显示「已运行 Ns」,终态「用时/失败 Ns」。 */
-function statusLabel(t: BgTaskEntry, now: number): string {
+/** 标题里的状态+时长标签(折叠时常驻可见)。
+ *  活跃态按 liveElapsedMode 显示档位或秒数;终态保留精确耗时。 */
+function statusLabel(
+  t: BgTaskEntry,
+  now: number,
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): string {
+  const liveLabel = (elapsedMs: number): string =>
+    liveElapsed(elapsedMs, liveElapsedMode).label
   switch (t.status) {
-    case 'running': return `🟡 运行中 (${elapsedBucket(now - t.startedAt).label})`
-    case 'paused': return `⏸️ 已暂停 (${elapsedBucket(now - t.startedAt).label})`
+    case 'running': return `🟡 运行中 (${liveLabel(now - t.startedAt)})`
+    case 'paused': return `⏸️ 已暂停 (${liveLabel(now - t.startedAt)})`
     case 'pending': return `⚪ 等待中`
     case 'completed': return `✅ 用时 ${fmtElapsed(terminalElapsed(t))}`
     case 'failed': return `❌ 失败 ${fmtElapsed(terminalElapsed(t))}`
@@ -474,12 +510,17 @@ function renderDetailBody(t: BgTaskEntry): string {
 }
 
 /** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。
- *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。 */
-export function backgroundTaskPanel(t: BgTaskEntry, now: number = Date.now()): object {
+ *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。
+ *  liveElapsedMode 只影响活跃态 header 时长文案;终态仍用精确 fmtElapsed。 */
+export function backgroundTaskPanel(
+  t: BgTaskEntry,
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
   return {
     tag: 'collapsible_panel',
     element_id: BG_ELEMENTS.panel(t.id),
-    header: { title: { tag: 'plain_text', content: `${TYPE_ICON[t.type]} ${ownerOf(t)} · ${t.description || '(无描述)'} — ${statusLabel(t, now)}` } },
+    header: { title: { tag: 'plain_text', content: `${TYPE_ICON[t.type]} ${ownerOf(t)} · ${t.description || '(无描述)'} — ${statusLabel(t, now, liveElapsedMode)}` } },
     expanded: false,
     elements: [{ tag: 'markdown', element_id: BG_ELEMENTS.body(t.id), content: renderDetailBody(t) }],
   }
@@ -487,7 +528,11 @@ export function backgroundTaskPanel(t: BgTaskEntry, now: number = Date.now()): o
 
 /** 活卡整张 JSON —— 首个后台任务到来时 sendCard 用。streaming 开。
  *  初始 body = 每任务一个 panel。 */
-export function backgroundLiveCard(tasks: BgTaskEntry[], now: number = Date.now()): object {
+export function backgroundLiveCard(
+  tasks: BgTaskEntry[],
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
   return {
     schema: '2.0',
     config: {
@@ -495,14 +540,18 @@ export function backgroundLiveCard(tasks: BgTaskEntry[], now: number = Date.now(
       summary: { content: backgroundLiveSummary(tasks) },
     },
     body: {
-      elements: tasks.map(t => backgroundTaskPanel(t, now)),
+      elements: tasks.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
     },
   }
 }
 
 /** 历史沉降卡 —— 用户发新消息且仍有活跃任务时,把旧卡 updateCard 成这个。
  *  只渲染终态任务,streaming 关。留在原地不再跟随。 */
-export function backgroundHistoryCard(tasks: BgTaskEntry[], now: number = Date.now()): object {
+export function backgroundHistoryCard(
+  tasks: BgTaskEntry[],
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
   const terminal = tasks.filter(isBgTerminal)
   return {
     schema: '2.0',
@@ -511,7 +560,7 @@ export function backgroundHistoryCard(tasks: BgTaskEntry[], now: number = Date.n
       summary: { content: `🧭 后台任务(历史) · ${terminal.length} 已结束` },
     },
     body: {
-      elements: terminal.map(t => backgroundTaskPanel(t, now)),
+      elements: terminal.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
     },
   }
 }
