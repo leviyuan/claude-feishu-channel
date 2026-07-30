@@ -367,7 +367,13 @@ export function bindSessionModel(
 }
 
 export function getSessionModelSelection(sessionName: string): SessionModelSelection | null {
-  return selectedModelByName.get(sessionName) ?? null
+  // 临时群(*MMDD-HHMM 后缀)不入 map:先查自己(用户在临时群里显式选过则优先),
+  // 没有就转发查主群名(tempProjectName 反解),让临时群首启继承主群档位而非走默认。
+  // 读取时转发 → 临时群永不入档,既无废记录堆积,bye/失败回滚也无需清理。
+  const direct = selectedModelByName.get(sessionName)
+  if (direct) return direct
+  const parent = tempProjectName(sessionName)
+  return parent ? (selectedModelByName.get(parent) ?? null) : null
 }
 
 export function getSessionModel(sessionName: string): string | null {
