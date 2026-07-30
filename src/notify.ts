@@ -53,7 +53,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
-import { sanitizeMarkdownForCardKit } from './cards/elements'
+import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
   get as getCallback,
@@ -148,7 +148,9 @@ export function buildNotifyCard(opts: {
       elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}</font>` })
     }
   }
-  elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(opts.text ?? '') || '_（空消息）_' })
+  // opts.text 用只降图片、不转义 HTML 的变体:notify 调用方会主动用 <font color='...'>
+  // 做彩色强调(上面图片上传失败行就是这么渲染的),全量转义会把它变成字面文本。
+  elements.push({ tag: 'markdown', content: downgradeExternalImagesForCardKit(opts.text ?? '') || '_（空消息）_' })
 
   if (opts.resolution) {
     // Post-click status marker replaces the button row. operator open_id
