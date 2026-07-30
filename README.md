@@ -136,52 +136,50 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 
 ## ⚙️ 配置参考
 
-配置在 `~/.config/lodestar/config.toml`,`lodestar-setup` 会帮你生成,手改也行。两个常被问的:
+配置在 `~/.config/lodestar/config.toml`,`lodestar-setup` 会帮你生成,手改也行。几个常被问的:
 
-### 想让 footer / 后台卡按秒刷新耗时?
+### footer / 后台卡按秒刷新
 
-默认 `bucket`:活跃 footer 与后台任务 header 用相对档位(`<30s` / `<1m` / …),只在档位边界 push,省飞书 cardkit 配额。需要旧式按秒进度时:
+默认 `bucket`:耗时按相对档位(`<30s` / `<1m` / …)显示,只在档位变化时 push,省飞书配额。想看旧式整秒进度(`45s`、`46s`):
 
 ```toml
 [runtime]
 live_elapsed = "second"   # "bucket"(默认) | "second"
 ```
 
-`second` 时 footer 约每 1s、后台卡约每 2s push,文案为 `45s` 这种整秒。改完需重启 daemon。
+改完重启 daemon 生效。
 
-### 想让某个外部项目跑在别的目录?
+### 外部项目跑在别的目录
 
-默认群名就是 `projects_root` 下的目录名。但如果你的项目放在别处、不想搬进来,在 config.toml 指一下它的目录就行——**section 名就是飞书群名**(daemon 用群名去 `config.projects[群名]` 取 cwd),其它项目不受影响:
+默认群名就是 `projects_root` 下的目录名。项目放在别处、不想搬进来,指一下目录即可——**section 名就是飞书群名**:
 
 ```toml
 [projects.calculator2]
 cwd = "/abs/path/to/calculator2"
 ```
 
-下面几个开关是给"想在这个项目里跑个更受限的 Claude session"的人准备的(限定工具、只挂项目自己的 MCP、只读项目级配置之类)。普通用法用不着,默认全不开,也只对 Claude 后端有效。**要开就整节配齐,配一半对话会卡死**:
+想给某个项目跑个更受限的 Claude session(限定工具、只挂项目自己的 MCP、只读项目级配置),把整节配齐——**配一半对话会卡死**,只对 Claude 后端生效:
 
 ```toml
 [projects.calculator2]
-cwd                        = "/abs/path/to/calculator2"
-setting_sources            = "project"   # 只读项目级配置(会丢全局)
-strict_mcp                 = "true"      # 只挂项目 .mcp.json,挡掉全局 MCP
-tools                      = "Read,Write,Edit,Bash,Glob,Grep"
+cwd             = "/abs/path/to/calculator2"
+setting_sources = "project"   # 只读项目级配置(会丢全局)
+strict_mcp      = "true"      # 只挂项目 .mcp.json,挡掉全局 MCP
+tools           = "Read,Write,Edit,Bash,Glob,Grep"
 ```
 
-> `<cwd>/.mcp.json` 默认就会被读(对齐裸 `claude` 的项目 MCP 自动发现),不用单独开;只有想关掉才设 `load_project_mcp = "false"`。
->
-> 最常踩的坑:`setting_sources = "project"` 会把 `~/.claude/settings.json` 里的 GLM 路由一起丢掉 —— `[claude.env]` 是**无差别注入到所有项目** spawn env 的(不只对这一个项目生效),把 GLM 的 base_url / token 挪过去就能兜住。要是看到卡片一直 `Thinking...`、model 显示 `<synthetic>`,先把整节注释掉重启,基本就是这几个开关没配齐。
+> `setting_sources = "project"` 会连 `~/.claude/settings.json` 里的 GLM 路由一起丢;要保留 GLM 就把 base_url / token 挪到 `[claude.env]`。卡片一直 `Thinking...`、model 显示 `<synthetic>` 时,先把这几项注释掉重启排查。
 
-### 想换成 reclaude 之类的 claude 包装器?
+### 换 claude 包装器
 
-默认 lodestar 自己找 `claude`。想让它改用 [reclaude](https://docs.reclaude.ai)(或别的"参数原样透传"的包装器),指定一下路径:
+默认 lodestar 自己找 `claude`。改用 [reclaude](https://docs.reclaude.ai) 这类"参数原样透传"的包装器,指定路径:
 
 ```toml
 [claude]
 bin = "~/.local/bin/reclaude"
 ```
 
-路径填错会直接报错,不会偷偷回退到自动查找。换成 reclaude 的话,记得把 `~/.claude/settings.json` 或 `[claude.env]` 里残留的 GLM 地址 / Token 清掉,否则流量还走 GLM、reclaude 的拦截不生效。更多细节看 `docs/claude-agent-backend.md`。
+路径填错直接报错,不偷偷回退。换 reclaude 记得清掉 `~/.claude/settings.json` 或 `[claude.env]` 里残留的 GLM 地址 / Token,否则流量还走 GLM。细节看 `docs/claude-agent-backend.md`。
 
 ---
 
