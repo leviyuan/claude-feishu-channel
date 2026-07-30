@@ -767,7 +767,9 @@ async function boot(): Promise<void> {
   feishu.loadSessionTurnsMap()
   feishu.loadSessionModelMap()
   await feishu.refreshChatList()
-  setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)
+  // 群名解析靠 chatNameCache,但新群/改名走 fetchChatName 点查,不依赖这里全量刷。
+  // 5min 全量 chat.list 是纯空转(IM API 计入免费版配额),拉长到 30min 足够保持缓存新鲜。
+  setInterval(() => { void feishu.refreshChatList() }, 30 * 60 * 1000)
   startTasklistWorker()
 
   // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.

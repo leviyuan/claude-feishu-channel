@@ -18,6 +18,11 @@ export const sentRawTexts: string[] = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const urgentPushes: Array<[string, string[]]> = []
+/** task v2 list 调用捕获(测 tasklist-worker 的 scanTaskSections 调用预算:每个 section
+ *  只能拉一次,防 2026-07-30 修掉的双重拉取回归)。beforeEach 调 resetFeishuMock() 清空。 */
+export const listSectionTasksCalls: Array<[string, boolean | undefined]> = []
+export const listTasklistSectionsCalls: string[] = []
+export const listTasklistTasksCalls: Array<[string, boolean | undefined]> = []
 export const modelSelections = new Map<string, {
   provider: 'codex' | 'claude'
   model: string | null
@@ -29,6 +34,9 @@ export const projectProfiles = new Map<string, { cwd?: string }>()
 
 export function resetFeishuMock(): void {
   for (const arr of [sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, urgentPushes]) {
+    arr.length = 0
+  }
+  for (const arr of [listSectionTasksCalls, listTasklistSectionsCalls, listTasklistTasksCalls]) {
     arr.length = 0
   }
   projectProfiles.clear()
@@ -58,6 +66,18 @@ mock.module('./feishu', () => ({
   },
   urgentApp: async (messageId: string, openIds: string[]) => {
     urgentPushes.push([messageId, openIds])
+  },
+  listSectionTasks: async (guid: string, completed?: boolean) => {
+    listSectionTasksCalls.push([guid, completed])
+    return []
+  },
+  listTasklistSections: async (guid: string) => {
+    listTasklistSectionsCalls.push(guid)
+    return []
+  },
+  listTasklistTasks: async (guid: string, completed?: boolean) => {
+    listTasklistTasksCalls.push([guid, completed])
+    return []
   },
   bindSessionResume: (sessionName: string, sessionId: string, provider?: string) => {
     boundResumes.push([sessionName, sessionId, provider])

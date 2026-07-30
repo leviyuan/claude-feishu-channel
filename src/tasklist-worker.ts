@@ -30,8 +30,12 @@ import type {
   TasklistSectionKey,
 } from './tasklist'
 
-const TASKLIST_WORKER_INTERVAL_MS = 30 * 1000
+const TASKLIST_WORKER_INTERVAL_MS = 5 * 60 * 1000
 const TASKLIST_WORKER_BOOT_DELAY_MS = 15_000
+/** ensureTasklistSections(section 结构自愈)的最小间隔。section guid 稳态不变,每个
+ *  worker tick 都 listTasklistSections + getTasklistSection 校验纯属空转打 task v2 API。
+ *  30min 自愈一次足够:section 被人手删的故障窗口最多 30min,换来 API 调用大幅下降。 */
+const SECTION_ENSURE_INTERVAL_MS = 30 * 60 * 1000
 const PROCESS_OUTPUT_TAIL_LIMIT = 20_000
 const COMMENT_OUTPUT_LIMIT = 15_000
 const PLAN_TIMEOUT_MS = 60 * 60 * 1000
@@ -71,11 +75,33 @@ export async function runTasklistWorkerOnce(): Promise<void> {
   }
 }
 
+/** binding 是否已存齐 lodestar 自己的 5 个 section guid(design + aiTodo/aiDoing/aiReview/done)。
+ *  缺任意一个就走 ensureTasklistSections 补全(旧数据迁移 / 刚 enable 还没落 section)。 */
+function hasLodestarSections(binding: TasklistBinding): boolean {
+  const s = binding.sections
+  return Boolean(s && s.design && s.aiTodo && s.aiDoing && s.aiReview && s.done)
+}
+
 async function processTasklist(projectName: string): Promise<void> {
   const projectDir = join(feishu.PROJECTS_ROOT, projectName)
   try {
     if (!existsSync(projectDir)) throw new Error(`project directory does not exist: ${projectDir}`)
-    let binding = await tasklist.ensureTasklistSections(projectName)
+    // ensureTasklistSections 改成低频自愈:section guid 稳态不变,没必要每个 tick 都
+    // listTasklistSections + getTasklistSection 校验。只在 30min 时间窗外、或 binding 还没
+    // 存齐 lodestar 5 个 section guid(旧数据 / 新 enable)时才 ensure 一次。
+    const cachedBinding = tasklist.getTasklistBinding(projectName)
+    if (!cachedBinding) throw new Error(`tasklist is not enabled for ${projectName}`)
+    let binding = cachedBinding
+    const lastEnsureMs = cachedBinding.worker?.lastSectionEnsureAt
+      ? Date.parse(cachedBinding.worker.lastSectionEnsureAt) : 0
+    if (Date.now() - lastEnsureMs > SECTION_ENSURE_INTERVAL_MS || !hasLodestarSections(cachedBinding)) {
+      binding = await tasklist.ensureTasklistSections(projectName)
+      safeUpdate(projectName, b => {
+        b.worker ??= {}
+        b.worker.lastSectionEnsureAt = new Date().toISOString()
+      })
+      binding = tasklist.getTasklistBinding(projectName) ?? binding
+    }
     await markStaleRunningProcesses(projectName, binding)
     binding = tasklist.getTasklistBinding(projectName) ?? binding
     const buckets = await scanTaskSections(binding)
@@ -98,19 +124,32 @@ async function processTasklist(projectName: string): Promise<void> {
 
 type TaskBuckets = Record<TasklistSectionKey, feishu.TaskSummary[]>
 
-async function scanTaskSections(binding: TasklistBinding): Promise<TaskBuckets> {
+export async function scanTaskSections(binding: TasklistBinding): Promise<TaskBuckets> {
   const sections = binding.sections ?? {}
-  const allOpenTasks = await feishu.listTasklistTasks(binding.guid, false)
-  const remoteSections = customSectionsForDesignSubtraction(await feishu.listTasklistSections(binding.guid))
-  const openTasksByCustomSection = await Promise.all(
-    remoteSections.map(section => feishu.listSectionTasks(section.guid, false)),
+  // lodestar 的 4 个 section 各拉一次(todo/doing 取 open;review/done 取 all,下游语义)。
+  // **每个 section 只拉一次** —— 旧版先 Promise.all(所有 custom section 拉 open) 再在 return
+  // 里又把 aiTodo/aiDoing/aiReview/done 拉一遍,同一批 section 打了两遍 section.tasks,是 worker
+  // 空转的主要放大器(2026-07-30 配额审查:稳态每 tick 10 次 → 6 次)。design bucket 的减法
+  // 用 guid 集合,review/done 取 all 是 open 的超集,不影响从 allOpenTasks(只含 open)里减的结果。
+  const aiTodo = sections.aiTodo ? await feishu.listSectionTasks(sections.aiTodo, false) : []
+  const aiDoing = sections.aiDoing ? await feishu.listSectionTasks(sections.aiDoing, false) : []
+  const aiReview = sections.aiReview ? await feishu.listSectionTasks(sections.aiReview) : []
+  const done = sections.done ? await feishu.listSectionTasks(sections.done) : []
+  // 远端可能还有用户手建的非 lodestar section —— 它们的 task 也不能算 design,只拉这些
+  // 「额外」section 的 open(lodestar 4 个已拉过,这里 filter 掉不重复)。
+  const lodestarGuids = new Set(
+    [sections.aiTodo, sections.aiDoing, sections.aiReview, sections.done]
+      .filter((g): g is string => !!g),
   )
+  const extraSections = customSectionsForDesignSubtraction(await feishu.listTasklistSections(binding.guid))
+    .filter(section => !lodestarGuids.has(section.guid))
+  const extraOpen = await Promise.all(
+    extraSections.map(section => feishu.listSectionTasks(section.guid, false)),
+  )
+  const allOpenTasks = await feishu.listTasklistTasks(binding.guid, false)
   return {
-    design: tasksOutsideCustomSections(allOpenTasks, openTasksByCustomSection),
-    aiTodo: sections.aiTodo ? await feishu.listSectionTasks(sections.aiTodo, false) : [],
-    aiDoing: sections.aiDoing ? await feishu.listSectionTasks(sections.aiDoing, false) : [],
-    aiReview: sections.aiReview ? await feishu.listSectionTasks(sections.aiReview) : [],
-    done: sections.done ? await feishu.listSectionTasks(sections.done) : [],
+    design: tasksOutsideCustomSections(allOpenTasks, [aiTodo, aiDoing, aiReview, done, ...extraOpen]),
+    aiTodo, aiDoing, aiReview, done,
   }
 }
 
