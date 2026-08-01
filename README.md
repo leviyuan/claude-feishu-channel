@@ -136,50 +136,23 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 
 ## ⚙️ 配置参考
 
-配置在 `~/.config/lodestar/config.toml`,`lodestar-setup` 会帮你生成,手改也行。几个常被问的:
-
-### footer / 后台卡按秒刷新
-
-默认 `bucket`:耗时按相对档位(`<30s` / `<1m` / …)显示,只在档位变化时 push,省飞书配额。想看旧式整秒进度(`45s`、`46s`):
+配置文件 `~/.config/lodestar/config.toml`,改完重启 daemon 生效。
 
 ```toml
 [runtime]
-live_elapsed = "second"   # "bucket"(默认) | "second"
-```
+live_elapsed = "second"   # footer/后台卡刷新粒度:bucket(默认,按档位省配额) | second(整秒)
 
-改完重启 daemon 生效。
-
-### 外部项目跑在别的目录
-
-默认群名就是 `projects_root` 下的目录名。项目放在别处、不想搬进来,指一下目录即可——**section 名就是飞书群名**:
-
-```toml
-[projects.calculator2]
-cwd = "/abs/path/to/calculator2"
-```
-
-想给某个项目跑个更受限的 Claude session(限定工具、只挂项目自己的 MCP、只读项目级配置),把整节配齐——**配一半对话会卡死**,只对 Claude 后端生效:
-
-```toml
-[projects.calculator2]
+[projects.calculator2]                  # section 名 = 飞书群名(默认取 projects_root 下目录名)
 cwd             = "/abs/path/to/calculator2"
-setting_sources = "project"   # 只读项目级配置(会丢全局)
-strict_mcp      = "true"      # 只挂项目 .mcp.json,挡掉全局 MCP
-tools           = "Read,Write,Edit,Bash,Glob,Grep"
-```
+setting_sources = "project"   # 只读项目级配置,会丢全局 GLM 路由
+strict_mcp      = "true"      # 只挂项目 .mcp.json
+tools           = "Read,Write,Edit,Bash,Glob,Grep"   # 仅 Claude 后端生效
 
-> `setting_sources = "project"` 会连 `~/.claude/settings.json` 里的 GLM 路由一起丢;要保留 GLM 就把 base_url / token 挪到 `[claude.env]`。卡片一直 `Thinking...`、model 显示 `<synthetic>` 时,先把这几项注释掉重启排查。
-
-### 换 claude 包装器
-
-默认 lodestar 自己找 `claude`。改用 [reclaude](https://docs.reclaude.ai) 这类"参数原样透传"的包装器,指定路径:
-
-```toml
 [claude]
-bin = "~/.local/bin/reclaude"
+bin = "~/.local/bin/reclaude"   # 换 claude 包装器;路径错直接报错,不回退
 ```
 
-路径填错直接报错,不偷偷回退。换 reclaude 记得清掉 `~/.claude/settings.json` 或 `[claude.env]` 里残留的 GLM 地址 / Token,否则流量还走 GLM。细节看 `docs/claude-agent-backend.md`。
+> `setting_sources`/`strict_mcp`/`tools` 是一整套,配一半会卡死(卡片一直 `Thinking...`、model 显示 `<synthetic>`)。换 `bin` 后清掉 `~/.claude/settings.json` 或 `[claude.env]` 里残留的 GLM 地址/Token,否则流量还走 GLM。细节见 `docs/claude-agent-backend.md`。
 
 ---
 
