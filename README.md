@@ -152,7 +152,7 @@ tools           = "Read,Write,Edit,Bash,Glob,Grep"
 bin = "~/.local/bin/reclaude"   # 换 claude 包装器;路径错直接报错,不回退
 ```
 
-> 每个字段独立可选,缺省走 Lodestar 默认:`setting_sources`=`user,project,local`(含全局 GLM 路由)、`tools`=`claude_code` 全套、项目 `.mcp.json` 自动发现。`setting_sources="project"` 是有意丢掉 `user` 层做隔离——`~/.claude/settings.json` 里的 GLM 路由会一起丢,要保留 GLM 就把凭据挪到 `[token_source.glm]` 或 `[claude.env]`。换 `bin` 后同理清掉这两处残留的 GLM 地址,否则流量还走 GLM。细节见 `docs/claude-agent-backend.md`。
+> `setting_sources="project"` 会丢掉 `~/.claude/settings.json` 的 GLM 路由,要保留把凭据挪到 `[token_source.glm]`。换 `bin` 后清掉 `settings.json` / `[claude.env]` 残留的 GLM 地址,否则流量仍走 GLM。细节见 `docs/claude-agent-backend.md`。
 
 ---
 
