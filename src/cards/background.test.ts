@@ -65,6 +65,13 @@ describe('liveElapsed', () => {
     expect(liveElapsed(999, 'second')).toEqual({ label: '0s', nextDelayMs: 1000 })
     expect(liveElapsed(1_500, 'second')).toEqual({ label: '1s', nextDelayMs: 1000 })
     expect(liveElapsed(45_000, 'second')).toEqual({ label: '45s', nextDelayMs: 1000 })
+    // 边界:599_999ms 仍按秒,600_000ms(整 10m)切档位。
+    expect(liveElapsed(599_999, 'second')).toEqual({ label: '599s', nextDelayMs: 1000 })
+    // 超 10m:不再按秒,改 5m 颗粒度档位(10m+ / 15m+ / 20m+…),只在 5m 边界 push。
+    expect(liveElapsed(600_000, 'second')).toEqual({ label: '10m+', nextDelayMs: 300_000 })
+    expect(liveElapsed(899_999, 'second')).toEqual({ label: '10m+', nextDelayMs: 1 })
+    expect(liveElapsed(900_000, 'second')).toEqual({ label: '15m+', nextDelayMs: 300_000 })
+    expect(liveElapsed(1_200_000, 'second')).toEqual({ label: '20m+', nextDelayMs: 300_000 })
   })
 })
 

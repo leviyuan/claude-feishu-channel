@@ -134,6 +134,5 @@ export {
   elapsedBucket,
   liveElapsed,
   LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
-  LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS,
   type LiveElapsedMode,
 } from './cards/background'

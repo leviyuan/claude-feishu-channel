@@ -33,7 +33,6 @@ import {
 } from './codex-process'
 import {
   liveElapsed,
-  LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS,
   type LiveElapsedMode,
 } from './cards/background'
 import {
@@ -1851,8 +1850,9 @@ export class Session {
 
   /** 后台卡 tick:running 任务 header 时长标签。
    *  bucket:取所有活跃任务最近档位边界再刷新(省配额);
-   *  second:固定 2s tick。事件驱动的 scheduleBackgroundRefresh 仍负责详情 diff;
-   *  本 tick 只补无 progress 事件时的时长变化。*/
+   *  second:前 10m 每 1s、超 10m 每 5m 边界(同 footer;2026-08-01 起后台卡不再 2s)。
+   *  事件驱动的 scheduleBackgroundRefresh 仍负责详情 diff;本 tick 只补无 progress
+   *  事件时的时长变化。*/
   private startBackgroundRefreshTick(): void {
     if (this.backgroundRefreshTick) return
     const schedule = (): void => {
@@ -1862,9 +1862,7 @@ export class Session {
       let minDelay = Infinity
       for (const t of this.backgroundTasks) {
         if (cards.isBgTerminal(t)) continue
-        const delay = mode === 'second'
-          ? LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS
-          : liveElapsed(now - t.startedAt, mode).nextDelayMs
+        const delay = liveElapsed(now - t.startedAt, mode).nextDelayMs
         if (delay < minDelay) minDelay = delay
       }
       if (!isFinite(minDelay)) return

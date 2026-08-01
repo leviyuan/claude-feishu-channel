@@ -1083,7 +1083,7 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
 })
 
 describe('Session live_elapsed second mode', () => {
-  test('second live_elapsed mode uses 1s footer and 2s background ticks', async () => {
+  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
     // claude-agent-process.test 的 mock.module('./config') 会在全量 suite 里
     // 把 config 换成缺 runtime 的 stub;这里先补上 runtime 再改 mode。
     const cfg = config as any
@@ -1112,7 +1112,7 @@ describe('Session live_elapsed second mode', () => {
         startedAt: Date.now() - 300_001, steps: [],
       }]
       session.startBackgroundRefreshTick()
-      expect(delays.at(-1)).toBe(2000)
+      expect(delays.at(-1)).toBe(1000)
 
       // startFooterStatus 先 Date.now() 记 startedAt,再 Date.now() 算 elapsed。
       // 第一次返回 base,后续返回 base+45s → 文案 Writing... (45s)。
