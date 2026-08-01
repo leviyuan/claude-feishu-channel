@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-07-26 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-08-01 -->
 
 # src
 
@@ -69,6 +69,8 @@
 | `inbound-markers.ts` | 与 `outbound-markers.ts` 对称,解析用户入站消息里的多条消息起始/收尾标记:`>>>`(≥3) 开始收集、`<<<`(≥3) 收尾合并,标记前缀从 body 去掉不转发给 agent;阈值 ≥3 是用户确认的本意(普通 `>`/`>>` 引用不误触,三级嵌套引用 `>>>` 会——可接受)。 |
 | `log.ts` | 按日滚动 logger：写 `daemon-YYYY-MM-DD.log`（本地日期），跨天与启动时清理超过 7 天的旧日志；启动把老 `daemon.log` 迁移成按日文件。 |
 | `feishu-test-mock.ts` | 共享的 `./feishu` 测试替身(仅供 `*.test.ts` import):统一 `mock.module` 注册,避免多测试文件的窄 mock 互相覆盖(cardkit 的窄 mock 曾顶掉 session 的全量 mock,导致单进程 `bun test src/` 时 Session 构造炸 `getSessionModelSelection`);导出 `sentCards`/`sentTexts`/`deletedReactions` 等捕获数组和 `resetFeishuMock()`。 |
+| `config.test.ts` | `config.ts` 的 `[runtime].live_elapsed` 解析测试: 默认 `bucket`、大小写不敏感接受 `bucket`/`second`、拒绝未知值并报错暴露; 因 `config.ts` 在 import 时同步读配置无法直接 mock, 改用隔离子进程 `Bun.spawnSync` 跑 `loadFreshConfig`(临时 config.toml + `LODESTAR_CONFIG` 覆盖)。 |
+| `feishu-model-map.test.ts` | `feishu.ts` 的 `getSessionModelSelection` 临时群转发测试: 验证 `*MMDD-HHMM`(及去重后缀 `*MMDD-HHMM-2`)临时群名经 `tempProjectName` 反解转发查主群档位、临时群永不入档无堆积、临时群显式选过则优先自己; 模式参照 `config.test.ts`(隔离子进程 + 独立 `LODESTAR_DATA_DIR`/`LODESTAR_CONFIG`, 结果用 `@@@` 标记包裹避开 feishu log 噪音)。 |
 | `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn/agy/task card 渲染、tasklist worker、card action 回调返回、context window 展示、outbound/inbound marker、入站多条消息合并、后台任务卡、临时会话卡、notify 回调、Codex 事件解析、usage 快照、session 行为和 worktree/agy Git 行为。 |
 
 ## Subdirectories
@@ -100,6 +102,7 @@
 - 修改 `agy` 命令、外部进程、Git 快照或卡片结构后，至少运行 `bun test src/agy-task.test.ts src/cards/agy.test.ts`，共享 session 行为变更再运行全量 `bun test`。
 - 修改 `task` 面板、清单分组、worker 调度、任务评论或本地审查/合并流程后，至少运行 `bun test src/tasklist-worker.test.ts src/cards/task.test.ts`；触及共享 session 或 Feishu API 包装时运行全量 `bun test`。
 - 修改 `cards/` 渲染或工具摘要时至少运行相关 Bun 测试：`bun test src/cards/turn.test.ts src/cardkit.test.ts src/context-window.test.ts`。
+- 修改 `config.ts` 的 `[runtime]`/`[codex.env]` 解析或 `feishu.ts` 的 session-model-map 转发(`getSessionModelSelection`/`bindSessionModel`/`tempProjectName`)后, 跑 `bun test src/config.test.ts src/feishu-model-map.test.ts`(这两类模块 import 时有副作用, 测试用隔离子进程隔离, 不污染真实档案)。
 
 ### Common Patterns
 - `daemon.ts` 负责把 Feishu WS 事件转成 `Session` 调用；`Session` 再把 Codex 事件转成 `cardkit` 操作。
