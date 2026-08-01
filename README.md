@@ -142,17 +142,17 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 [runtime]
 live_elapsed = "second"   # footer/后台卡刷新粒度:bucket(默认,按档位省配额) | second(整秒)
 
-[projects.calculator2]                  # section 名 = 飞书群名(默认取 projects_root 下目录名)
-cwd             = "/abs/path/to/calculator2"
-setting_sources = "project"   # 只读项目级配置,会丢全局 GLM 路由
+[projects.calculator2]            # section 名 = 飞书群名(= projects_root 下目录名);整节仅 Claude 后端生效
+cwd             = "/abs/path/to/calculator2"   # 不填则用 projects_root/<群名>
+setting_sources = "project"   # 只读项目级配置,丢全局 GLM 路由
 strict_mcp      = "true"      # 只挂项目 .mcp.json
-tools           = "Read,Write,Edit,Bash,Glob,Grep"   # 仅 Claude 后端生效
+tools           = "Read,Write,Edit,Bash,Glob,Grep"
 
 [claude]
 bin = "~/.local/bin/reclaude"   # 换 claude 包装器;路径错直接报错,不回退
 ```
 
-> `setting_sources`/`strict_mcp`/`tools` 是一整套,配一半会卡死(卡片一直 `Thinking...`、model 显示 `<synthetic>`)。换 `bin` 后清掉 `~/.claude/settings.json` 或 `[claude.env]` 里残留的 GLM 地址/Token,否则流量还走 GLM。细节见 `docs/claude-agent-backend.md`。
+> 每个字段独立可选,缺省走 Lodestar 默认:`setting_sources`=`user,project,local`(含全局 GLM 路由)、`tools`=`claude_code` 全套、项目 `.mcp.json` 自动发现。`setting_sources="project"` 是有意丢掉 `user` 层做隔离——`~/.claude/settings.json` 里的 GLM 路由会一起丢,要保留 GLM 就把凭据挪到 `[token_source.glm]` 或 `[claude.env]`。换 `bin` 后同理清掉这两处残留的 GLM 地址,否则流量还走 GLM。细节见 `docs/claude-agent-backend.md`。
 
 ---
 
