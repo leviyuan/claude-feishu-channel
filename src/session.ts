@@ -603,6 +603,7 @@ export class Session {
         forkSession,
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
+        ...(ts?.settingSources ? { settingSources: ts.settingSources } : {}),
         transformEnv,
       })
     }
@@ -3089,31 +3090,36 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
-  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%·[Xh]`),按当前 provider:
-   *   claude/GLM → readGlmUsage(轻量 HTTP,主动拉当前 5h 窗口)
-   *   codex      → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
+  /** turn footer 末尾的额度后缀,按当前 token source 渲染(不再硬编码 GLM):
+   *   claude source(glm/deepseek)→ ts.readUsage(轻量 HTTP):glm 显示 5h 滚动窗口 %,
+   *                deepseek 等标量余额 source 显示 planLabel「剩余 ¥X」
+   *   codex        → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
    *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
-   * 拿不到百分比就返回空串;resetsAt 在未来时追加剩余重置时长
-   * (`·[2.3h]`),缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
-  private async footerFiveHourSuffix(provider: AgentProvider): Promise<string> {
-    let pct: number | null = null
-    let resetsAt: Date | null = null
-    if (provider === 'claude') {
-      const g = await readGlmUsage()
-      if (g.state === 'ok') {
-        pct = g.fiveHour?.percent ?? null
-        resetsAt = g.fiveHour?.resetsAt ?? null
-      }
-    } else {
-      const u = peekUsage()
-      if (u?.state === 'ok') {
-        pct = u.fiveHour?.percent ?? null
-        resetsAt = u.fiveHour?.resetsAt ?? null
-      }
+   * 拿不到数据返回空串;resetsAt 在未来时追加剩余重置时长(`·[2.3h]`),
+   * 缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
+  private async footerUsageSuffix(provider: AgentProvider): Promise<string> {
+    const ts = this.currentTokenSource()
+    if (ts?.agent === provider && ts.enabled && provider === 'claude') {
+      const snap = await ts.readUsage()
+      const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
+      if (fiveHour) return this.fmtFiveHourSuffix(fiveHour.percent, fiveHour.resetsAt)
+      // DeepSeek 等标量余额 source(无 5h 窗口)→ 显示 planLabel(余额);失败/无数据不假数据
+      return snap.state === 'ok' && snap.planLabel ? `  |  ${snap.planLabel}` : ''
     }
-    if (pct == null) return ''
+    if (provider === 'codex') {
+      const u = peekUsage()
+      return u?.state === 'ok' ? this.fmtFiveHourSuffix(u.fiveHour?.percent ?? null, u.fiveHour?.resetsAt ?? null) : ''
+    }
+    // claude 无匹配 token source(理论不发生,token source 总有)→ 回退 readGlmUsage 兼容
+    const g = await readGlmUsage()
+    return g.state === 'ok' ? this.fmtFiveHourSuffix(g.fiveHour?.percent ?? null, g.fiveHour?.resetsAt ?? null) : ''
+  }
+
+  /** 5h 滚动窗口百分比 + 重置倒计时的 footer 后缀;percent null → 空串。 */
+  private fmtFiveHourSuffix(percent: number | null, resetsAt: Date | null): string {
+    if (percent == null) return ''
     const resetIn = resetsAt && resetsAt.getTime() > Date.now() ? cards.fmtResetIn(resetsAt) : ''
-    return resetIn ? `  |  5h·${Math.round(pct)}%·[${resetIn}]` : `  |  5h·${Math.round(pct)}%`
+    return resetIn ? `  |  5h·${Math.round(percent)}%·[${resetIn}]` : `  |  5h·${Math.round(percent)}%`
   }
 
   async closeTurnCard(
@@ -3188,7 +3194,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix(turn.provider))
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerUsageSuffix(turn.provider))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)

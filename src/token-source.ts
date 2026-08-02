@@ -14,6 +14,7 @@
 
 import type { AgentReasoningEffort } from './agent-process'
 import type { TokenSourceConfig } from './config'
+import { log } from './log'
 
 export type TokenSourceAgent = 'claude' | 'codex'
 
@@ -95,16 +96,41 @@ export interface TokenSource {
   refreshModels(): Promise<void>
   spawnEnv(base: Env): Env
   resolveSpawnModel(model: string): string | undefined
+  /** 该 source spawn 的 claude 子进程 settingSources(覆盖 DEFAULT_SETTING_SOURCES)。
+   *  注入 env 的 source(glm/deepseek)不设 → DEFAULT(['project','local'],spawnEnv 权威);
+   *  透传型 source(native)设 ['user','project','local'] → 读本机 Claude Code 配置。 */
+  settingSources?: readonly string[]
   readUsage(): Promise<UsageSnapshotUnified>
 }
 
 // ── provider factory registry(声明式:每 source 模块加载时登记) ──────────
 
+/** 飞书 setup 命令接入(`<commandSuffix>-setup`):source 声明引导 + 参数解析,
+ *  加新 source 不必改 session-commands 命令路由(声明式 generic 路由)。 */
+export interface TokenSourceSetup {
+  /** 命令后缀:飞书发 `<commandSuffix>-setup <args>`;通常 = configSectionId。 */
+  commandSuffix: string
+  /** model 面板「启用」按钮的引导文本(含命令用法)。 */
+  hint: (display: string) => string
+  /** 解析飞书命令参数 → 写 config.toml 的 cfg;失败返 { error }。 */
+  parseArgs: (args: string) => { config: TokenSourceConfig } | { error: string }
+}
+
+/** 本机 settings.json 探测:config.toml 没配时,若本机 Claude Code 配的 host 命中本 source,
+ *  自动启用(凭据从 settings.json 取)—— 新机装 lodestar 不用手动 config.toml,本机配啥自动认。 */
+export interface TokenSourceDetection {
+  fromSettingsEnv(env: Record<string, string>): Partial<TokenSourceConfig> | null
+}
+
 export interface TokenSourceFactoryDef {
   kind: string
   /** config.toml 里该 source 的 section id(如 'glm');undefined = 无 config(codex 走本地 login) */
   configSectionId?: string
-  build: (cfg: TokenSourceConfig) => TokenSource
+  build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null) => TokenSource
+  /** 飞书 setup 命令接入(可选;codex login / native 无独立 setup)。 */
+  setup?: TokenSourceSetup
+  /** 本机 settings.json 探测(可选;codex / native 无)—— 命中 host 则自动启用。 */
+  detect?: TokenSourceDetection
 }
 
 const factoryRegistry = new Map<string, TokenSourceFactoryDef>()
@@ -158,4 +184,15 @@ export function setDefaultTokenSource(id: string): void {
 export function resetTokenSourceRegistry(): void {
   registry.clear()
   defaultId = null
+}
+
+/** 全量刷新所有 token source 的 models(boot 启动 / setup rebuild 后调)。
+ *  rebuild(resetTokenSourceRegistry)丢弃旧实例、重建空实例,必须重新 refresh,
+ *  否则非当前操作的 source 的 models 永远空(deepseek-setup 后 glm/codex 变空)。
+ *  allSettled:单个失败不阻断其余;失败如实留空,绝不假数据。 */
+export async function refreshAllTokenSourceModels(): Promise<void> {
+  await Promise.allSettled(listTokenSources().map(async ts => {
+    await ts.refreshModels()
+    log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
+  }))
 }

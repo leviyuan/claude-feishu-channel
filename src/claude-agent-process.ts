@@ -94,6 +94,10 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
    * strict-mcp / project-mcp loading for an isolated session. Absent ⇒
    * Lodestar defaults (user sources, claude_code preset, no project MCP). */
   profile?: ProjectProfile
+  /** 覆盖 settingSources(优先于 profile / DEFAULT_SETTING_SOURCES)。
+   *  注入 env 的 token source(glm/deepseek)不传 → DEFAULT(['project','local'],不读 user settings env,spawnEnv 权威);
+   *  透传型 source(native)传 ['user','project','local'] → 读本机 Claude Code 配置(settings.json env / .credentials)。 */
+  settingSources?: readonly string[]
 }
 
 type ClaudePathLookup = {
@@ -266,7 +270,10 @@ function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number
  *  jsonl 都在此 —— rs 历史列表扫这个目录,得到同工作目录的全部 claude 会话
  *  (worktree 不同 cwd → 不同编码目录,自然不混进来)。cwd 编码 = 绝对路径 / 全替换成 -。 */
 export function claudeTranscriptDir(workDir: string): string {
-  const encoded = workDir.replace(/\//g, '-')
+  // 编码对齐 Claude Code SDK:cwd 非字母数字字符全 → -(不只 /,[ ] . _ - 等也 → -)。
+  // 否则 workDir 含特殊字符(如 test[deepseek])时,SDK 实际 transcript dir 与本函数算出的
+  // 不一致,readLastCallUsageFromTranscript 读不到 → lastContextTokens 恒 null → footer 无 🧠。
+  const encoded = workDir.replace(/[^a-zA-Z0-9]/g, '-')
   const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
   return join(configDir, 'projects', encoded)
 }
@@ -467,13 +474,17 @@ function mapModelInfo(info: ModelInfo): CodexModel {
 export const CLAUDE_PERMISSION_MODE = 'default' as const
 
 /** Default setting sources when no project profile overrides them.
- * Matches the bare `claude` CLI (user + project + local) so a project's
- * CLAUDE.md / skills / agents / settings.json are honored when claude runs
- * under lodestar — parity with launching claude directly in that dir. */
-const DEFAULT_SETTING_SOURCES: readonly string[] = ['user', 'project', 'local']
+ * 刻意不含 'user':lodestar spawn 的 agent 是无头子进程,env 全由 token source
+ * 的 spawnEnv 注入(token-source-*.ts)。若读 user settings(~/.claude/settings.json
+ * 的 env 段),其 ANTHROPIC_BASE_URL/AUTH_TOKEN/slots 会**覆盖** spawnEnv —— 导致
+ * 只有和 settings.json 一致的 source(如本机配的 GLM)能跑通,切 DeepSeek 等其他
+ * source 被覆盖打到错误端点。故 user settings 的 env 段不参与;permissions/hooks
+ * 由 lodestar canUseTool 自管,project 的 CLAUDE.md/skills/agents 仍经 project/local 生效。
+ * 只影响 lodestar spawn 的子进程;裸 claude CLI 不经 lodestar,不受影响。 */
+const DEFAULT_SETTING_SOURCES: readonly string[] = ['project', 'local']
 
 /** Resolve SDK `settingSources` from a project profile's comma-separated
- * string (e.g. `"project"`), falling back to CLI parity (user+project+local). */
+ * string (e.g. `"project"`), falling back to project+local. */
 export function settingSourcesFromProfile(profile: ProjectProfile | undefined): string[] {
   if (!profile?.settingSources) return [...DEFAULT_SETTING_SOURCES]
   const list = profile.settingSources.split(',').map(s => s.trim()).filter(Boolean)
@@ -673,7 +684,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true}`)
     }
-    const settingSources = settingSourcesFromProfile(profile)
+    const settingSources = this.opts.settingSources ?? settingSourcesFromProfile(profile)
     const toolsOption = toolsFromProfile(profile)
     const strictMcpConfig = profile?.strictMcp === true
     // Default true (CLI parity): discover <cwd>/.mcp.json like bare `claude`.

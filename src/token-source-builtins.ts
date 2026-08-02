@@ -13,6 +13,7 @@ import {
   setDefaultTokenSource,
   tokenSourceFactories,
 } from './token-source'
+import { readClaudeSettingsEnv } from './glm-usage'
 
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
@@ -24,10 +25,19 @@ import './token-source-deepseek'
  *  daemon 启动调;飞书改 token source 配置后也可重调(热更新)。 */
 export function buildTokenSourcesFromConfig(): number {
   resetTokenSourceRegistry()
+  const settingsEnv = readClaudeSettingsEnv()
   const sources = tokenSourceFactories().map(def => {
     const cfg = def.configSectionId ? (config.token_sources[def.configSectionId] ?? {}) : {}
-    return def.build(cfg)
+    // config.toml 没配时,若本机 settings.json 命中本 source 的 detect host,自动启用(凭据从 settings.json 取)
+    const detected = def.detect?.fromSettingsEnv(settingsEnv) ?? null
+    return def.build(cfg, detected)
   })
+  // native 兜底:有显式 claude-side source(glm/deepseek/...)启用则让位;否则 native 启用(真 Claude)。
+  const native = sources.find(s => s.kind === 'claude-native')
+  if (native) {
+    const hasClaudeSource = sources.some(s => s.agent === 'claude' && s.enabled && s.kind !== 'claude-native')
+    native.enabled = !hasClaudeSource
+  }
   for (const s of sources) registerTokenSource(s)
   const firstEnabled = sources.find(s => s.enabled)
   if (firstEnabled) setDefaultTokenSource(firstEnabled.id)

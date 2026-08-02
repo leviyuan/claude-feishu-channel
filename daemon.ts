@@ -757,11 +757,8 @@ async function boot(): Promise<void> {
   buildTokenSourcesFromConfig()
   // 各 source 后台拉模型填 models(codex 拉 model/list,几秒;glm 内置同步)。
   // 不阻塞 boot —— 拉完前面板显 MISS,拉完自动有。失败如实留空,绝不假数据。
-  const { listTokenSources } = await import('./src/token-source')
-  void Promise.allSettled(listTokenSources().map(async ts => {
-    await ts.refreshModels()
-    log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
-  }))
+  const { refreshAllTokenSourceModels } = await import('./src/token-source')
+  void refreshAllTokenSourceModels()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
   feishu.loadSessionTurnsMap()

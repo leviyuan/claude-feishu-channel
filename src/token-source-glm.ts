@@ -14,7 +14,7 @@ import {
   scrubAnthropicEnv,
   registerTokenSourceFactory,
 } from './token-source'
-import { fetchGlmUsage, resolveClaudeGlm, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
+import { fetchGlmUsage, isGlmBaseUrl, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
 import { fetchGlmModels } from './token-source-models'
 import { log } from './log'
 
@@ -57,11 +57,11 @@ function glmUsageToUnified(s: GlmUsageSnapshot): UsageSnapshotUnified {
 registerTokenSourceFactory({
   kind: 'glm-coding-plan',
   configSectionId: 'glm',
-  build: (cfg: TokenSourceConfig): TokenSource => {
-    // GLM 启用判定走 glm-usage.ts 的 resolveClaudeGlm(与 native 兜底 source 共享,
-    // 保证严格互斥)。优先级 config.toml [token_source.glm] > ~/.claude/settings.json
-    // env(后者 base_url 须命中 GLM host 才被借作 fallback,真 Anthropic 等不会被吞)。
-    const { baseUrl, token, enabled } = resolveClaudeGlm(cfg)
+  build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null): TokenSource => {
+    // config.toml 优先,本机 settings.json 探测(detected)兜底 —— 有任一且 host 命中 GLM 即启用。
+    const baseUrl = cfg.base_url?.trim() || detected?.base_url?.trim() || ''
+    const token = cfg.auth_token?.trim() || detected?.auth_token?.trim() || ''
+    const enabled = !!(baseUrl && token) && isGlmBaseUrl(baseUrl)
     const ts: TokenSource = {
       id: 'glm',
       kind: 'glm-coding-plan',
@@ -103,5 +103,22 @@ registerTokenSourceFactory({
       },
     }
     return ts
+  },
+  setup: {
+    commandSuffix: 'glm',
+    hint: display => `启用 ${display}:发送\n\`\`\`\nglm-setup <base_url> <token>\n\`\`\``,
+    parseArgs: args => {
+      const parts = args.trim().split(/\s+/)
+      if (parts.length < 2) return { error: '用法:`glm-setup <base_url> <token>`' }
+      return { config: { agent: 'claude', base_url: parts[0], auth_token: parts[1] } }
+    },
+  },
+  detect: {
+    fromSettingsEnv(env) {
+      const baseUrl = env.ANTHROPIC_BASE_URL?.trim() ?? ''
+      if (!isGlmBaseUrl(baseUrl)) return null
+      const token = env.ANTHROPIC_AUTH_TOKEN?.trim() ?? ''
+      return token ? { base_url: baseUrl, auth_token: token } : null
+    },
   },
 })

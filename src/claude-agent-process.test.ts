@@ -852,9 +852,9 @@ describe('Claude transcript context tokens', () => {
 })
 
 describe('Claude project profile overrides', () => {
-  test('settingSourcesFromProfile falls back to CLI parity (user+project+local) when absent', () => {
-    expect(settingSourcesFromProfile(undefined)).toEqual(['user', 'project', 'local'])
-    expect(settingSourcesFromProfile({})).toEqual(['user', 'project', 'local'])
+  test('settingSourcesFromProfile falls back to project+local when absent (排除 user: settings.json env 段不覆盖 token source spawnEnv)', () => {
+    expect(settingSourcesFromProfile(undefined)).toEqual(['project', 'local'])
+    expect(settingSourcesFromProfile({})).toEqual(['project', 'local'])
   })
 
   test('settingSourcesFromProfile splits and trims comma-separated sources', () => {
@@ -862,9 +862,9 @@ describe('Claude project profile overrides', () => {
     expect(settingSourcesFromProfile({ settingSources: 'user, project' })).toEqual(['user', 'project'])
   })
 
-  test('settingSourcesFromProfile falls back to CLI parity when only blanks given', () => {
-    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user', 'project', 'local'])
-    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user', 'project', 'local'])
+  test('settingSourcesFromProfile falls back to project+local when only blanks given', () => {
+    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['project', 'local'])
+    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['project', 'local'])
   })
 
   test('toolsFromProfile falls back to claude_code preset when absent', () => {

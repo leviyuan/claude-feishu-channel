@@ -69,18 +69,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await s.showTasklistPanel()
     return true
   }
-  // glm-setup <base_url> <token> —— 启用 GLM Coding Plan(未配置 source 的「启用」入口,配合 model 面板)
-  const glmSetup = raw.trim().match(/^glm-setup\s+([\s\S]+)$/i)
-  if (glmSetup) {
-    const { runGlmSetupCommand } = await import('./token-source-setup')
-    await runGlmSetupCommand(s, glmSetup[1].trim())
-    return true
-  }
-  // deepseek-setup <api_key> | <base_url> <api_key> —— 启用 DeepSeek(默认官方 Anthropic 端点)
-  const dsSetup = raw.trim().match(/^deepseek-setup\s+([\s\S]+)$/i)
-  if (dsSetup) {
-    const { runDeepseekSetupCommand } = await import('./token-source-setup')
-    await runDeepseekSetupCommand(s, dsSetup[1].trim())
+  // <source>-setup <args> —— 启用某 token source(generic:路由到 source factory 的 setup.parseArgs,
+  // 加新 source 不改本文件 —— 在 token-source-<name>.ts 声明 setup 字段即自动接入)。
+  const tsSetup = raw.trim().match(/^(\w+)-setup\s+([\s\S]+)$/i)
+  if (tsSetup) {
+    const { runTokenSourceSetup } = await import('./token-source-setup')
+    await runTokenSourceSetup(s, tsSetup[1].trim(), tsSetup[2].trim())
     return true
   }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())

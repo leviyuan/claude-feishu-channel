@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { reloadTokenSources, type TokenSourceConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
+import { refreshAllTokenSourceModels } from './token-source'
 
 /** TOML 基本字符串转义(与 setup.ts escapeTomlString / config.ts parseToml 反转义对称) */
 function esc(v: string): string {
@@ -40,10 +41,14 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   return lines.join('\n')
 }
 
-/** 写后热更新:reload config 单例 + rebuild token source registry */
+/** 写后热更新:reload config 单例 + rebuild token source registry + 全量刷新 models。
+ *  rebuild(resetTokenSourceRegistry)丢弃旧实例重建空实例,必须重新 refresh,否则非当前
+ *  操作的 source models 永远空(setup deepseek 后 glm/codex 变空)。在此统一兜底,
+ *  addTokenSource/removeTokenSource 的调用方不必各自记得 refresh。 */
 function reloadAndRebuild(): void {
   reloadTokenSources()
   buildTokenSourcesFromConfig()
+  void refreshAllTokenSourceModels()
 }
 
 /** 新增/覆盖一个 token source:追加 [token_source.<id>] 节到 config.toml。
