@@ -92,7 +92,7 @@ describe('Claude model profiles', () => {
     }
   })
 
-  test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
+  test('maps claude profiles to SDK model alias', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
   })

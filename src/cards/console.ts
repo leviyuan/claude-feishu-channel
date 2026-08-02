@@ -416,7 +416,8 @@ export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefine
     if (w.resetsAt) parts.push(`重置 ${fmtResetIn(w.resetsAt)}`)
     lines.push(`　· ${w.label}　${parts.join(' · ')}`)
   }
-  return lines.length === 1 ? '**📊 额度**　_无数据_' : lines.join('\n')
+  // planLabel-only(标量余额 source 如 DeepSeek,无滚动窗口)不算「无数据」。
+  return lines.length === 1 && !snap.planLabel ? '**📊 额度**　_无数据_' : lines.join('\n')
 }
 
 /** 订阅额度行:有 unifiedUsage(tokenSource.readUsage)优先统一渲染;

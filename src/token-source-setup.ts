@@ -33,9 +33,37 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
       s.chatId,
       `${ts.display} 需要 ChatGPT 登录:在服务器执行 \`codex login\`,完成后重启 daemon(\`systemctl --user restart feishu-daemon\`)或重发 \`model\` 刷新。`,
     )
+  } else if (ts.kind === 'deepseek') {
+    await feishu.sendText(
+      s.chatId,
+      `启用 ${ts.display}:发送\n\`\`\`\ndeepseek-setup <api_key>\n\`\`\`\n默认走官方 Anthropic 端点;自建中转用 \`deepseek-setup <base_url> <api_key>\`。`,
+    )
   } else if (ts.kind === 'claude-native') {
     // native 凭本机 Claude 配置自动启用/禁用,无独立「启用」操作(它就是默认通路)。
     await feishu.sendText(s.chatId, `${ts.display} 直接使用本机 Claude Code 配置,无需单独启用。`)
+  }
+}
+
+/** `deepseek-setup <api_key>` | `<base_url> <api_key>` 文本命令:写 config + 热更新 registry。
+ *  单参数 = api_key(走官方 Anthropic 端点默认值);双参数 = 自定义 base_url + api_key。 */
+export async function runDeepseekSetupCommand(s: Session, args: string): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) {
+    await feishu.sendText(s.chatId, '用法:`deepseek-setup <api_key>`(官方端点)或 `deepseek-setup <base_url> <api_key>`(自建中转)')
+    return
+  }
+  const baseUrl = parts.length >= 2 ? parts[0] : undefined
+  const apiKey = parts.length >= 2 ? parts[1] : parts[0]
+  try {
+    addTokenSource('deepseek', { agent: 'claude', ...(baseUrl ? { base_url: baseUrl } : {}), api_key: apiKey })
+    const ds = getTokenSource('deepseek')
+    if (ds) await ds.refreshModels()
+    await feishu.sendText(
+      s.chatId,
+      `✅ ${ds?.display ?? 'DeepSeek'} 已启用${baseUrl ? `(base_url=${baseUrl})` : '(官方端点)'}。发 \`model\` 重新选择。`,
+    )
+  } catch (e: any) {
+    await feishu.sendText(s.chatId, `❌ 启用失败: ${e?.message ?? e}`)
   }
 }
 
