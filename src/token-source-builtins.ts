@@ -27,7 +27,9 @@ export function buildTokenSourcesFromConfig(): number {
   resetTokenSourceRegistry()
   const settingsEnv = readClaudeSettingsEnv()
   const sources = tokenSourceFactories().map(def => {
-    const cfg = def.configSectionId ? (config.token_sources[def.configSectionId] ?? {}) : {}
+    // config.token_sources ?? {}：防御 test 环境 mock.module('./config') 跨文件污染
+    // (claude-agent-process.test mock 的 config 无 token_sources);生产 loadConfig 总返 record。
+    const cfg = def.configSectionId ? ((config.token_sources ?? {})[def.configSectionId] ?? {}) : {}
     // config.toml 没配时,若本机 settings.json 命中本 source 的 detect host,自动启用(凭据从 settings.json 取)
     const detected = def.detect?.fromSettingsEnv(settingsEnv) ?? null
     return def.build(cfg, detected)

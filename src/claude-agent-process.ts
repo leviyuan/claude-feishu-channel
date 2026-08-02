@@ -299,7 +299,12 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
     if (!line) continue
     try {
       const m = JSON.parse(line)
-      if (m?.type === 'assistant' && m?.message?.usage) return m.message.usage as CodexUsage
+      if (m?.type === 'assistant' && m?.message?.usage) {
+        const u = m.message.usage as CodexUsage
+        // 跳过 synthetic 占位(SDK 对部分 turn 写 model='<synthetic>' usage 0/0,非真实 API call)
+        const occ = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
+        if (occ > 0) return u
+      }
     } catch { /* skip malformed line */ }
   }
   return null
@@ -1186,9 +1191,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
     // modelUsage 是 session 累计,都不能代表当前上下文)。与 Claude Code 底栏(omc hud)
     // context_window.current_usage 同口径。transcript 不可读 → null → footer 显 MISS。
-    this.lastContextTokens = contextOccupancyFromUsage(
-      readLastCallUsageFromTranscript(claudeTranscriptPath(this.opts.workDir, this.sessionId ?? ''))
-    )
+    // transcript 读最后真实 assistant usage(跳 synthetic);文件存在但全 synthetic(DeepSeek 前 turn
+    // SDK 只写占位)→ fallback result.usage 单 turn input;文件不存在(test / 新 session 首次)→ null(MISS)。
+    const transcriptPath = claudeTranscriptPath(this.opts.workDir, this.sessionId ?? '')
+    const transcriptUsage = readLastCallUsageFromTranscript(transcriptPath)
+    this.lastContextTokens = contextOccupancyFromUsage(transcriptUsage)
+      ?? (existsSync(transcriptPath) ? contextOccupancyFromUsage(usage) : null)
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
         usage: this.lastUsage,
