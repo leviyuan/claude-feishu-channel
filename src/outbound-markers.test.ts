@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
+import { extractAskUsrMarkers, extractSendMarkerPaths, normalizeOutboundPath, stripAskUsrMarkers } from './outbound-markers'
 
 describe('outbound send markers', () => {
   test('extracts paths that contain square brackets', () => {
@@ -48,5 +48,30 @@ describe('host askusr markers', () => {
 
   test('does not match askusr markers split across lines', () => {
     expect(extractAskUsrMarkers('[[askusr: {"question":"A?"}\n]]')).toEqual([])
+  })
+})
+
+describe('normalizeOutboundPath', () => {
+  test('win32: rewrites MSYS drive prefix to native path', () => {
+    expect(normalizeOutboundPath('/c/Users/maoxiandao2/winctl_screen.jpg', 'win32'))
+      .toBe('C:\\Users\\maoxiandao2\\winctl_screen.jpg')
+    expect(normalizeOutboundPath('/d/projects/a/b.png', 'win32'))
+      .toBe('D:\\projects\\a\\b.png')
+  })
+
+  test('win32: leaves native Windows paths untouched', () => {
+    expect(normalizeOutboundPath('C:\\Users\\a\\x.jpg', 'win32')).toBe('C:\\Users\\a\\x.jpg')
+    expect(normalizeOutboundPath('C:/Users/a/x.jpg', 'win32')).toBe('C:/Users/a/x.jpg')
+  })
+
+  test('win32: leaves non-drive POSIX absolutes untouched', () => {
+    expect(normalizeOutboundPath('/home/a/x.jpg', 'win32')).toBe('/home/a/x.jpg')
+    expect(normalizeOutboundPath('/tmp/a', 'win32')).toBe('/tmp/a')
+    expect(normalizeOutboundPath('/usr/bin/x', 'win32')).toBe('/usr/bin/x')
+  })
+
+  test('non-win32: no-op even for MSYS-looking paths', () => {
+    expect(normalizeOutboundPath('/c/Users/a/x.jpg', 'linux')).toBe('/c/Users/a/x.jpg')
+    expect(normalizeOutboundPath('/c/Users/a/x.jpg', 'darwin')).toBe('/c/Users/a/x.jpg')
   })
 })

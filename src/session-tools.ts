@@ -8,6 +8,7 @@
 import type { Session } from './session'
 import type { TurnState } from './session-types'
 import { isAbsolute } from 'node:path'
+import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -26,7 +27,9 @@ function isImageGenerationTool(name: string): boolean {
 
 export function autoSendPathFromToolResult(name: string, output: string, isError: boolean): string | null {
   if (isError || !isImageGenerationTool(name)) return null
-  const p = output.trim()
+  // 图片工具在 Windows git bash 下可能吐 /c/Users/... 的 MSYS 路径,
+  // 归一化成 C:\Users\... 再校验,否则 statSync 会 ENOENT。
+  const p = normalizeOutboundPath(output.trim())
   return isAbsolute(p) ? p : null
 }
 

@@ -66,7 +66,7 @@ import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
 } from './context-window'
-import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
+import { extractAskUsrMarkers, extractSendMarkerPaths, normalizeOutboundPath, stripAskUsrMarkers } from './outbound-markers'
 import * as sessionMultimsg from './session-multimsg'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
@@ -3030,7 +3030,10 @@ export class Session {
   }
 
   sendOutboundPath(rawPath: string, source: string): void {
-    const p = rawPath.trim()
+    // 归一化 MSYS/Git Bash 风格路径(/c/Users/... → C:\Users\...);否则
+    // Windows 上 statSync 把 /c 当成当前盘根下的相对路径,stat 成
+    // C:\c\Users\... 而 ENOENT。
+    const p = normalizeOutboundPath(rawPath.trim())
     if (!p) return
     const turn = this.currentTurn
     if (turn?.outboundSeenPaths.has(p)) return
