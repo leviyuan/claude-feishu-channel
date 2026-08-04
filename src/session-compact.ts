@@ -5,6 +5,7 @@ import {
   type TokenUsageUpdated,
 } from './codex-process'
 import type { AgentProcess } from './agent-process'
+import { NothingToCompactError } from './agent-process'
 import * as feishu from './feishu'
 import { log } from './log'
 import {
@@ -206,7 +207,11 @@ export async function runCompactCommand(s: Session): Promise<void> {
     await finishStatus(s.withModel(`✅ 上下文已压缩${doneThread}${compactContextWindowLabel(contextSnapshot)}`))
   } catch (e) {
     watch.cancel()
-    await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
+    if (e instanceof NothingToCompactError) {
+      await finishStatus(s.withModel(`ⓘ ${e.message}`))
+    } else {
+      await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
+    }
   } finally {
     usageWatch.cancel()
     s.manualContextCompactionPending = false

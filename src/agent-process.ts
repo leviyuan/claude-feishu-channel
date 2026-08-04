@@ -32,6 +32,17 @@ export function agentProviderLabel(provider: AgentProvider): string {
   return provider === 'claude' ? 'Claude' : 'Codex'
 }
 
+/** 主动 compact 时上下文不足、后端未触发压缩。这不是错误 —— 是"无需压缩"的正常
+ *  情况,调用方(runCompactCommand)应显示 ⓘ 提示而非 ❌ 失败。claude 路由 /compact
+ *  在 transcript 不足时返回 "Not enough messages to compact." 且不 emit compact_boundary,
+ *  compactThread 据此抛出;codex 目前不发此错误。 */
+export class NothingToCompactError extends Error {
+  constructor(message = '上下文不足,无需压缩') {
+    super(message)
+    this.name = 'NothingToCompactError'
+  }
+}
+
 export interface AgentProcess extends EventEmitter {
   readonly provider: AgentProvider
   sessionId: string | null

@@ -19,6 +19,7 @@ import { log } from './log'
 import {
   CLAUDE_EFFORT,
   isClaudeReasoningEffort,
+  NothingToCompactError,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
 } from './agent-process'
@@ -873,7 +874,53 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   async compactThread(): Promise<void> {
-    throw new Error('Claude Agent SDK backend does not support Lodestar compact yet')
+    // claude-agent-sdk 没暴露主动 compact 的 control request(control 枚举里只有只读的
+    // GetContextUsage)。但 /compact 是 claude code CLI 的本地命令 —— 往 streaming input
+    // push 一条 text="/compact" 的 SDKUserMessage,SDK 会路由到 CLI 命令处理器执行真压缩
+    // 并吐 compact_boundary(由 handleSystemMessage 接成 context_compacted 事件)。
+    // 实测(2026-08-04):transcript 不足时 /compact 返回 "Not enough messages to compact."
+    // + result、不 emit compact_boundary —— 这里 race context_compacted(真压缩) vs
+    // result(命令结束但未压缩 → NothingToCompactError) vs timeout(兜底 SDK 卡死),让
+    // runCompactCommand 显示"无需压缩"而不是傻等 watchManualCompaction 的 120s 超时。
+    if (!this.input) throw new Error('claude thread not initialized')
+    this.input.push({
+      type: 'user',
+      session_id: this.sessionId ?? '',
+      message: { role: 'user', content: [{ type: 'text', text: '/compact' }] },
+      parent_tool_use_id: null,
+      priority: 'now',
+    } as SDKUserMessage)
+    return new Promise<void>((resolve, reject) => {
+      const timeoutMs = 60_000
+      let settled = false
+      const cleanup = () => {
+        clearTimeout(timer)
+        this.off('context_compacted', onCompacted)
+        this.off('result', onResult)
+      }
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error('claude /compact timed out (no compact_boundary, no result)'))
+      }, timeoutMs)
+      const onCompacted = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve()
+      }
+      const onResult = () => {
+        // result 到了却没先收到 compact_boundary = 命令执行完但未真压缩(transcript 不足)。
+        // 真压缩时 compact_boundary 先于 result 到达。
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new NothingToCompactError())
+      }
+      this.on('context_compacted', onCompacted)
+      this.on('result', onResult)
+    })
   }
 
   async injectThreadItems(items: any[]): Promise<void> {
