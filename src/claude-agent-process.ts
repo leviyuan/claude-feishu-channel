@@ -878,10 +878,16 @@ export class ClaudeAgentProcess extends EventEmitter {
     // GetContextUsage)。但 /compact 是 claude code CLI 的本地命令 —— 往 streaming input
     // push 一条 text="/compact" 的 SDKUserMessage,SDK 会路由到 CLI 命令处理器执行真压缩
     // 并吐 compact_boundary(由 handleSystemMessage 接成 context_compacted 事件)。
-    // 实测(2026-08-04):transcript 不足时 /compact 返回 "Not enough messages to compact."
-    // + result、不 emit compact_boundary —— 这里 race context_compacted(真压缩) vs
-    // result(命令结束但未压缩 → NothingToCompactError) vs timeout(兜底 SDK 卡死),让
-    // runCompactCommand 显示"无需压缩"而不是傻等超时。
+    //
+    // 三路判定(2026-08-04 两轮实测确立):
+    //   1. context_compacted → 真压缩完成。大上下文压缩可能 5min+,且 compact_boundary
+    //      可能晚于 result 到达 —— 所以必须"等 boundary",不能用"result 先到就判定"。
+    //   2. assistant_text 含 "Not enough messages to compact" → transcript 不足,明确无需压缩。
+    //   3. timeout(10min)→ 异常兜底(SDK 卡死 / boundary 真没来),报超时,不误报"无需压缩"。
+    //
+    // ⚠️ 之前用 onResult 兜底("result 到了没 boundary 就是无需压缩")是错的 —— 大上下文压缩
+    // 极慢时 boundary 会晚于 result,被误判成"无需压缩"(user-reported 2026-08-04:80%+ 上下文
+    // 压了 81s 却提示"窗口充足")。只有 "Not enough" 这句固定文案才是明确的无需压缩信号。
     if (!this.input) throw new Error('claude thread not initialized')
     this.input.push({
       type: 'user',
@@ -891,20 +897,20 @@ export class ClaudeAgentProcess extends EventEmitter {
       priority: 'now',
     } as SDKUserMessage)
     return new Promise<void>((resolve, reject) => {
-      // 10min 兜底:大上下文压缩实测 5min+(user-reported 2026-08-04),timeout 只在
-      // SDK 卡死(既无 compact_boundary 也无 result)时触发;真压缩靠 compact_boundary。
+      // 10min:大上下文压缩实测 5min+(user-reported 2026-08-04)。真压缩靠 compact_boundary
+      // 到达(resolve);timeout 只在 boundary 既不在 result 前也不在 result 后的异常时触发。
       const timeoutMs = 600_000
       let settled = false
       const cleanup = () => {
         clearTimeout(timer)
         this.off('context_compacted', onCompacted)
-        this.off('result', onResult)
+        this.off('assistant_text', onAssistantText)
       }
       const timer = setTimeout(() => {
         if (settled) return
         settled = true
         cleanup()
-        reject(new Error('claude /compact timed out (no compact_boundary, no result)'))
+        reject(new Error('claude /compact 超时(10min 内无 compact_boundary 也无 Not enough 文案)'))
       }, timeoutMs)
       const onCompacted = () => {
         if (settled) return
@@ -912,16 +918,19 @@ export class ClaudeAgentProcess extends EventEmitter {
         cleanup()
         resolve()
       }
-      const onResult = () => {
-        // result 到了却没先收到 compact_boundary = 命令执行完但未真压缩(transcript 不足)。
-        // 真压缩时 compact_boundary 先于 result 到达。
+      const onAssistantText = (e: { text?: string } | undefined) => {
+        // 只认 claude code /compact 在 transcript 不足时的固定输出文案。真压缩不会 emit
+        // 这句(实测:真压缩 emit compact_boundary + 可选总结文本,无此句),所以不会误杀真压缩。
         if (settled) return
-        settled = true
-        cleanup()
-        reject(new NothingToCompactError())
+        const text = e?.text ?? ''
+        if (text.includes('Not enough messages to compact')) {
+          settled = true
+          cleanup()
+          reject(new NothingToCompactError())
+        }
       }
       this.on('context_compacted', onCompacted)
-      this.on('result', onResult)
+      this.on('assistant_text', onAssistantText)
     })
   }
 
