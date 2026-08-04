@@ -423,28 +423,15 @@ function serverToolName(name: string): string {
   return `server_tool:${name}`
 }
 
-function sanitizeServerToolInput(input: unknown): unknown {
-  if (typeof input === 'string') return input.replace(/https?:\/\/[^\s"'`<>]+/g, '<url-redacted>')
-  if (Array.isArray(input)) return input.map(item => sanitizeServerToolInput(item))
-  if (input && typeof input === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-      out[key] = sanitizeServerToolInput(value)
-    }
-    return out
-  }
-  return input
-}
-
 function serverToolInputFromScaffoldText(text: string): PendingServerToolInput | null {
   const name = text.match(/Built-in Tool:\s*([A-Za-z0-9_.:-]+)/)?.[1]
   if (!name) return null
   const inputText = text.match(/\*\*Input:\*\*\s*```(?:json)?\s*([\s\S]*?)```/)?.[1]?.trim()
   if (!inputText) return { name, input: {} }
   try {
-    return { name, input: sanitizeServerToolInput(JSON.parse(inputText)) }
+    return { name, input: JSON.parse(inputText) }
   } catch {
-    return { name, input: { raw: sanitizeServerToolInput(inputText) } }
+    return { name, input: { raw: inputText } }
   }
 }
 
@@ -1167,7 +1154,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private serverToolInput(name: string, rawInput: unknown): unknown {
-    const structuredInput = sanitizeServerToolInput(rawInput)
+    const structuredInput = rawInput
     if (
       structuredInput &&
       typeof structuredInput === 'object' &&

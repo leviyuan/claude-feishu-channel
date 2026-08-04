@@ -795,7 +795,7 @@ describe('other tool card rendering', () => {
     const input = {
       tool: 'analyze_image',
       input: {
-        imageSource: '<url-redacted>',
+        imageSource: 'https://signed.example/img',
         prompt: '识别截图内容',
       },
     }
@@ -810,7 +810,7 @@ describe('other tool card rendering', () => {
     expect(el.header.title.content).toBe('✅ 🔧 服务端工具: analyze_image: 识别截图内容')
     expect(body).toContain('**类型**: 模型服务端内置工具')
     expect(body).toContain('**tool**: `analyze_image`')
-    expect(body).toContain('"imageSource": "<url-redacted>"')
+    expect(body).toContain('"imageSource": "https://signed.example/img"')
     expect(body).toContain('"prompt": "识别截图内容"')
     expect(body).toContain('完整识图结果')
     expect(body).not.toContain('"tool": "analyze_image"')

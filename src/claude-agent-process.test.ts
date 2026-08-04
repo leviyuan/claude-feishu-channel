@@ -418,7 +418,7 @@ describe('Claude user dialog bridge', () => {
         input: {
           tool: 'analyze_image',
           input: {
-            imageSource: '<url-redacted>',
+            imageSource: 'https://signed.example/img',
             prompt: '识别截图内容',
           },
         },
