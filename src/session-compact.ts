@@ -75,9 +75,8 @@ function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCom
   const promise = new Promise<ContextCompactedNotification>((resolve, reject) => {
     resolvePromise = resolve
     rejectPromise = reject
-    timer = setTimeout(() => {
-      fail(new Error(`context compaction completion timed out after ${timeoutMs / 1000}s`))
-    }, timeoutMs)
+    // 不设 timeout(user-requested 2026-08-05):大上下文压缩可能 >10min,固定 timeout 误杀。
+    // 死等 context_compacted;proc exit/error 兜底 fail(onExit/onError 已注册)。
   })
   proc.on('context_compacted', onCompacted)
   proc.once('exit', onExit)

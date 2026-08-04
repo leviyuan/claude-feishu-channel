@@ -879,15 +879,16 @@ export class ClaudeAgentProcess extends EventEmitter {
     // push 一条 text="/compact" 的 SDKUserMessage,SDK 会路由到 CLI 命令处理器执行真压缩
     // 并吐 compact_boundary(由 handleSystemMessage 接成 context_compacted 事件)。
     //
-    // 三路判定(2026-08-04 两轮实测确立):
-    //   1. context_compacted → 真压缩完成。大上下文压缩可能 5min+,且 compact_boundary
-    //      可能晚于 result 到达 —— 所以必须"等 boundary",不能用"result 先到就判定"。
-    //   2. assistant_text 含 "Not enough messages to compact" → transcript 不足,明确无需压缩。
-    //   3. timeout(10min)→ 异常兜底(SDK 卡死 / boundary 真没来),报超时,不误报"无需压缩"。
+    // 判定(2026-08-04/05 实测确立):
+    //   1. context_compacted → 真压缩完成 resolve(大上下文可能 >10min,死等)。
+    //   2. assistant_text 含 "Not enough messages to compact" → transcript 不足,无需压缩。
+    //   3. proc exit/error → reject(proc 死了才 fail,不靠固定时长)。
+    // **不设 timeout**(user-requested 2026-08-05)—— 大上下文压缩 >10min 正常,固定 timeout
+    // 会误杀(600s 超时报错);真挂起靠 proc exit/error 兜底,或用户 stop 命令中断。
     //
     // ⚠️ 之前用 onResult 兜底("result 到了没 boundary 就是无需压缩")是错的 —— 大上下文压缩
-    // 极慢时 boundary 会晚于 result,被误判成"无需压缩"(user-reported 2026-08-04:80%+ 上下文
-    // 压了 81s 却提示"窗口充足")。只有 "Not enough" 这句固定文案才是明确的无需压缩信号。
+    // 极慢时 boundary 会晚于 result,被误判成"无需压缩"。只有 "Not enough" 这句固定文案才是
+    // 明确的无需压缩信号。
     if (!this.input) throw new Error('claude thread not initialized')
     this.input.push({
       type: 'user',
@@ -897,21 +898,13 @@ export class ClaudeAgentProcess extends EventEmitter {
       priority: 'now',
     } as SDKUserMessage)
     return new Promise<void>((resolve, reject) => {
-      // 10min:大上下文压缩实测 5min+(user-reported 2026-08-04)。真压缩靠 compact_boundary
-      // 到达(resolve);timeout 只在 boundary 既不在 result 前也不在 result 后的异常时触发。
-      const timeoutMs = 600_000
       let settled = false
       const cleanup = () => {
-        clearTimeout(timer)
         this.off('context_compacted', onCompacted)
         this.off('assistant_text', onAssistantText)
+        this.off('exit', onExit)
+        this.off('error', onError)
       }
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        cleanup()
-        reject(new Error('claude /compact 超时(10min 内无 compact_boundary 也无 Not enough 文案)'))
-      }, timeoutMs)
       const onCompacted = () => {
         if (settled) return
         settled = true
@@ -929,8 +922,22 @@ export class ClaudeAgentProcess extends EventEmitter {
           reject(new NothingToCompactError())
         }
       }
+      const onExit = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error('claude thread exited during /compact'))
+      }
+      const onError = (e: unknown) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
       this.on('context_compacted', onCompacted)
       this.on('assistant_text', onAssistantText)
+      this.once('exit', onExit)
+      this.once('error', onError)
     })
   }
 
