@@ -881,7 +881,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 实测(2026-08-04):transcript 不足时 /compact 返回 "Not enough messages to compact."
     // + result、不 emit compact_boundary —— 这里 race context_compacted(真压缩) vs
     // result(命令结束但未压缩 → NothingToCompactError) vs timeout(兜底 SDK 卡死),让
-    // runCompactCommand 显示"无需压缩"而不是傻等 watchManualCompaction 的 120s 超时。
+    // runCompactCommand 显示"无需压缩"而不是傻等超时。
     if (!this.input) throw new Error('claude thread not initialized')
     this.input.push({
       type: 'user',
@@ -891,7 +891,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       priority: 'now',
     } as SDKUserMessage)
     return new Promise<void>((resolve, reject) => {
-      const timeoutMs = 60_000
+      // 10min 兜底:大上下文压缩实测 5min+(user-reported 2026-08-04),timeout 只在
+      // SDK 卡死(既无 compact_boundary 也无 result)时触发;真压缩靠 compact_boundary。
+      const timeoutMs = 600_000
       let settled = false
       const cleanup = () => {
         clearTimeout(timer)

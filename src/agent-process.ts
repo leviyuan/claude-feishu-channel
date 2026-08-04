@@ -37,7 +37,7 @@ export function agentProviderLabel(provider: AgentProvider): string {
  *  在 transcript 不足时返回 "Not enough messages to compact." 且不 emit compact_boundary,
  *  compactThread 据此抛出;codex 目前不发此错误。 */
 export class NothingToCompactError extends Error {
-  constructor(message = '上下文不足,无需压缩') {
+  constructor(message = '上下文窗口充足，无需压缩') {
     super(message)
     this.name = 'NothingToCompactError'
   }

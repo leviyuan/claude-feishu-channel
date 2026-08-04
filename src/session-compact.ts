@@ -16,7 +16,9 @@ import {
 } from './context-window'
 import { messageOf } from './session-util'
 
-const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
+// 10min:claude 大上下文压缩实测 5min+(user-reported 2026-08-04)。codex 正常压缩
+// 快得多,设大对 codex 无害 —— timeout 只在压缩完成 notification 不到时兜底触发。
+const CONTEXT_COMPACT_TIMEOUT_MS = 600_000
 const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
 
 type ManualCompactionWatch = {
