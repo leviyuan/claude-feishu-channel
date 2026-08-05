@@ -74,6 +74,8 @@ export interface SpawnOpts {
   appendSystemPrompt?: string
   /** token source 注入:对 spawn env 做 scrub+inject(防 A 账号夹带 B 凭据)。未传 = 走 config 默认。 */
   transformEnv?: (env: Record<string, string | undefined>) => Record<string, string | undefined>
+  /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
+  tokenSourceId?: string | null
 }
 
 export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
@@ -221,6 +223,7 @@ type ServerRequestState = {
 
 export class CodexProcess extends EventEmitter {
   readonly provider = 'codex' as const
+  readonly tokenSourceId: string | null
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private stdoutBuf = ''
   private stderrBuf = ''
@@ -257,6 +260,7 @@ export class CodexProcess extends EventEmitter {
     // crash before it can surface the app-server failure.
     this.on('error', () => {})
     this.opts = opts
+    this.tokenSourceId = opts.tokenSourceId ?? null
     const codexBin = resolveCodexBin()
     const args = ['app-server', '--listen', 'stdio://']
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)

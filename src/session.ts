@@ -604,6 +604,7 @@ export class Session {
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
         ...(ts?.settingSources ? { settingSources: ts.settingSources } : {}),
+        tokenSourceId: ts?.id ?? null,
         transformEnv,
       })
     }
@@ -614,6 +615,7 @@ export class Session {
       effort: this.effortForSpawn(),
       resumeSessionId: sid,
       appendSystemPrompt: this.spawnDeveloperInstructions(),
+      tokenSourceId: ts?.id ?? null,
       transformEnv,
     })
   }
@@ -648,7 +650,10 @@ export class Session {
 
   async stopIdleMismatchedProcess(): Promise<void> {
     if (!this.proc?.isAlive()) return
-    if (this.proc.provider === this.selectedProvider) return
+    // provider 或 token source 任一变化 = 进程 env 不再匹配 → idle 时杀掉,下轮重 spawn 换 env。
+    // 同 provider 跨 source(GLM↔DeepSeek↔native)env(base_url/凭据)不同也必须重启,
+    // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
+    if (this.proc.provider === this.selectedProvider && this.proc.tokenSourceId === this.selectedTokenSourceId) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
     const proc = this.proc
     log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)

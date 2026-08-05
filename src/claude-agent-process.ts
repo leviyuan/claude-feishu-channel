@@ -99,6 +99,8 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
    *  注入 env 的 token source(glm/deepseek)不传 → DEFAULT(['project','local'],不读 user settings env,spawnEnv 权威);
    *  透传型 source(native)传 ['user','project','local'] → 读本机 Claude Code 配置(settings.json env / .credentials)。 */
   settingSources?: readonly string[]
+  /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
+  tokenSourceId?: string | null
 }
 
 type ClaudePathLookup = {
@@ -632,6 +634,7 @@ export interface BgTaskSettledEvent {
 
 export class ClaudeAgentProcess extends EventEmitter {
   readonly provider = 'claude' as const
+  readonly tokenSourceId: string | null
 
   private opts: ClaudeSpawnOpts
   private input = new AsyncQueue<SDKUserMessage>()
@@ -665,6 +668,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     super()
     this.on('error', () => {})
     this.opts = opts
+    this.tokenSourceId = opts.tokenSourceId ?? null
     this.lastEffort = opts.effort
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
   }

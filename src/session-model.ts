@@ -233,7 +233,11 @@ export async function onModelEffortSelect(
     // 不重启 agent(保持之前体验):同 provider 切 model/effort 一律 setModelSettings 热切换
     // (SDK 记新 model,下轮/下次生效)。不再 stopIdle respawn —— 那基于旧 env-alias 假设,
     // 且会静默打断用户(发 model 选个模型就把 claude 进程杀了,离谱)。
-    if (s.proc?.isAlive() && s.proc.provider === provider) {
+    // 同 provider 且同 source 才热切换(env 没变,setModelSettings 改 model 即够);
+    // 跨 source(GLM↔DeepSeek↔native,即使同 provider)env 变了 → 跳过热切换,交给
+    // applyModelSelection→stopIdleMismatchedProcess 杀进程重启换 env。热切换只改 model
+    // 不重注入 env,跨 source 会打到上一个 source 的 base_url(silent divergence)。
+    if (s.proc?.isAlive() && s.proc.provider === provider && !sourceChanged) {
       const processModel = choice.sourceId
         ? getTokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
         : model

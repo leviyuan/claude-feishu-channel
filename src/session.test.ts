@@ -67,6 +67,7 @@ class FakeAgentProc extends EventEmitter {
   constructor(
     readonly provider: 'codex' | 'claude',
     public sessionId: string | null = null,
+    readonly tokenSourceId: string | null = null,
   ) {
     super()
   }
@@ -462,7 +463,7 @@ describe('Session provider switching', () => {
 
   test('keeps idle Claude process, hot-swaps model via setModelSettings (no respawn)', async () => {
     const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm')
     session.proc = proc
     session.selectedProvider = 'claude'
     session.selectedTokenSourceId = 'glm'
@@ -485,9 +486,36 @@ describe('Session provider switching', () => {
     expect(result.card ? JSON.stringify(result.card) : '').toContain('下一轮')
   })
 
+  test('GLM→DeepSeek (same provider, different token source) respawns to swap base_url/env', async () => {
+    // 跨 token source 切换(GLM↔DeepSeek↔native,同 provider='claude')env(base_url/凭据)不同,
+    // 必须杀进程重启换 env —— setModelSettings 只改 model 不重注入 env,留着旧进程会拿
+    // deepseek 模型名打到 GLM 端点(base URL 错)。故 onModelEffortSelect 跳过热切换,
+    // applyModelSelection→stopIdleMismatchedProcess 据 proc.tokenSourceId 判 mismatch 并杀。
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm')   // 进程是 GLM spawn 的
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('panel-ds', { models: [{
+      provider: 'claude', sourceId: 'deepseek', model: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro',
+      efforts: [{ effort: 'high', isDefault: true }],
+    }] })
+
+    const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'panel-ds', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(true)
+    expect(session.selectedTokenSourceId).toBe('deepseek')
+    // 跨 source → 不热切换(避免给将死的进程做无意义 RPC),直接杀进程重启换 env:
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).not.toBe(proc)   // 旧进程已杀;下轮 start 用 deepseek 的 base_url 重 spawn
+  })
+
   test('reselecting the active GLM model and max effort is idempotent', async () => {
     const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm')
     session.proc = proc
     session.selectedProvider = 'claude'
     session.selectedTokenSourceId = 'glm'
