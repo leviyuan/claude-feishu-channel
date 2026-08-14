@@ -365,6 +365,11 @@ export class Session {
    *  null = 未配 token source,走旧路径(provider/model 自治)。 */
   selectedTokenSourceId: string | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
+  /** 补录应答态:点「➕ 补录模型」后置位,下一条群消息(裸词命令除外)作为
+   *  模型名消费(校验/补录)。一次性,消费或取消即清。cardMessageId 是补录
+   *  提示卡的消息 id —— 消费后原位更新它(通过→effort 卡;失败→红字),
+   *  不单发群消息(和正常消息流混淆会产生"下条是否还是模型名"的歧义)。 */
+  modelCustomPrompt: { sourceId: string, panelId: string, cardMessageId: string } | null = null
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -509,7 +514,10 @@ export class Session {
   currentModelLabel(): string | null {
     // 有 token source 时 fallback 到它声明的真实模型(ts.defaultModel 如 GLM-5.2[1m]),
     // 而非 proc.lastModel —— 那是 SDK alias(如 'opus'),用户看着像切错了模型。
-    return this.selectedModel ?? this.currentTokenSource()?.defaultModel ?? this.proc?.lastModel ?? null
+    // 显示/比对统一出口:剥 claude: 前缀和 [1m] 记账后缀 —— 面板选中态比对
+    // (session-model)用裸模型名,内部后缀不参与。
+    const raw = this.selectedModel ?? this.currentTokenSource()?.defaultModel ?? this.proc?.lastModel ?? null
+    return raw?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '') ?? null
   }
 
   currentEffortLabel(): AgentReasoningEffort {
@@ -519,13 +527,15 @@ export class Session {
   }
 
   /** 当前实际进程的显示快照。selected* 是持久目标；只要旧 proc 还活着，
-   * footer/console 就必须显示 proc，而不能提前冒充下一次启动目标。 */
+   * footer/console 就必须显示 proc，而不能提前冒充下一次启动目标。
+   *  model 剥 claude: 前缀和 [1m] 记账后缀 —— 这是显示层,内部细节不外露。 */
   private runtimeModelSelection(): Pick<TurnState, 'provider' | 'model' | 'effort'> {
     const proc = this.proc?.isAlive() ? this.proc : null
     const provider = proc?.provider ?? this.selectedProvider
     const selectedMatchesProc = !proc || proc.provider === this.selectedProvider
-    const model = proc?.lastModel
-      ?? (selectedMatchesProc ? this.currentModelLabel() : null)
+    const model = (proc?.lastModel
+      ?? (selectedMatchesProc ? this.currentModelLabel() : null))
+      ?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '') ?? null
     const effort = proc?.lastEffort
       ?? (selectedMatchesProc
         ? this.currentEffortLabel()
@@ -536,8 +546,10 @@ export class Session {
   private modelEffortLabel(
     selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
   ): string {
+    // [1m] 是给 CLI 的窗口记账后缀(spawn 侧内部细节),用户可见层剥掉 ——
+    // footer/console 显示干净的模型名(GLM-5.3 而非 GLM-5.3[1m])。
     const shownModel = selection.provider === 'claude'
-      ? selection.model?.replace(/^claude:/i, '')
+      ? selection.model?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
       : selection.model
     const label = shownModel ? `${shownModel}/${selection.effort}` : selection.effort
     return selection.provider === 'claude'
@@ -1338,6 +1350,15 @@ export class Session {
   }
   onProviderSelect(sourceIdRaw: string, panelIdRaw = ''): Promise<ModelActionResult> {
     return sessionModel.onProviderSelect(this, sourceIdRaw, panelIdRaw)
+  }
+  onModelPanelCancel(): Promise<ModelActionResult> {
+    return sessionModel.onModelPanelCancel(this)
+  }
+  onModelCustomPrompt(sourceIdRaw: string, panelIdRaw: string, cardMessageId = ''): Promise<ModelActionResult> {
+    return sessionModel.onModelCustomPrompt(this, sourceIdRaw, panelIdRaw, cardMessageId)
+  }
+  consumeModelCustomMessage(text: string, user: string): Promise<boolean> {
+    return sessionModel.consumeModelCustomMessage(this, text, user)
   }
 
   onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {

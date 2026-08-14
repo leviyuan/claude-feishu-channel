@@ -398,6 +398,12 @@ async function handleMessage(data: any): Promise<void> {
     if (await session.runCommand(text, userOpenId)) return
   }
 
+  // 补录应答态:点「➕ 补录模型」后的下一条文本作为模型名消费(裸词命令
+  // 已在上面优先分流)。同 AskUserQuestion 的消息应答语义。
+  if (msgType === 'text' && text && await session.consumeModelCustomMessage(text, userOpenId)) {
+    return
+  }
+
   // Pending AskUserQuestion: route the message as a custom answer
   // instead of opening a new turn. This is how custom-text answers
   // work in this version — Feishu schema 2.0 doesn't support form/
@@ -476,6 +482,21 @@ async function handleCardAction(data: any): Promise<any> {
       return result.card
         ? actionCardResponse(result.card)
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'model_custom_prompt': {
+      // context.open_message_id = 补录卡所在消息;等待态记住它,回复后原位更新。
+      const result = await session.onModelCustomPrompt(
+        String(value.source_id ?? ''),
+        String(value.panel_id ?? ''),
+        String(data?.context?.open_message_id ?? ''),
+      )
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'model_panel_cancel': {
+      const result = await session.onModelPanelCancel()
+      return actionCardResponse(result.card)
     }
     case 'model_effort_select': {
       const result = await session.onModelEffortSelect(

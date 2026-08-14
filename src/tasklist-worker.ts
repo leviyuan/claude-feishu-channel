@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { buildAgySpawnPath, resolveAgyBin, agyPrintArgs } from './agy-task'
 import { resolveCodexBin } from './codex-process'
+import { getTokenSource } from './token-source'
 import * as feishu from './feishu'
 import { log } from './log'
 import * as tasklist from './tasklist'
@@ -41,8 +42,20 @@ const COMMENT_OUTPUT_LIMIT = 15_000
 const PLAN_TIMEOUT_MS = 60 * 60 * 1000
 const EXEC_TIMEOUT_MS = 180 * 60 * 1000
 const KILL_AFTER_MS = 5000
-const CODEX_MODEL = process.env.LODESTAR_TASK_CODEX_MODEL ?? 'gpt-5.5'
-const CODEX_REASONING_EFFORT = process.env.LODESTAR_TASK_CODEX_EFFORT ?? 'xhigh'
+/** codex exec 的模型/effort:env 显式覆盖 > codex token source 当前默认
+ *  (config pin 或订阅动态列表)> 无默认(不传 -m,让 codex CLI 自己用配置)。
+ *  不再有代码级模型名默认 —— 模型选择单一来源 = token source 层。 */
+function taskCodexModel(): string {
+  return process.env.LODESTAR_TASK_CODEX_MODEL
+    ?? getTokenSource('codex-sub')?.defaultModel
+    ?? ''
+}
+
+function codexModelArgs(): string[] {
+  const model = taskCodexModel()
+  const effort = process.env.LODESTAR_TASK_CODEX_EFFORT ?? 'xhigh'
+  return model ? ['-m', model, '-c', `model_reasoning_effort="${effort}"`] : []
+}
 
 let timer: ReturnType<typeof setInterval> | null = null
 let bootTimer: ReturnType<typeof setTimeout> | null = null
@@ -401,7 +414,7 @@ async function runCodexPlan(
     `你是 ${projectName} 项目的任务讨论者。`,
     '请结合项目实情，对这个需求做简单评审；不执行、不修改文件，可以帮着扩展想法。',
     '如果任务中有明确的询问性质内容，必须认真回答。',
-    '最终回答以 gpt-5.5 的身份输出，内容会直接发到飞书任务评论区。',
+    `最终回答以 ${taskCodexModel() || 'codex'} 的身份输出，内容会直接发到飞书任务评论区。`,
     '',
     '任务完整结构化数据：',
     jsonBlock(structured),
@@ -415,8 +428,7 @@ async function runCodexPlan(
     command: [
       resolveCodexBin(),
       'exec',
-      '-m', CODEX_MODEL,
-      '-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+      ...codexModelArgs(),
       '-s', 'read-only',
       '-C', projectDir,
       prompt,
@@ -537,8 +549,7 @@ async function runCodexExecution(
     command: [
       resolveCodexBin(),
       'exec',
-      '-m', CODEX_MODEL,
-      '-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+      ...codexModelArgs(),
       '--dangerously-bypass-approvals-and-sandbox',
       '-C', worktreePath,
       prompt,
@@ -671,8 +682,7 @@ async function runCodexMerge(
     command: [
       resolveCodexBin(),
       'exec',
-      '-m', CODEX_MODEL,
-      '-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+      ...codexModelArgs(),
       '--dangerously-bypass-approvals-and-sandbox',
       '-C', projectDir,
       prompt,

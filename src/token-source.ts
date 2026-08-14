@@ -35,6 +35,9 @@ export interface TokenSourceModel {
   display: string
   efforts: AgentReasoningEffort[]
   defaultEffort: AgentReasoningEffort
+  /** 1M context 能力(refreshModels 时自动实测,anthropic 兼容端点适用;
+   *  undefined = 未探/不适用,spawn 不加 [1m] 后缀)。 */
+  context1m?: boolean
 }
 
 // ── 统一用量(codex 5h/weekly、glm 5h/monthly 归一) ────────────────────
@@ -94,6 +97,9 @@ export interface TokenSource {
   defaultModel: string
   /** 启动/刷新时拉模型填 models。失败如实留空(MISS),绝不假数据。 */
   refreshModels(): Promise<void>
+  /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
+   *  未声明 = 无从校验(补录入口对该 source 拒绝,不猜)。 */
+  verifyModel?(model: string): Promise<'exists' | 'not_found' | 'no_verdict'>
   spawnEnv(base: Env): Env
   resolveSpawnModel(model: string): string | undefined
   /** 该 source spawn 的 claude 子进程 settingSources(覆盖 DEFAULT_SETTING_SOURCES)。

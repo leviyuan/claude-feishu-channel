@@ -17,7 +17,7 @@ function esc(v: string): string {
   return v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-/** regex 特殊字符转义(用于 id 拼 regex) */
+/** regex 特殊字符转义(用于 id 拼 regex,removeTokenSource 用) */
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -52,17 +52,34 @@ function reloadAndRebuild(): void {
 }
 
 /** 新增/覆盖一个 token source:追加 [token_source.<id>] 节到 config.toml。
- * 已存在则先删再写(覆盖)。写完热更新 registry。 */
+ * 已存在则与新 cfg 字段级合并(新值优先,旧键保留)—— 重跑 <source>-setup
+ * 只更新凭据,不洗掉 models/slots/usage 等既有配置。写完热更新 registry。 */
 export function addTokenSource(id: string, cfg: TokenSourceConfig): void {
   const existing = readFileSync(CONFIG_FILE, 'utf8')
-  let next = existing
-  // 已存在则先删(覆盖语义)
-  if (existing.includes(`[token_source.${id}]`)) {
-    const re = new RegExp(`\\n?\\[token_source\\.${escapeRegex(id)}\\][^\\[]*`, 'g')
-    next = existing.replace(re, '')
+  // 逐行状态机找节:节边界 = 行首 [xxx](值里可含 '[',如 slots = "opus=GLM-5.2[1m]",
+  // regex 硬截断会吞值,故不用正则切多行节体)。
+  const header = `[token_source.${id}]`
+  const lines = existing.split('\n')
+  let inSection = false
+  const prev: Record<string, string> = {}
+  const kept: string[] = []
+  for (const line of lines) {
+    if (line.startsWith('[')) inSection = line === header
+    if (inSection) {
+      const m = line.match(/^\s*([A-Za-z_]+)\s*=\s*"([^"]*)"/)
+      if (m) prev[m[1]] = m[2]
+    } else {
+      kept.push(line)
+    }
   }
-  const sep = next.endsWith('\n') ? '' : '\n'
-  writeFileSync(CONFIG_FILE, next + sep + '\n' + cfgToToml(id, cfg) + '\n')
+  // 字段级合并:旧键打底,新 cfg 非空值覆盖(重跑 setup 只换凭据,不洗 models/slots/usage)。
+  const combined: Record<string, string | undefined> = { ...prev }
+  const incoming: Record<string, string | undefined> = { ...cfg }
+  for (const k of Object.keys(incoming)) if (incoming[k]) combined[k] = incoming[k]
+  const merged = combined as TokenSourceConfig
+  // 去掉 kept 尾部空行再拼新节,保持节间一个空行的布局。
+  while (kept.length && kept[kept.length - 1] === '') kept.pop()
+  writeFileSync(CONFIG_FILE, kept.join('\n') + '\n\n' + cfgToToml(id, merged) + '\n')
   reloadAndRebuild()
 }
 

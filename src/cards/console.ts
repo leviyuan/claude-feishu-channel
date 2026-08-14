@@ -616,8 +616,97 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
       ...(opts.models.length
         ? modelElements
         : [{ tag: 'markdown', content: '_未返回可用模型列表_' }]),
+      // 列表外模型补录:上游列表滞后(新模型已可用但未列出)时用。点击进入
+      // 「群里直接回复模型名」应答态(同 AskUserQuestion 的消息应答语义),
+      // 回复后端点校验,存在才补进列表。
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '➕ 补录模型' },
+        type: 'default',
+        width: 'default',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            kind: 'model_custom_prompt',
+            panel_id: opts.panelId,
+            ...(opts.models[0]?.sourceId ? { source_id: opts.models[0].sourceId } : {}),
+          },
+        }],
+      },
     ],
   }
+}
+
+/** 补录等待态取消后的收尾卡:一行静态文本,无可交互元素。 */
+export function modelCancelledCard(sessionName: string): object {
+  return modelCard(sessionName, {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '补录模型' } },
+    expanded: true,
+    elements: [{
+      tag: 'markdown',
+      content: '_已取消补录 — 列表未改动_',
+    }],
+  }, 'grey')
+}
+
+/** 补录应答态提示卡:告知用户直接在群里回复模型名(同 AskUserQuestion 语义)。
+ *  取消按钮只在这里 —— 唯一会拦群消息的等待态;普通选择面板不拦任何消息,
+ *  扔着不管即可,不需要取消。 */
+export function modelCustomPromptCard(sessionName: string, sourceDisplay: string): object {
+  return modelCard(sessionName, {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '补录模型' } },
+    expanded: true,
+    elements: [
+      {
+        tag: 'markdown',
+        content: [
+          `**直接回复模型名补录到 ${sourceDisplay}**(列表外的模型,端点会先校验真伪)`,
+          '_裸词命令(hi/stop/model 等)不受影响_',
+        ].join('\n'),
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '取消' },
+        type: 'default',
+        width: 'default',
+        behaviors: [{ type: 'callback', value: { kind: 'model_panel_cancel' } }],
+      },
+    ],
+  }, 'blue')
+}
+
+/** 补录结果 panel(原位替换补录卡的 modelPanel 元素):红/绿字说明结果。 */
+export function modelCustomResultPanelElement(
+  ok: boolean,
+  model: string,
+  reason: string,
+): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '补录模型' } },
+    expanded: true,
+    elements: [{
+      tag: 'markdown',
+      content: ok
+        ? `✅ \`${model}\` 已加入列表`
+        : `❌ \`${model}\` 未加入 — ${reason}`,
+    }],
+  }
+}
+
+/** 补录结果卡(整卡,消息形态):备用导出。 */
+export function modelCustomResultCard(
+  sessionName: string,
+  ok: boolean,
+  model: string,
+  reason: string,
+): object {
+  return modelCard(sessionName, modelCustomResultPanelElement(ok, model, reason), ok ? 'green' : 'red')
 }
 
 export function modelEffortSelectionPanelElement(opts: ModelEffortSelectionCardOpts): object {

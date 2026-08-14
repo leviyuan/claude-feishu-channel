@@ -19,6 +19,7 @@ import {
 } from './token-source'
 import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { fetchCodexModels } from './token-source-models'
+import type { AgentReasoningEffort } from './agent-process'
 import { log } from './log'
 
 type Env = Record<string, string | undefined>
@@ -52,23 +53,33 @@ function codexLoggedIn(): boolean {
 
 registerTokenSourceFactory({
   kind: 'codex-subscription',
-  // codex 走本地 ChatGPT login,无 config 节。
-  build: (_cfg: TokenSourceConfig): TokenSource => {
+  // codex 登录态走本地 ~/.codex,但 config [token_source.codex-sub] 可选覆盖
+  // display/model/effort/models(codex app-server 动态拉,config 只做 pin)。
+  configSectionId: 'codex-sub',
+  build: (cfg: TokenSourceConfig): TokenSource => {
     const enabled = codexLoggedIn()
+    const cfgDefaultModel = cfg.model?.trim() || undefined
+    const cfgEffort = (cfg.effort?.trim() || undefined) as AgentReasoningEffort | undefined
     const ts: TokenSource = {
       id: 'codex-sub',
       kind: 'codex-subscription',
       agent: 'codex',
-      display: 'Codex 订阅',
+      display: cfg.display?.trim() || 'Codex 订阅',
       capabilities: { resumeSessionAt: false, fork: false, hostAsk: true },
       enabled,
       models: [],
-      defaultModel: 'gpt-5.5',
+      defaultModel: cfgDefaultModel ?? '',
       async refreshModels(): Promise<void> {
         if (!ts.enabled) { ts.models = []; return }
         try {
           ts.models = await fetchCodexModels()
-          if (ts.models.length) ts.defaultModel = ts.models[0].model
+          // config effort pin:把订阅默认 effort 覆盖为用户选择(per-model 仍可用)。
+          if (cfgEffort) {
+            for (const m of ts.models) m.defaultEffort = cfgEffort
+          }
+          // 默认模型:config model 键优先;未配 → 动态列表第一个(app-server 自己
+          // 的首选顺序,订阅语义明确,不重排)。
+          if (!cfgDefaultModel) ts.defaultModel = ts.models[0]?.model ?? ''
         } catch (e: any) {
           log(`codex-sub refreshModels MISS: ${e?.message ?? e}`)
           ts.models = []

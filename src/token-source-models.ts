@@ -62,7 +62,8 @@ export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
 /** glm Coding Plan 可用模型(anthropic 端点 /v1/models)。用 display_name(端点接受的大写形式)。 */
 export async function fetchGlmModels(baseUrl: string, token: string): Promise<TokenSourceModel[]> {
   const u = new URL(baseUrl)
-  const url = `${u.protocol}//${u.host}/api/anthropic/v1/models`
+  const path = u.pathname.replace(/\/+$/, '')
+  const url = `${u.protocol}//${u.host}${path}/v1/models`
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     signal: AbortSignal.timeout(TIMEOUT_MS),

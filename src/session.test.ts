@@ -421,7 +421,7 @@ describe('Session provider switching', () => {
 
     const footer = session.withModel('Thinking(1s)')
 
-    expect(footer).toContain('Claude · GLM-5.2[1m]/max')
+    expect(footer).toContain('Claude · GLM-5.2/max')  // [1m] 记账后缀不外露
     expect(footer).not.toContain('gpt-5.6-sol')
   })
 
@@ -439,7 +439,7 @@ describe('Session provider switching', () => {
 
     const footer = session.withModel('Writing(2s)')
 
-    expect(footer).toContain('Claude · GLM-5.2[1m]/max')
+    expect(footer).toContain('Claude · GLM-5.2/max')  // [1m] 记账后缀不外露
     expect(footer).not.toContain('gpt-5.6-sol')
   })
 
@@ -482,7 +482,7 @@ describe('Session provider switching', () => {
     // 不重启 agent(保持之前体验):热切换 setModelSettings,不 kill、proc 还在
     expect(proc.killCalls).toBe(0)
     expect(session.proc).toBe(proc)
-    expect(proc.setModelSettingsCalls).toEqual([['GLM-5.2[1m]', 'max']])
+    expect(proc.setModelSettingsCalls).toEqual([['GLM-5.2[1m]', 'max']])  // 未观测默认 [1m](客户端记账 1M)
     expect(result.card ? JSON.stringify(result.card) : '').toContain('下一轮')
   })
 

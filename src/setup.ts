@@ -127,11 +127,48 @@ function claudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 }
 
+/** 安装向导的 slots 动态化:拉 GLM /v1/models,最新一代(版本号最大)给
+ *  opus/sonnet,最老一代给 haiku。拉不到返回 null(只写凭据,不写 slots ——
+ *  不猜,让 lodestar 运行时自己的 config/env 决定)。 */
+async function fetchGlmSetupSlots(glmKey: string): Promise<Record<string, string> | null> {
+  try {
+    const res = await fetch('https://open.bigmodel.cn/api/anthropic/v1/models', {
+      headers: { Authorization: `Bearer ${glmKey}` },
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return null
+    const json: any = await res.json()
+    const ids: string[] = (Array.isArray(json?.data) ? json.data : [])
+      .map((m: any) => typeof m?.display_name === 'string' && m.display_name ? m.display_name : String(m?.id ?? ''))
+      .filter(Boolean)
+    if (!ids.length) return null
+    // 版本号排序(取 "GLM-5.2" 的 5.2;无版本的排最后)。Turbo/Air 变体不进 slots。
+    const versionOf = (id: string): number => {
+      const m = id.match(/(\d+(?:\.\d+)?)/)
+      return m ? Number(m[1]) : -1
+    }
+    const base = (id: string): string => id.replace(/-Turbo|-Air$/i, '')
+    const plain = ids.filter(id => !/-Turbo|-Air/i.test(id))
+    const sorted = [...plain].sort((a, b) => versionOf(b) - versionOf(a))
+    const top = sorted[0]
+    const bottom = sorted[sorted.length - 1]
+    const out: Record<string, string> = {}
+    if (top) {
+      out.ANTHROPIC_DEFAULT_OPUS_MODEL = `${top}[1m]`
+      out.ANTHROPIC_DEFAULT_SONNET_MODEL = `${top}[1m]`
+    }
+    if (bottom && base(bottom) !== base(top)) out.ANTHROPIC_DEFAULT_HAIKU_MODEL = bottom
+    return Object.keys(out).length ? out : null
+  } catch {
+    return null
+  }
+}
+
 /** 把 GLM Coding Plan 路由 merge 进 ~/.claude/settings.json 的 env 段。
  *  真相源与 docs/claude-agent-backend.md / glm-usage.ts 一致; 保留用户
  *  已有字段 (permissions / hooks / plugins …), 只覆盖 GLM 相关 env key。
  *  settings.json 存在但 JSON 解析失败时绝不静默覆盖 —— surface 出来。 */
-function writeClaudeGlmEnv(glmKey: string): { path: string } | { error: string } {
+async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string } | { error: string }> {
   try {
     const dir = claudeConfigDir()
     mkdirSync(dir, { recursive: true })
@@ -154,17 +191,17 @@ function writeClaudeGlmEnv(glmKey: string): { path: string } | { error: string }
     const prevEnv = (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env))
       ? settings.env as Record<string, string>
       : {}
-    // 与本机验证过的 GLM 配置一致: opus/sonnet → GLM-5.2[1m] (1M context),
-    // haiku → GLM-4.7。ANTHROPIC_AUTH_TOKEN 裸 token, 不带 Bearer。
+    // 模型 slots 不再写死:安装时从 GLM 端点动态拉当前列表,最强的给 opus/sonnet、
+    // 最弱的给 haiku;拉不到就只写凭据(slots 留给 lodestar 的 config/env 决定)。
+    // ANTHROPIC_AUTH_TOKEN 裸 token, 不带 Bearer。
     const glmEnv: Record<string, string> = {
       ANTHROPIC_AUTH_TOKEN: glmKey,
       ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
       API_TIMEOUT_MS: '3000000',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.2[1m]',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.2[1m]',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-4.7',
     }
+    const slots = await fetchGlmSetupSlots(glmKey)
+    if (slots) Object.assign(glmEnv, slots)
     settings.env = { ...prevEnv, ...glmEnv }
 
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 })
@@ -293,7 +330,7 @@ export async function runSetup(): Promise<void> {
 
   // ── Step 2/4 ──────────────────────────────────────────────────
   step(2, 4, 'GLM Coding Plan (推荐, 可选)')
-  console.log('GLM Coding Plan 给 Claude Code 接 GLM-5.2 (开放 1M token 上下文, 中文友好)。')
+  console.log('GLM Coding Plan 给 Claude Code 接 GLM 系列模型 (支持 1M token 上下文, 中文友好)。')
   console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导自动写进 ~/.claude/settings.json。')
   console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
   console.log(`  ${C.dim}不给也行: 以本机 Claude Code 现有配置启动 (确保是 API key 方式, 非订阅)。${C.reset}`)
@@ -301,10 +338,10 @@ export async function runSetup(): Promise<void> {
 
   const glmKey = await ask('GLM API key (直接回车跳过)', {})
   if (glmKey) {
-    const r = writeClaudeGlmEnv(glmKey)
+    const r = await writeClaudeGlmEnv(glmKey)
     if ('path' in r) {
       console.log(`${C.green}✓ GLM 路由已写入${C.reset}: ${C.dim}${r.path}${C.reset}`)
-      console.log(`${C.dim}opus/sonnet → GLM-5.2[1m] (1M ctx), haiku → GLM-4.7${C.reset}`)
+      console.log(`${C.dim}模型 slots 按端点当前列表自动选取(最新一代 opus/sonnet, 1M ctx)${C.reset}`)
     } else {
       console.log(`${C.red}✗ 写入失败:${C.reset} ${r.error}`)
       console.log(`${C.dim}跳过 GLM 配置, 以本机 Claude Code 现有配置启动。${C.reset}`)

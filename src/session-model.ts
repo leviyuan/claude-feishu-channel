@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto'
 
 import type { Session } from './session'
-import { listTokenSources, getTokenSource, type TokenSource } from './token-source'
+import { config } from './config'
+import { listTokenSources, getTokenSource, refreshAllTokenSourceModels, type TokenSource } from './token-source'
+import { addTokenSource } from './token-source-config'
+import { CLAUDE_EFFORTS } from './token-source-models'
 import { isCodexReasoningEffort } from './codex-process'
 import {
   agentProviderLabel,
@@ -11,6 +14,7 @@ import {
   type AgentReasoningEffort,
 } from './agent-process'
 import * as cards from './cards'
+import * as cardkit from './cardkit'
 import * as feishu from './feishu'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
@@ -30,7 +34,7 @@ function providerChoices(s: Session): cards.ProviderChoice[] {
     .map(ts => ({
       provider: ts.agent as AgentProvider,
       sourceId: ts.id,
-      display: ts.display + (cur?.id === ts.id && curModel ? ` · ${curModel}` : ''),
+      display: ts.display,
       enabled: ts.enabled,
       modelCount: ts.models.length,
       selected: cur?.id === ts.id,
@@ -63,8 +67,11 @@ function modelChoicesFor(s: Session, ts: TokenSource): cards.ModelChoice[] {
   })
 }
 
-/** model 命令:发第1级面板(选账号)。点账号 → onProviderSelect 发第2级(该账号模型)。 */
+/** model 命令:发第1级面板(选账号)。点账号 → onProviderSelect 发第2级(该账号模型)。
+ *  打开即后台刷新各 source models(上游新模型上线后面板即时报出,不等 daemon 重启;
+ *  失败 MISS 留旧列表,面板先用当前缓存渲染,不阻塞)。 */
 export async function showModelPanel(s: Session): Promise<void> {
+  void refreshAllTokenSourceModels()
   const panelId = randomUUID()
   const providers = providerChoices(s)
   s.modelPanels.set(panelId, { models: [] })  // 第1级;第2级 onProviderSelect 填 models
@@ -106,6 +113,130 @@ export async function onProviderSelect(
   }
 }
 
+/** 「➕ 补录模型」按钮回调:进补录应答态 —— 下一条群消息(裸词命令除外)
+ *  作为模型名消费。ACK 换出提示卡;等待态记住这张卡的 messageId,回复后
+ *  原位更新它(通过 → effort 选择卡;失败 → 卡上红字),不单发消息。 */
+export async function onModelCustomPrompt(
+  s: Session,
+  sourceIdRaw: string,
+  panelIdRaw: string,
+  cardMessageId = '',
+): Promise<ModelActionResult> {
+  const ts = getTokenSource(sourceIdRaw.trim())
+  if (!ts) return { ok: false, message: `未知账号: ${sourceIdRaw}` }
+  if (!ts.enabled) return { ok: false, message: `${ts.display} 未配置` }
+  if (ts.agent !== 'claude' || !ts.verifyModel) {
+    return { ok: false, message: `${ts.display} 不支持手动补录模型` }
+  }
+  s.modelCustomPrompt = { sourceId: ts.id, panelId: panelIdRaw.trim(), cardMessageId }
+  return {
+    ok: true,
+    message: '等待模型名',
+    card: cards.modelCustomPromptCard(s.sessionName, ts.display),
+  }
+}
+
+/** 补录应答态消费一条群消息(daemon 在裸词命令之后、开新 turn 之前调)。
+ *  返回 true = 消息被当模型名消费,false = 不是补录态,消息走正常流程。
+ *  结果一律原位更新补录卡(等待态存的 messageId):通过 → effort 选择卡
+ *  (与点列表模型完全同路径);失败/已存在 → 卡上红字。不单发群消息 ——
+ *  回执单发会和正常消息流混淆,产生"下一条是否还是模型名"的歧义。 */
+export async function consumeModelCustomMessage(
+  s: Session,
+  text: string,
+  user: string,
+): Promise<boolean> {
+  const pending = s.modelCustomPrompt
+  if (!pending) return false
+  s.modelCustomPrompt = null  // 一次性:无论成败,应答态结束
+  const model = text.trim()
+  const ts = getTokenSource(pending.sourceId)
+  // 更新补录卡的 panel(失败提示/成功转 effort);id_convert 失败如实 log,
+  // 状态机照常走(卡片更新是呈现,不是数据路径)。
+  const updateCard = async (panel: object) => {
+    if (!pending.cardMessageId) return
+    try {
+      const cardId = await cardkit.convertMessageToCard(pending.cardMessageId)
+      await cardkit.replaceElement(cardId, cards.ELEMENTS.modelPanel, panel)
+    } catch (e: any) {
+      log(`model-custom: card update MISS (${e?.message ?? e})`)
+    }
+  }
+  const failCard = (reason: string) => updateCard(cards.modelCustomResultPanelElement(false, model, reason))
+  if (!ts || !ts.enabled) {
+    await failCard('账号不可用')
+    return true
+  }
+  if (!model) {
+    await failCard('模型名为空')
+    return true
+  }
+  if (ts.models.some(m => m.model.toLowerCase() === model.toLowerCase())) {
+    await updateCard(cards.modelCustomResultCard(s.sessionName, false, model, '已在列表中'))
+    return true
+  }
+  const verdict = await ts.verifyModel(model)
+  if (verdict === 'not_found') {
+    await failCard('端点确认不存在')
+    return true
+  }
+  if (verdict === 'no_verdict') {
+    await failCard('无法校验(端点无响应或凭据问题)')
+    return true
+  }
+  // 校验通过:持久化 config models 键(addTokenSource 合并语义),rebuild 后
+  // 重取 registry 新实例并等它的 refreshModels 完成 —— rebuild 会整体换实例,
+  // 新实例 models 要 refresh 后才有(异步 void,不等会读到空列表),而后续
+  // 面板/currentTokenSource 都走 registry 新实例。等待失败如实 log,面板
+  // 用当时状态渲染(不猜)。
+  const cfgModels = [...readSourceModelsConfig(ts.id), model].join(',')
+  addTokenSource(ts.id, { models: cfgModels })
+  log(`model-custom: ${ts.id} 补录 ${model} by ${user}(端点校验通过,已持久化)`)
+  const fresh = getTokenSource(ts.id) ?? ts
+  try {
+    await withTimeout(fresh.refreshModels(), 15_000, 'refreshModels')
+  } catch (e: any) {
+    log(`model-custom: refresh after 补录 MISS (${e?.message ?? e})`)
+  }
+  const target = fresh.models.some(m => m.model === model) ? fresh : ts
+  const models = modelChoicesFor(s, target)
+  s.modelPanels.set(pending.panelId, { models })
+  await updateCard(cards.modelEffortSelectionPanelElement({
+    sessionName: s.sessionName,
+    panelId: pending.panelId,
+    currentModel: s.currentModelLabel(),
+    currentEffort: s.currentEffortLabel(),
+    model: models.find(m => m.model === model)!,
+  }))
+  return true
+}
+
+/** 读 config 里某 source 的 models 键现值(合并写入用,addTokenSource 是覆盖语义)。 */
+function readSourceModelsConfig(sourceId: string): string[] {
+  const raw = config.token_sources[sourceId]?.models
+  return (raw ?? '').split(',').map(x => x.trim()).filter(Boolean)
+}
+
+/** 取消按钮(补录等待态专用):清补录态、卡收成「已取消」。普通选择面板
+ *  不设取消 —— 它们不拦群消息,扔着不管无代价。幂等:无等待态也收尾卡。 */
+export async function onModelPanelCancel(
+  s: Session,
+): Promise<ModelActionResult> {
+  s.modelCustomPrompt = null
+  return {
+    ok: true,
+    message: '已取消',
+    card: cards.modelCancelledCard(s.sessionName),
+  }
+}
+
+/** 读 config 里某 source 的 models 键现值(合并写入用,addTokenSource 是覆盖语义)。 */
+function readSourceModelsConfig(sourceId: string): string[] {
+  const raw = config.token_sources[sourceId]?.models
+  return (raw ?? '').split(',').map(x => x.trim()).filter(Boolean)
+}
+
+/** 取消按钮(旧副本删除:见上方带补录态清理的版本)。 */
 function actionProvider(model: string, raw: any): AgentProvider {
   return raw?.provider === 'claude' || raw?.provider === 'codex'
     ? raw.provider

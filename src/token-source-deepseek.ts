@@ -5,8 +5,10 @@
  * 认证用 x-api-key → SDK 读 ANTHROPIC_API_KEY(注意:与 GLM 的
  * ANTHROPIC_AUTH_TOKEN / Bearer 不同 —— DeepSeek 走裸 api-key)。
  *
- * 模型 = 静态 deepseek-v4-pro / deepseek-v4-flash(官方两个,均支持 tool calls +
- * 1M context + Anthropic API;V4 迭代慢,静态比动态拉稳,refreshModels 幂等重赋值);
+ * 模型 = OpenAI 风格 GET {origin}/models 动态拉(anthropic 侧 /v1/models 404);
+ *      + config models 键补充(同 glm 约定);
+ * 默认模型/slots = config model/slots 键(无代码级模型名默认);
+ * [1m] 后缀 = 真实 turn 观测决策(context-window-observe.ts);
  * 额度 = {host}/user/balance(剩余余额标量,非 GLM 的滚动窗口百分比);
  * enabled = config [token_source.deepseek] 有 api_key(base_url 有官方默认,故只认 key)。
  *
@@ -24,6 +26,8 @@ import {
   registerTokenSourceFactory,
 } from './token-source'
 import { CLAUDE_EFFORTS } from './token-source-models'
+import { resolveModelWithWindow, observedContextWindow } from './context-window-observe'
+import { verifyModelExists } from './model-existence'
 import { log } from './log'
 
 type Env = Record<string, string | undefined>
@@ -31,16 +35,53 @@ type Env = Record<string, string | undefined>
 /** DeepSeek 官方 Anthropic 兼容端点(用户可在 config 覆盖,如自建中转)。 */
 const DEFAULT_BASE_URL = 'https://api.deepseek.com/anthropic'
 
-const DEEPSEEK_MODELS: TokenSourceModel[] = [
-  { model: 'deepseek-v4-pro', display: 'DeepSeek V4 Pro', efforts: CLAUDE_EFFORTS, defaultEffort: 'high' },
-  { model: 'deepseek-v4-flash', display: 'DeepSeek V4 Flash', efforts: CLAUDE_EFFORTS, defaultEffort: 'medium' },
-]
+/** config models 键解析:逗号分隔 slug → 干净数组。 */
+function parseModelList(raw: string | undefined): string[] {
+  return (raw ?? '').split(',').map(s => s.trim()).filter(Boolean)
+}
+
+/** 版本号排序取最新(默认模型兜底用):'deepseek-v4-pro' → 4,数字大 = 新。零模型名假设。 */
+function latestByVersion(models: string[]): string {
+  const versionOf = (id: string): number => {
+    const m = id.match(/(\d+(?:\.\d+)?)/)
+    return m ? Number(m[1]) : -1
+  }
+  return [...models].sort((a, b) => versionOf(b) - versionOf(a))[0] ?? ''
+}
+
+/** config slots 键解析:'opus=X,sonnet=Y,haiku=Z' → record;非法段忽略。 */
+function parseSlots(raw: string | undefined): Partial<Record<'opus' | 'sonnet' | 'haiku', string>> {
+  const out: Partial<Record<'opus' | 'sonnet' | 'haiku', string>> = {}
+  for (const seg of (raw ?? '').split(',')) {
+    const eq = seg.indexOf('=')
+    if (eq <= 0) continue
+    const slot = seg.slice(0, eq).trim().toLowerCase()
+    const model = seg.slice(eq + 1).trim()
+    if ((slot === 'opus' || slot === 'sonnet' || slot === 'haiku') && model) out[slot] = model
+  }
+  return out
+}
 
 /** 判定 base_url 是否 DeepSeek 官方端点(detect 探测本机配置用)。 */
 function isDeepseekBaseUrl(baseUrl: string): boolean {
   try {
     return new URL(baseUrl).hostname.toLowerCase() === 'api.deepseek.com'
   } catch { return false }
+}
+
+/** OpenAI 风格 GET {origin}/models → 模型 id 列表(anthropic 侧 /v1/models 是 404)。 */
+async function fetchDeepseekModels(baseUrl: string, apiKey: string): Promise<TokenSourceModel[]> {
+  const origin = new URL(baseUrl).origin
+  const res = await fetch(`${origin}/models`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const json: any = await res.json()
+  const data: any[] = Array.isArray(json?.data) ? json.data : []
+  return data
+    .filter(m => m && typeof m.id === 'string' && m.id)
+    .map(m => ({ model: m.id, display: m.id, efforts: CLAUDE_EFFORTS, defaultEffort: 'high' as const }))
 }
 
 const BALANCE_TIMEOUT_MS = 10_000
@@ -89,18 +130,43 @@ registerTokenSourceFactory({
     const baseUrl = cfg.base_url?.trim() || detected?.base_url?.trim() || DEFAULT_BASE_URL
     const apiKey = cfg.api_key?.trim() || detected?.api_key?.trim() || ''
     const enabled = !!apiKey
+    // config 键(零代码默认):model = 默认模型;slots = SDK alias 槽位。
+    const cfgDefaultModel = cfg.model?.trim() || undefined
+    const slots = parseSlots(cfg.slots)
     const ts: TokenSource = {
       id: 'deepseek',
       kind: 'deepseek',
       agent: 'claude',
-      display: 'DeepSeek',
+      display: cfg.display?.trim() || 'DeepSeek',
       capabilities: { resumeSessionAt: true, fork: true, hostAsk: false },
       enabled,
-      models: DEEPSEEK_MODELS,
-      defaultModel: 'deepseek-v4-pro',
+      models: [],
+      defaultModel: cfgDefaultModel ?? '',
       async refreshModels(): Promise<void> {
-        // 静态列表(V4 两档,迭代慢),幂等重赋值;不依赖网络拉取。
-        ts.models = DEEPSEEK_MODELS
+        if (!ts.enabled) { ts.models = []; return }
+        try {
+          const fetched = await fetchDeepseekModels(baseUrl, apiKey)
+          // config models 键补充(同 glm 约定):端点列表缺模型时手动补登,去重合并。
+          const extra = parseModelList(cfg.models).filter(
+            m => !fetched.some(f => f.model.toLowerCase() === m.toLowerCase()),
+          )
+          const extras: TokenSourceModel[] = extra.map(m => ({
+            model: m, display: m, efforts: CLAUDE_EFFORTS, defaultEffort: 'high',
+          }))
+          ts.models = [...fetched, ...extras]
+          // 默认模型:config model 键优先;未配 → 版本号最新的(flash<pro 不成立,
+          // 4 同版本时取排序首个,行为确定)。列表空(拉取 MISS)→ 保持空,
+          // spawn 侧 undefined → SDK 'opus' alias → config slots。
+          if (!cfgDefaultModel) ts.defaultModel = latestByVersion(ts.models.map(m => m.model))
+          // 1M 标注 = 真实 turn 观测缓存(纯被动,零探测)。
+          for (const m of ts.models) {
+            const observed = observedContextWindow('deepseek', m.model)
+            m.context1m = observed != null && observed >= 1_000_000 || undefined
+          }
+        } catch (e: any) {
+          log(`deepseek refreshModels MISS: ${e?.message ?? e}`)
+          ts.models = []
+        }
       },
       spawnEnv(base: Env): Env {
         const out = scrubAnthropicEnv(base)
@@ -108,16 +174,19 @@ registerTokenSourceFactory({
         merged.ANTHROPIC_BASE_URL = baseUrl
         // DeepSeek Anthropic 端点认 x-api-key → ANTHROPIC_API_KEY(非 AUTH_TOKEN/Bearer)。
         merged.ANTHROPIC_API_KEY = apiKey
-        // alias 槽位 fallback(pro=opus 档 / flash=其余档),与官方 claude-* 名字映射对齐。带 [1m] 给 1M。
-        merged.ANTHROPIC_DEFAULT_OPUS_MODEL = 'deepseek-v4-pro[1m]'
-        merged.ANTHROPIC_DEFAULT_SONNET_MODEL = 'deepseek-v4-flash[1m]'
-        merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = 'deepseek-v4-flash[1m]'
+        // slots 只从 config slots 键来(零代码默认);alias fallback 路径才读。
+        if (slots.opus) merged.ANTHROPIC_DEFAULT_OPUS_MODEL = slots.opus
+        if (slots.sonnet) merged.ANTHROPIC_DEFAULT_SONNET_MODEL = slots.sonnet
+        if (slots.haiku) merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = slots.haiku
         return { ...out, ...merged }
       },
       resolveSpawnModel(model: string): string | undefined {
-        // 加 [1m] 后缀给 1M context(同 GLM 约定):SDK 据 [1m] 报 contextWindow=1M,否则默认 200K。
-        // 端点剥后缀跑真实模型(curl 验证 response.model=deepseek-v4-pro)。已带 [1m] 不重复加。
-        return model.endsWith('[1m]') ? model : `${model}[1m]`
+        // [1m] 后缀同 GLM 约定:加不加由真实 turn 观测定(见 context-window-observe.ts),
+        // 未观测默认加(端点不支持则首轮爆窗自动降级)。
+        return resolveModelWithWindow('deepseek', model)
+      },
+      async verifyModel(model: string) {
+        return verifyModelExists(baseUrl, { 'x-api-key': apiKey }, model)
       },
       async readUsage(): Promise<UsageSnapshotUnified> {
         if (!apiKey) return { state: 'no_credentials', windows: [] }

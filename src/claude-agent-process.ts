@@ -35,6 +35,7 @@ import type {
   SpawnOpts,
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
+import { observeContextWindow, downgradeContextWindow } from './context-window-observe'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -1240,6 +1241,17 @@ export class ClaudeAgentProcess extends EventEmitter {
       } else if (total.contextWindow < (contextWindowMaxByRoute.get(routeKey) ?? 0)) {
         log(`claude-agent-process: SDK contextWindow ${total.contextWindow} ignored (global max ${contextWindowMaxByRoute.get(routeKey)} locked for ${routeKey})`)
       }
+      // 真实窗口观测落盘(纯被动):token source 模型名 → contextWindow,spawn 侧
+      // resolveSpawnModel 据此决定 [1m] 后缀(观测 1M 加 / 200K 裸名)。per-model
+      // 粒度(modelUsage 的 key 即模型名),比 routeKey 聚合更准。
+      if (this.tokenSourceId) {
+        for (const [model, entry] of Object.entries(modelUsageRaw ?? {})) {
+          const ctx = (entry as any)?.contextWindow
+          if (typeof ctx === 'number' && ctx > 0) {
+            observeContextWindow(this.tokenSourceId, model, ctx)
+          }
+        }
+      }
     }
     this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null
     // 上下文占用 = session 当前上下文 = 最后一次 API call 的输入侧 token。从 claude
@@ -1263,6 +1275,22 @@ export class ClaudeAgentProcess extends EventEmitter {
       })
     }
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
+    // 爆窗降级:带 [1m] 的模型被服务端 200K 挡下 = 端点没给 1M → 记 200K,
+    // resolveSpawnModel 下轮起裸名(200K 记账),不再被拒。纯观测闭环的纠错臂。
+    // 触发条件收紧到窗口类错误文本 —— 任意 API error 都降级会把网络/凭据
+    // 故障误判成"不支持 1M",错锁 200K。
+    if (this.tokenSourceId && raw.is_error === true) {
+      const errText = String(raw.result ?? raw.error ?? raw.api_error_message ?? '')
+      const isWindowError = /context.?window|prompt is too long|exceeds?.*(?:context|token)|too many (?:input )?tokens/i.test(errText)
+      if (isWindowError) {
+        // lastModel 带 'claude:' 前缀(claudeModelKey 归一),观测缓存的 key 是裸模型名
+        // —— 剥前缀+后缀再写,与观测臂/resolveSpawnModel 同一 key 空间。
+        const rawModel = this.lastModel ?? claudeRouteKey(this.opts.model)
+        const model = rawModel.replace(/^claude:/, '')
+        downgradeContextWindow(this.tokenSourceId, model)
+        log(`claude-agent-process: context window exceeded on ${model} — downgraded to 200K (no [1m] next spawn)`)
+      }
+    }
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
