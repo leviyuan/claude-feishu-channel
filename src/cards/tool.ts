@@ -982,6 +982,50 @@ export function toolCallElement(
   }
 }
 
+/** Panel for one or more consecutive edit-family tool calls
+ * (`Edit`/`MultiEdit`/`NotebookEdit`). Same philosophy as
+ * `readBatchElement`: body lists paths + per-call edit counts only,
+ * never the diff bodies. Header collapses to a single-item summary and
+ * `编辑文件 · N 次` once a run has joined. */
+export function editBatchElement(
+  i: number,
+  items: Array<{ input: any; output: string | null; isError: boolean }>,
+): object {
+  const n = items.length
+  const anyError = items.some(it => it.isError)
+  const allDone = items.every(it => it.output !== null)
+  const status = anyError ? '❌' : allDone ? '✅' : '⏳'
+  const headerText = n === 1
+    ? (() => {
+        const summary = summarizeEditBatchItem(items[0])
+        return summary ? `${status} 🔧 编辑文件: ${summary}` : `${status} 🔧 编辑文件`
+      })()
+    : `${status} 🔧 编辑文件 · ${n} 次`
+  const lines = items.map(it => {
+    const detail = summarizeEditBatchItem(it)
+    return detail ? `\`${detail}\`` : '`(无 path)`'
+  })
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.tool(i),
+    header: { title: { tag: 'plain_text', content: headerText } },
+    expanded: false,
+    elements: [{ tag: 'markdown', content: sanitizeMarkdownForCardKit(lines.join('\n')) }],
+  }
+}
+
+/** One-line summary of a single edit-family call: `<path> · N 处`
+ * (MultiEdit), `<path> · 全局替换` (replace_all Edit) or just the path. */
+function summarizeEditBatchItem(item: { input: any }): string {
+  const input = item.input ?? {}
+  const path = String(input.file_path ?? input.path ?? input.notebook_path ?? '')
+  if (Array.isArray(input.edits) && input.edits.length > 0) {
+    return path ? `${path} · ${input.edits.length} 处` : `${input.edits.length} 处`
+  }
+  if (input.replace_all && path) return `${path} · 全局替换`
+  return path
+}
+
 /** Panel for one or more `Read` tool calls in a row. Body lists file
  * paths only — never the contents, since piping repo source into a
  * Feishu group is the wrong default (chat history persists, the bot

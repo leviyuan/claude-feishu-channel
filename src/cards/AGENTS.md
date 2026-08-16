@@ -11,7 +11,7 @@
 |------|-------------|
 | `elements.ts` | 集中定义卡片 `element_id` 命名约定，例如 `user_input`、`footer`、`model_panel`、`tasklist_panel`、`tool_<i>`、`assistant_<i>`。 |
 | `turn.ts` | 对话主卡、assistant 分段、计划/目标/上下文压缩元素和 AskUserQuestion 面板；工具相关导出从 `tool.ts` 兼容 re-export。 |
-| `tool.ts` | 工具折叠面板、权限按钮、Read 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
+| `tool.ts` | 工具折叠面板、权限按钮、Read / Edit 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
 | `task-board.ts` | Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex 的 TodoWrite 一次就带完整列表,但 Claude Code 拆成 4 个单点工具,这里维护一份以 task id 为 key 的 board(`applyTaskTool` 跨调用累积),`taskBoardElement` 渲染整个板产出与 codex 一致的列表效果。board 由 `session-tools.ts` 在 Session 级持有。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、`model` 三级选择卡（`providerSelectionCard` 选账号 → `modelSelectionCard` 选模型 → `modelEffortSelectionCard` 选 effort → `modelResultCard` 结果，账号/模型列表由 `session-model.ts` 从 token sources 传入）、额度/主机信息格式化和关闭 streaming 设置。 |

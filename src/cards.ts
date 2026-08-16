@@ -34,6 +34,7 @@ export {
   summarizeToolInput,
   toolCallElement,
   readBatchElement,
+  editBatchElement,
   toolCallPermissionElement,
 } from './cards/tool'
 export {

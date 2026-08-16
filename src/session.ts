@@ -2508,8 +2508,8 @@ export class Session {
       goalUpdateCount: 0,
       contextCompactCount: 0,
       contextCompactionPending: new Map(),
-      readBatches: new Map(),
-      openReadBatchI: null,
+      toolBatches: new Map(),
+      openBatchI: null,
       taskCreateI: null,
       taskUpdateI: null,
       taskBoardResetThisTurn: false,
@@ -2547,7 +2547,7 @@ export class Session {
   }
 
   /** Cheap synchronous check called from stream handlers right before
-   * they `addElement` a new tool / assistant segment / Read batch /
+   * they `addElement` a new tool / assistant segment / file-tool batch /
    * etc. If the current card is close to Feishu's element ceiling and
    * we haven't already kicked off a rotation, fire-and-forget start a
    * `startMidTurnRotate` and let it run async on its own. The current
@@ -2606,7 +2606,7 @@ export class Session {
    * against the new card cleanly; the still-live content is carried over
    * rather than dropped: the in-flight assistant segment (rebuilt and
    * continued) and any unfinished / failed tools (rebuildToolsOnRotate
-   * moves them, Reads split out), while already-finished tools stay on
+   * moves them, file-tool batches split out), while already-finished tools stay on
    * the old card. */
   private startMidTurnRotate(turn: TurnState): void {
     if (turn.rotating) return
@@ -2619,7 +2619,7 @@ export class Session {
     // 的 delta),所以放到 swap 时再读 —— 配合 appendAssistant onFailure 在
     // rotating 期间不 reset,这段会一直累积到 swap,窗口期的字一个不丢。
     const oldToolByUseId = turn.toolByUseId
-    const oldBatches = turn.readBatches
+    const oldBatches = turn.toolBatches
     turn.rotating = (async () => {
       try {
         log(`session "${this.sessionName}": mid-turn rotate triggered card=${oldCardId.slice(0, 8)}… elementCount=${cardkit.getElementCount(oldCardId)}`)
@@ -2657,8 +2657,8 @@ export class Session {
         turn.messageId = newMessageId
         turn.toolCount = 0
         turn.toolByUseId = new Map()
-        turn.readBatches = new Map()
-        turn.openReadBatchI = null
+        turn.toolBatches = new Map()
+        turn.openBatchI = null
         turn.planUpdateCount = 0
         turn.goalUpdateCount = 0
         // swap 那一刻读当前正在写的段(含切卡 async 窗口里到达的全部 delta ——
@@ -2695,7 +2695,7 @@ export class Session {
             targetElementId: sessionTools.taskLiveAnchor(turn),
           })
         }
-        // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
+        // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
         // 当前 assistant 段还没收尾就换卡时,整段只迁移内存缓冲到新卡继续收。
         // 正文要等 block_stop / turn close 后一次性插入,不在新旧卡上打字。
@@ -2801,7 +2801,7 @@ export class Session {
     }
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
-    turn.openReadBatchI = null
+    turn.openBatchI = null
     this.maybeMidTurnRotate()
     if (notice.phase === 'start') {
       const i = turn.contextCompactCount++
@@ -2845,7 +2845,7 @@ export class Session {
     }
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
-    turn.openReadBatchI = null
+    turn.openBatchI = null
     if (!Array.isArray(update.plan)) {
       log(`session "${this.sessionName}": turn/plan/updated missing plan array`)
       turn.planSteps = []
@@ -2900,7 +2900,7 @@ export class Session {
     if (turn) {
       this.startWorkingFooter(turn)
       if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
-      turn.openReadBatchI = null
+      turn.openBatchI = null
     }
     this.addGoalUpdateOnCurrentTurn(currentGoal)
   }
@@ -2912,7 +2912,7 @@ export class Session {
     if (!turn) return
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
-    turn.openReadBatchI = null
+    turn.openBatchI = null
     this.addGoalClearedOnCurrentTurn()
   }
 
@@ -2930,10 +2930,10 @@ export class Session {
     // 正文自身只进入内存缓冲,等 agentMessage completed 后一次性插入卡片。
     this.startWritingFooter(turn)
     if (!turn.currentAssistantSegmentId) {
-      // New assistant segment opens a visual break — any prior Read run
-      // is now visually separated from future Reads, so close the batch
-      // window. Future Reads will start a fresh batch at a new i.
-      turn.openReadBatchI = null
+      // New assistant segment opens a visual break — any prior file-tool run
+      // is now visually separated from future calls, so close the batch
+      // window. Future file-tool calls will start a fresh batch at a new i.
+      turn.openBatchI = null
       // Pre-empt the "element exceeds the limit" 300305/300315 cliff —
       // if the card's element count is approaching Feishu's cap, fire-and-
       // forget kick off a mid-turn rotation onto a fresh card before this

@@ -33,10 +33,24 @@ export function autoSendPathFromToolResult(name: string, output: string, isError
   return isAbsolute(p) ? p : null
 }
 
+/** File tools that merge consecutive calls into one batch panel:
+ * `Read` runs (paths only) and edit-family runs (`Edit`/`MultiEdit`/
+ * `NotebookEdit`, paths + edit counts only). Same kind consecutively
+ * joins the open batch; anything else closes the window. */
+function fileToolBatchKind(name: string): 'read' | 'edit' | null {
+  if (name === 'Read') return 'read'
+  if (name === 'Edit' || name === 'MultiEdit' || name === 'NotebookEdit') return 'edit'
+  return null
+}
+
+function batchElement(kind: 'read' | 'edit', i: number, items: Array<{ input: any; output: string | null; isError: boolean }>): object {
+  return kind === 'read' ? cards.readBatchElement(i, items) : cards.editBatchElement(i, items)
+}
+
 export function addTool(s: Session, toolUseId: string, name: string, input: any): void {
   if (!s.currentTurn) return
   // 元素接近上限时 fire-and-forget kick off mid-turn rotation。check 是
-  // O(1) 的(只查 cardkit 内部计数 Map),即使 in-batch Read 续走 replace
+  // O(1) 的(只查 cardkit 内部计数 Map),即使 in-batch 文件工具续走 replace
   // 路径不会 +1 element,也无害 —— maybeMidTurnRotate 看到 count 没到
   // 阈值会直接 return。
   s.maybeMidTurnRotate()
@@ -51,20 +65,25 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     // 这里直接跳过),本调用是 block_stop 没覆盖时的兜底。
     s.finalizeCurrentAssistantSegment()
   }
-  // Consecutive Read merger: if a Read run is already open, append to
-  // its batch and re-render the panel instead of inserting a new one.
-  // Any other tool name closes the run (handled below).
-  if (name === 'Read' && s.currentTurn.openReadBatchI !== null) {
-    const batchI = s.currentTurn.openReadBatchI
-    const batch = s.currentTurn.readBatches.get(batchI)!
-    const slot = batch.items.length
-    batch.items.push({ toolUseId, input, output: null, isError: false })
-    s.currentTurn.toolByUseId.set(toolUseId, { i: batchI, name, input, readBatchSlot: slot })
-    const el = cards.readBatchElement(batchI, batch.items)
-    void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
-    return
+  // Consecutive file-tool merger: if a same-kind run is already open,
+  // append to its batch and re-render the panel instead of inserting a
+  // new one. Any other tool name closes the run (handled below).
+  const batchKind = fileToolBatchKind(name)
+  if (batchKind && s.currentTurn.openBatchI !== null) {
+    const batchI = s.currentTurn.openBatchI
+    const batch = s.currentTurn.toolBatches.get(batchI)
+    if (batch && batch.kind === batchKind) {
+      const slot = batch.items.length
+      batch.items.push({ toolUseId, input, output: null, isError: false })
+      s.currentTurn.toolByUseId.set(toolUseId, { i: batchI, name, input, batchSlot: slot })
+      const el = batchKind === 'read'
+        ? cards.readBatchElement(batchI, batch.items)
+        : cards.editBatchElement(batchI, batch.items)
+      void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
+      return
+    }
   }
-  if (name !== 'Read') s.currentTurn.openReadBatchI = null
+  if (!batchKind) s.currentTurn.openBatchI = null
   // Claude Code Task 工具:整个流程复用本 turn 同一面板(codex 单面板效果),
   // 而非每次调用新建 —— 否则一次 TaskCreate×N + TaskUpdate×N 会堆成一串重复
   // 视图。board 累积在 session 级,这里只占/复用 element slot。
@@ -115,15 +134,17 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   s.currentTurn.taskCreateI = null
   s.currentTurn.taskUpdateI = null
   const i = s.currentTurn.toolCount++
-  if (name === 'Read') {
-    // First Read of a run — render the batch panel (file-paths only,
-    // never source). Subsequent Reads append into the same batch via
-    // the openReadBatchI fast-path above.
-    s.currentTurn.openReadBatchI = i
+  if (batchKind) {
+    // First call of a run — render the batch panel (paths + edit counts
+    // only, never source/diff bodies). Subsequent same-kind calls append
+    // into the same batch via the openBatchI fast-path above.
+    s.currentTurn.openBatchI = i
     const items = [{ toolUseId, input, output: null, isError: false }]
-    s.currentTurn.readBatches.set(i, { items })
-    s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, readBatchSlot: 0 })
-    const el = cards.readBatchElement(i, items)
+    s.currentTurn.toolBatches.set(i, { kind: batchKind, items })
+    s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, batchSlot: 0 })
+    const el = batchKind === 'read'
+      ? cards.readBatchElement(i, items)
+      : cards.editBatchElement(i, items)
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
     })
@@ -206,16 +227,16 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
     startThinkingIfNoToolsRunning(s)
     return
   }
-  // Read batch path: update this row's status in the shared batch then
-  // re-render via the path-only `readBatchElement`. We never fall back
-  // to `toolCallElement` for Read — single or batched, the panel only
-  // ever lists file paths, not contents.
-  if (meta.name === 'Read' && meta.readBatchSlot != null) {
-    const batch = s.currentTurn.readBatches.get(meta.i)
+  // File-tool batch path: update this row's status in the shared batch
+  // then re-render via the path-only batch element. We never fall back
+  // to `toolCallElement` for batched file tools — single or batched, the
+  // panel only ever lists file paths (+ edit counts), not contents.
+  if (meta.batchSlot != null) {
+    const batch = s.currentTurn.toolBatches.get(meta.i)
     if (batch) {
-      const row = batch.items[meta.readBatchSlot]
+      const row = batch.items[meta.batchSlot]
       if (row) { row.output = output; row.isError = isError }
-      const el = cards.readBatchElement(meta.i, batch.items)
+      const el = batchElement(batch.kind, meta.i, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
     startThinkingIfNoToolsRunning(s)
@@ -265,19 +286,19 @@ function startThinkingIfNoToolsRunning(s: Session): void {
  * result 回来仍能在新卡更新、建失败的也补上显示。已完成且旧卡上活着的
  * tool 不搬 —— 旧卡留底,也避免把新卡瞬间塞满又触发连锁 rotate。
  *
- * Read 按约定切开:合并 batch 里每个还需搬的 item 各自独立成一个新 panel,
+ * Read/Edit 批次按约定切开:合并 batch 里每个还需搬的 item 各自独立成一个新 panel,
  * 不再维持 batch 合并。rotate 是异常路径,功能正确(result 不丢)优先于
  * 合并美观。
  *
  * 调用约定:在 startMidTurnRotate 的 swap 完成后调(turn.cardId 已是新卡,
- * toolByUseId / readBatches / toolCount 已 reset),传入 swap 前同步快照的
+ * toolByUseId / toolBatches / toolCount 已 reset),传入 swap 前同步快照的
  * oldToolByUseId / oldBatches —— swap 把这俩换成了新空 Map,旧对象只在快照里。 */
 export function rebuildToolsOnRotate(
   s: Session,
   oldCardId: string,
   newCardId: string,
   oldToolByUseId: TurnState['toolByUseId'],
-  oldBatches: TurnState['readBatches'],
+  oldBatches: TurnState['toolBatches'],
 ): void {
   const turn = s.currentTurn
   if (!turn) return
@@ -285,12 +306,12 @@ export function rebuildToolsOnRotate(
   // 已先于本函数完成 —— 这里搬过来的 tool insert_before taskLiveAnchor(turn)
   // 时 live 区已在新卡就位。board 是 session 级累积快照,这里直接用。
   for (const [useId, meta] of oldToolByUseId) {
-    const isRead = meta.readBatchSlot != null
+    const batchSlot = meta.batchSlot ?? null
     let input = meta.input
     let output: string | null
     let isError: boolean
-    if (isRead) {
-      const item = oldBatches.get(meta.i)?.items[meta.readBatchSlot!]
+    if (batchSlot != null) {
+      const item = oldBatches.get(meta.i)?.items[batchSlot]
       if (!item) continue
       input = item.input
       output = item.output
@@ -303,12 +324,14 @@ export function rebuildToolsOnRotate(
     const deadOnOld = cardkit.isDeadElement(oldCardId, cards.ELEMENTS.tool(meta.i))
     // 已完成且旧卡上活着 → 留在旧卡,不搬。
     if (done && !deadOnOld) continue
-    if (isRead) {
+    if (batchSlot != null) {
+      const kind = oldBatches.get(meta.i)?.kind
+      if (!kind) continue
       const ni = turn.toolCount++
       const item = { toolUseId: useId, input, output, isError }
-      turn.readBatches.set(ni, { items: [item] })
-      turn.toolByUseId.set(useId, { ...meta, i: ni, readBatchSlot: 0 })
-      void cardkit.addElement(newCardId, cards.readBatchElement(ni, [item]), {
+      turn.toolBatches.set(ni, { kind, items: [item] })
+      turn.toolByUseId.set(useId, { ...meta, i: ni, batchSlot: 0 })
+      void cardkit.addElement(newCardId, batchElement(kind, ni, [item]), {
         type: 'insert_before', targetElementId: taskLiveAnchor(turn),
       })
       continue

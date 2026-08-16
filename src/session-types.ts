@@ -37,10 +37,11 @@ export interface TurnState {
     resolvedNote?: string
     output?: string
     isError?: boolean
-    /** Set when this tool is part of a merged Read batch — points to the
-     * batch's slot in `readBatches[i].items`. completeTool uses it to
-     * update the right row instead of rendering a standalone panel. */
-    readBatchSlot?: number
+    /** Set when this tool is part of a merged file-tool batch (Read run or
+     * Edit run) — points to the batch's slot in `toolBatches[i].items`.
+     * completeTool uses it to update the right row instead of rendering
+     * a standalone panel. */
+    batchSlot?: number
   }>
   /** Current turn plan as reported by Codex app-server
    * turn/plan/updated. Deltas are only for the pre-authoritative
@@ -51,18 +52,21 @@ export interface TurnState {
   goalUpdateCount: number
   contextCompactCount: number
   contextCompactionPending: Map<string, { i: number; cardId: string; notice: any }>
-  /** Consecutive `Read` calls collapse into a single panel rendered by
-   * `cards.readBatchElement`. Keyed by element index `i` so completeTool
-   * can find the batch after its open-window closed (a non-Read tool or
-   * new assistant segment has since arrived).
+  /** Consecutive file-tool calls collapse into a single panel: `Read` runs
+   * render via `cards.readBatchElement`, `Edit`/`MultiEdit`/`NotebookEdit`
+   * runs via `cards.editBatchElement`. Keyed by element index `i` so
+   * completeTool can find the batch after its open-window closed (a
+   * different-kind tool or new assistant segment has since arrived).
    *
-   * `openReadBatchI` is the i of the batch currently accepting new Reads;
-   * null once the run ends. Subsequent Read calls open a fresh batch at a
-   * new i. */
-  readBatches: Map<number, {
+   * `openBatchI` is the i of the batch currently accepting new calls of
+   * its own kind; null once the run ends. A run of a different kind (or
+   * any non-batch tool) closes the window — subsequent calls open a fresh
+   * batch at a new i. */
+  toolBatches: Map<number, {
+    kind: 'read' | 'edit'
     items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
   }>
-  openReadBatchI: number | null
+  openBatchI: number | null
   /** Task 工具按类型分两个合并槽(连续同类调用复用同一面板,切类则前一类定稿):
    * - taskCreateI:连续 TaskCreate 合并成"创建任务"面板(列待办,按 #1#2#3 顺序),
    *   遇到任何非 Create 工具(含 TaskUpdate)即定稿,board 后续变化不再回写它。

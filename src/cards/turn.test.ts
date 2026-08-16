@@ -4,6 +4,7 @@ import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, m
 import {
   askUserQuestionElement,
   contextCompactionElement,
+  editBatchElement,
   footerContextPercentLabel,
   footerTokenDetailLine,
   goalElement,
@@ -11,6 +12,7 @@ import {
   hostAskCard,
   mainConversationCard,
   planElement,
+  readBatchElement,
   summarizeToolInput,
   toolCallElement,
   toolCallPermissionElement,
@@ -925,5 +927,46 @@ describe('other tool card rendering', () => {
     expect(body).toContain('**类型**: `reviewer`')
     expect(body).toContain('Find issues in card rendering.')
     expect(body).not.toContain('"subagent_type"')
+  })
+})
+
+describe('file-tool batch rendering', () => {
+  test('readBatchElement lists paths only, collapsing a joined run', () => {
+    const items = [
+      { input: { file_path: '/repo/src/a.ts' }, output: 'ok', isError: false },
+      { input: { file_path: '/repo/src/b.ts' }, output: null, isError: false },
+    ]
+    const el = readBatchElement(3, items) as any
+    const body = el.elements[0].content
+
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(false)
+    expect(el.header.title.content).toBe('⏳ 🔧 Read · 2 次')
+    expect(body).toContain('`/repo/src/a.ts`')
+    expect(body).toContain('`/repo/src/b.ts`')
+    expect(body).not.toContain('ok')
+  })
+
+  test('editBatchElement lists path + edit counts, not diff bodies', () => {
+    const single = editBatchElement(4, [
+      { input: { file_path: '/repo/src/session.ts', old_string: 'a', new_string: 'b' }, output: null, isError: false },
+    ]) as any
+    expect(single.header.title.content).toBe('⏳ 🔧 编辑文件: /repo/src/session.ts')
+
+    const joined = editBatchElement(5, [
+      { input: { file_path: '/repo/src/a.ts', edits: [{ old_string: 'x', new_string: 'y' }, { old_string: 'p', new_string: 'q' }] }, output: 'done', isError: false },
+      { input: { file_path: '/repo/src/b.ts', replace_all: true, old_string: 'x', new_string: 'y' }, output: 'done', isError: false },
+      { input: { notebook_path: '/repo/nb.ipynb', cell_id: 'c1', new_source: 'z' }, output: 'err', isError: true },
+    ]) as any
+    const body = joined.elements[0].content
+
+    expect(joined.header.title.content).toBe('❌ 🔧 编辑文件 · 3 次')
+    expect(body).toContain('`/repo/src/a.ts · 2 处`')
+    expect(body).toContain('`/repo/src/b.ts · 全局替换`')
+    expect(body).toContain('`/repo/nb.ipynb`')
+    // diff / old / new 文本一律不进卡片
+    expect(body).not.toContain('old_string')
+    expect(body).not.toContain('new_string')
+    expect(body).not.toContain('done')
   })
 })
