@@ -3120,43 +3120,36 @@ export class Session {
   }
 
   /** turn footer 末尾的额度后缀,按当前 token source 渲染(不再硬编码 GLM):
-   *   claude source(glm/deepseek)→ ts.readUsage(轻量 HTTP):glm 显示 5h 滚动窗口 %,
+   *   claude source(glm/deepseek)→ ts.readUsage(轻量 HTTP):glm 显示 5h+周双窗口,
    *                deepseek 等标量余额 source 显示 planLabel「剩余 ¥X」
    *   codex        → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
    *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
-   * 拿不到数据返回空串;resetsAt 在未来时追加剩余重置时长(`·[2.3h]`),
-   * 缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
+   * 拿不到数据返回空串;缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
   private async footerUsageSuffix(provider: AgentProvider): Promise<string> {
     const ts = this.currentTokenSource()
     if (ts?.agent === provider && ts.enabled && provider === 'claude') {
       const snap = await ts.readUsage()
       const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
-      if (fiveHour) return this.fmtFiveHourSuffix(fiveHour.percent, fiveHour.resetsAt)
+      const weekly = snap.windows.find(w => w.kind === 'weekly')
+      if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)
       // DeepSeek 等标量余额 source(无 5h 窗口)→ 显示 planLabel(余额);失败/无数据不假数据
       return snap.state === 'ok' && snap.planLabel ? `  |  ${snap.planLabel}` : ''
     }
     if (provider === 'codex') {
       const u = peekUsage()
-      return u?.state === 'ok' ? this.fmtCodexUsageSuffix(u.fiveHour ?? null, u.weekly ?? null) : ''
+      return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : ''
     }
     // claude 无匹配 token source(理论不发生,token source 总有)→ 回退 readGlmUsage 兼容
     const g = await readGlmUsage()
-    return g.state === 'ok' ? this.fmtFiveHourSuffix(g.fiveHour?.percent ?? null, g.fiveHour?.resetsAt ?? null) : ''
+    return g.state === 'ok' ? this.fmtDualWindowSuffix(g.fiveHour ?? null, g.weekly ?? null) : ''
   }
 
-  /** 5h 滚动窗口百分比 + 重置倒计时的 footer 后缀;percent null → 空串。 */
-  private fmtFiveHourSuffix(percent: number | null, resetsAt: Date | null): string {
-    if (percent == null) return ''
-    const resetIn = resetsAt && resetsAt.getTime() > Date.now() ? cards.fmtResetIn(resetsAt) : ''
-    return resetIn ? `  |  5h·${Math.round(percent)}%·[${resetIn}]` : `  |  5h·${Math.round(percent)}%`
-  }
-
-  /** codex 双窗口 footer 后缀,形如 `4.1h·7%·[6.9d·17%]`:
+  /** 双窗口额度 footer 后缀,codex/GLM 共用,形如 `4.1h·7%·[6.9d·17%]`:
    * 5h 窗口(重置倒计时·已用%)+ 方括号内周窗口(重置倒计时·已用%)。
    * Prolite 等套餐只有周窗口(无 5h)→ 退化为裸周窗口段 `[6.9d·9%]`。
    * 缺哪段就省哪段(no_fallbacks 不假数据):两窗口都缺 → 空串;
    * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比。 */
-  private fmtCodexUsageSuffix(
+  private fmtDualWindowSuffix(
     fiveHour: { percent: number | null; resetsAt: Date | null } | null,
     weekly: { percent: number | null; resetsAt: Date | null } | null,
   ): string {

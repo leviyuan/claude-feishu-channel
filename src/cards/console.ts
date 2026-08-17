@@ -240,6 +240,11 @@ export function consoleGlmUsageContent(glmUsage: GlmUsageSnapshot | undefined): 
     if (glmUsage.fiveHour.resetsAt) parts.push(`重置 ${fmtResetIn(glmUsage.fiveHour.resetsAt)}`)
     lines.push(`　· 5h 窗口　${parts.join(' · ')}`)
   }
+  if (glmUsage.weekly) {
+    const parts = [fmtUsagePercent(glmUsage.weekly.percent)]
+    if (glmUsage.weekly.resetsAt) parts.push(`重置 ${fmtResetIn(glmUsage.weekly.resetsAt)}`)
+    lines.push(`　· 周额度　${parts.join(' · ')}`)
+  }
   if (glmUsage.monthly) {
     const parts = [fmtUsagePercent(glmUsage.monthly.percent)]
     if (typeof glmUsage.monthly.used === 'number' && typeof glmUsage.monthly.total === 'number') {

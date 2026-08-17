@@ -47,8 +47,10 @@ export type GlmUsageSnapshot =
       state: 'ok'
       /** 套餐档位(open.bigmodel.cn 的 level 字段:max / standard / …) */
       level?: string
-      /** 5 小时 token 滚动窗口(TOKENS_LIMIT) */
+      /** 5 小时 token 滚动窗口(TOKENS_LIMIT unit=3 number=5) */
       fiveHour: GlmUsageWindow | null
+      /** 周额度窗口(TOKENS_LIMIT unit=6 number=1);无周限额套餐为 null */
+      weekly: GlmUsageWindow | null
       /** 月度工具/MCP 用量(TIME_LIMIT) */
       monthly: GlmMonthlyWindow | null
       fetchedAt: number
@@ -118,14 +120,21 @@ function resetDate(ms: unknown): Date | null {
   return typeof ms === 'number' && isFinite(ms) && ms > 0 ? new Date(ms) : null
 }
 
-/** 解析 quota/limit 响应 → ok 快照;limits 缺字段按 null(MISS)渲染。 */
+/** 解析 quota/limit 响应 → ok 快照;limits 缺字段按 null(MISS)渲染。
+ * TOKENS_LIMIT 有两条:5h 窗口(unit=3 number=5)和周窗口(unit=6 number=1)
+ * —— 靠 unit/number 区分,不能只 find 第一条(有周限额的账号会丢窗口或错配;
+ * 无周限额的账号响应里只有 5h 那条,weekly 落 null)。字段语义来自
+ * opencode-glm-quota / pi-glm-usage 对同一 API 的解析,2026-08-17 核实。 */
 function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
   const limits: any[] = Array.isArray(data?.limits) ? data.limits : []
-  const tokens = limits.find(l => l?.type === 'TOKENS_LIMIT')
+  const tokens = limits.filter(l => l?.type === 'TOKENS_LIMIT')
+  const fiveHourLimit = tokens.find(l => l?.unit === 3 && l?.number === 5)
+  const weeklyLimit = tokens.find(l => l?.unit === 6 && l?.number === 1)
   const time = limits.find(l => l?.type === 'TIME_LIMIT')
-  const fiveHour: GlmUsageWindow | null = tokens
-    ? { percent: clampPct(tokens.percentage), resetsAt: resetDate(tokens.nextResetTime) }
-    : null
+  const win = (l: any): GlmUsageWindow | null =>
+    l ? { percent: clampPct(l.percentage), resetsAt: resetDate(l.nextResetTime) } : null
+  const fiveHour = win(fiveHourLimit)
+  const weekly = win(weeklyLimit)
   const monthly: GlmMonthlyWindow | null = time
     ? {
         percent: clampPct(time.percentage),
@@ -138,6 +147,7 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
     state: 'ok',
     level: typeof data?.level === 'string' && data.level ? data.level : undefined,
     fiveHour,
+    weekly,
     monthly,
     fetchedAt: Date.now(),
   }

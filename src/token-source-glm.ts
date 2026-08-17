@@ -79,6 +79,7 @@ function glmUsageToUnified(s: GlmUsageSnapshot): UsageSnapshotUnified {
   }
   const windows: UsageWindowUnified[] = []
   if (s.fiveHour) windows.push(glmWindowToUnified(s.fiveHour, 'fiveHour', '5h 窗口'))
+  if (s.weekly) windows.push(glmWindowToUnified(s.weekly, 'weekly', '周额度'))
   if (s.monthly) windows.push(glmMonthlyToUnified(s.monthly))
   return {
     state: 'ok',
