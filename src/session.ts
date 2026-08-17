@@ -2923,11 +2923,11 @@ export class Session {
     turn.segmentTexts.set(segId, turn.currentAssistantText)
     this.processOutboundMarkers(turn.currentAssistantText)
     const displayText = this.cleanAssistantTextForDisplay(turn.currentAssistantText)
-    // Chat-list preview: tail of the latest assistant text. Feishu
-    // truncates anyway; ~60 chars is what shows on a typical phone
-    // preview line. patchSummaryThrottled is rate-limited on its own.
-    const tail = displayText.slice(-60)
-    cardkit.patchSummaryThrottled(turn.cardId, tail)
+    // Chat-list preview: head of the latest assistant text (~40 chars —
+    // 开头即主题,流式期间稳定不闪;尾部截断会把 markdown 语法尾巴糊进列表行)。
+    // Feishu truncates anyway. patchSummaryThrottled is rate-limited on its own.
+    const head = displayText.slice(0, 40)
+    cardkit.patchSummaryThrottled(turn.cardId, head)
   }
 
   /** 取走并清空孤儿 assistant 缓冲(定稿段 + 未定稿尾段,空行分隔)。 */

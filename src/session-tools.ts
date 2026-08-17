@@ -83,6 +83,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
         ? cards.readBatchElement(batchI, batch.items)
         : cards.editBatchElement(batchI, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
+      toolSummaryToPreview(s.currentTurn, name, input)
       return
     }
   }
@@ -131,6 +132,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     void (isFirst
       ? cardkit.addElement(turn.cardId, el, { type: 'insert_before', targetElementId: taskLiveAnchor(turn) })
       : cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(ti), el))
+    toolSummaryToPreview(turn, name, input)
     return
   }
   // 非 Task 工具:Task 面板合并窗口关闭(创建/进度面板各自定稿)
@@ -151,6 +153,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
     })
+    toolSummaryToPreview(s.currentTurn, name, input)
     return
   }
   s.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
@@ -204,6 +207,19 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     type: 'insert_before',
     targetElementId: taskLiveAnchor(s.currentTurn),
   })
+  // Chat-list preview: 工具运行阶段正文不出字,预览会冻结在旧文字尾部 ——
+  // 同步当前工具面板同款标题(🔧 工具名: 摘要),列表里能看到 agent 在干嘛。
+  toolSummaryToPreview(s.currentTurn, name, input)
+}
+
+/** 与 toolCallElement 的面板 header 同构的预览行(⏳ 状态、不带 resolvedNote)。 */
+function toolSummaryToPreview(turn: TurnState | null, name: string, input: any): void {
+  if (!turn) return
+  const raw = cards.summarizeToolInput(name, input)
+  const summary = raw.length > 80 ? raw.slice(0, 80) + '…' : raw
+  const toolName = cards.displayToolName(name)
+  const line = summary ? `🔧 ${toolName}: ${summary}` : `🔧 ${toolName}`
+  cardkit.patchSummaryThrottled(turn.cardId, line)
 }
 
 export function completeTool(s: Session, toolUseId: string, content: any, isError: boolean): void {
