@@ -73,9 +73,7 @@ function goalStatusLabel(s: string): string {
   }
 }
 
-function planHeader(plan: TurnPlanStep[], draftText = ''): string {
-  const draft = draftText.trim()
-  if (plan.length === 0) return draft ? '📋 计划草稿' : '📋 计划更新'
+function planStats(plan: TurnPlanStep[]): string {
   const completed = plan.filter(item => item.status === 'completed').length
   const inProgress = plan.filter(item => item.status === 'inProgress').length
   const pending = plan.filter(item => item.status === 'pending').length
@@ -83,7 +81,13 @@ function planHeader(plan: TurnPlanStep[], draftText = ''): string {
   if (inProgress) parts.push(`${inProgress} 进行中`)
   if (completed) parts.push(`${completed} 完成`)
   if (pending) parts.push(`${pending} 待办`)
-  return `📋 计划更新 · ${parts.join(' · ')}`
+  return parts.join(' · ')
+}
+
+function planHeader(plan: TurnPlanStep[], draftText = ''): string {
+  const draft = draftText.trim()
+  if (plan.length === 0) return draft ? '📋 计划草稿' : '📋 计划更新'
+  return `📋 计划更新 · ${planStats(plan)}`
 }
 
 function formatGoalTime(seconds: number): string {
@@ -198,6 +202,33 @@ export function planElement(
     header: { title: { tag: 'plain_text', content: planHeader(plan, draftText) } },
     expanded: false,
     elements: [{ tag: 'markdown', content: renderPlanContent(plan, explanation, draftText) }],
+  }
+}
+
+/**
+ * 实时计划面板(footer 正前常驻,与 taskBoardLive 同语义)。codex 每次
+ * turn/plan/updated 都会推完整最新计划 —— 这里 replace 成最新快照,让最新
+ * 计划永远压在卡片末尾,不被后续 tool/assistant 元素顶走,对齐 claude cli
+ * 底部常驻 todo 的"保持最新状态在末尾"体验。
+ *
+ * header 固定 "📋 当前计划 · 统计"(无序号 —— planUpdateCount 在换卡时清零,
+ * 序号会从 1 重数,语义失真);expanded=true 让用户不用点开就能看计划。body
+ * 复用 renderPlanContent,与 timeline 快照(planElement,折叠过程记录)视觉一致。
+ */
+export function planLiveElement(
+  plan: TurnPlanStep[],
+  explanation: string | null,
+  elementId: string,
+): object {
+  const header = plan.length > 0
+    ? `📋 当前计划 · ${planStats(plan)}`
+    : '📋 当前计划'
+  return {
+    tag: 'collapsible_panel',
+    element_id: elementId,
+    header: { title: { tag: 'plain_text', content: header } },
+    expanded: true,
+    elements: [{ tag: 'markdown', content: renderPlanContent(plan, explanation) }],
   }
 }
 

@@ -26,6 +26,12 @@ export const ELEMENTS = {
    *  建立后它成为新的插入锚点 —— 后续过程元素 insert_before 它而非 footer,
    *  保证实时区永远压在 footer 正前(见 session-tools.taskLiveAnchor)。 */
   taskBoardLive: 'task_board_live',
+  /** Live plan panel — codex turn/plan/updated 首次到达即建立(footer 正前,
+   *  固定 id,后续只 replace 内容、不挪位),始终显示最新计划,对齐 claude 侧
+   *  taskBoardLive 的常驻语义(最新状态压在卡片末尾,不被后续元素顶走)。
+   *  timeline 上的 plan_update_<i> 快照与此并存。建立后与 taskBoardLive
+   *  共同构成插入锚点链(见 session-tools.taskLiveAnchor)。 */
+  planLive: 'plan_live',
   tool: (i: number) => `tool_${i}`,
   planUpdate: (i: number) => `plan_update_${i}`,
   goalUpdate: (i: number) => `goal_update_${i}`,

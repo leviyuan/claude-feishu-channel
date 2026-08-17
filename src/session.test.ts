@@ -128,6 +128,11 @@ function turnState(cardId = 'card_session_turn'): any {
     contextCompactionPending: new Map(),
     toolBatches: new Map(),
     openBatchI: null,
+    taskCreateI: null,
+    taskUpdateI: null,
+    taskBoardResetThisTurn: false,
+    taskLiveInserted: false,
+    planLiveInserted: false,
     assistantSegmentCount: 0,
     currentAssistantSegmentId: null,
     currentAssistantText: '',
@@ -1128,8 +1133,124 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
   })
 })
 
-describe('Session live_elapsed second mode', () => {
-  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
+describe('Session codex plan live panel (plan_live)', () => {
+  test('turn/plan/updated 首次建立 plan_live,后续原地 replace,最新计划始终在卡末', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_plan_live')
+    session.currentTurn.planLiveInserted = false
+    cardkit.recordCardCreated('card_plan_live', 1)
+
+    try {
+      const plan1 = { explanation: '第一版', plan: [{ step: '探查', status: 'inProgress' }] }
+      proc.emit('turn_plan_updated', plan1)
+      await cardkit.flush('card_plan_live')
+
+      // 首次:建立 plan_live(insert_before footer)+ timeline 快照 plan_update_0
+      const addLive = calls.find(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_live/elements' &&
+        String(c.body?.elements ?? '').includes('"plan_live"'))
+      expect(addLive).toBeDefined()
+      expect(addLive?.body.target_element_id).toBe('footer')
+      expect(session.currentTurn.planLiveInserted).toBe(true)
+
+      const plan2 = { explanation: '第二版', plan: [
+        { step: '探查', status: 'completed' },
+        { step: '接入', status: 'inProgress' },
+      ] }
+      proc.emit('turn_plan_updated', plan2)
+      await cardkit.flush('card_plan_live')
+
+      // 后续:PUT 原地 replace plan_live,内容是最新的第二版
+      const putLive = calls.filter(c =>
+        c.method === 'PUT' && c.path === '/cards/card_plan_live/elements/plan_live')
+      expect(putLive.length).toBe(1)
+      const replaced = JSON.parse(putLive[0].body.element)
+      expect(replaced.expanded).toBe(true)
+      expect(replaced.elements[0].content).toContain('- ✅ 探查')
+      expect(replaced.elements[0].content).toContain('- 🔄 接入')
+      expect(replaced.header.title.content).toBe('📋 当前计划 · 2 项 · 1 进行中 · 1 完成')
+
+      // timeline 快照照旧累积(过程记录),且 insert_before plan_live(不被顶走)
+      const snapshotAdds = calls.filter(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_live/elements' &&
+        String(c.body?.elements ?? '').includes('plan_update_'))
+      expect(snapshotAdds).toHaveLength(2)
+      expect(snapshotAdds.every(c => c.body.target_element_id === 'plan_live')).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_plan_live')
+    }
+  })
+
+  test('plan_live 建立后锚点指向 plan_live,任务总览仍紧贴 footer', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    const turn = turnState('card_anchor')
+    turn.planLiveInserted = true
+    turn.taskLiveInserted = true
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_anchor', 1)
+
+    try {
+      proc.emit('turn_plan_updated', { explanation: null, plan: [{ step: 'x', status: 'pending' }] })
+      await cardkit.flush('card_anchor')
+      // 已建立 → replace 路径,timeline 快照 insert_before plan_live
+      const snapshotAdd = calls.find(c =>
+        c.method === 'POST' && c.path === '/cards/card_anchor/elements' &&
+        String(c.body?.elements ?? '').includes('plan_update_'))
+      expect(snapshotAdd?.body.target_element_id).toBe('plan_live')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_anchor')
+    }
+  })
+
+  test('空 plan 数组不建立 live 面板,也不把已建立的刷成占位', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_plan_empty')
+    cardkit.recordCardCreated('card_plan_empty', 1)
+
+    try {
+      // 首次就是空数组 → 不建立
+      proc.emit('turn_plan_updated', { explanation: null, plan: [] })
+      await cardkit.flush('card_plan_empty')
+      expect(session.currentTurn.planLiveInserted).toBe(false)
+      expect(calls.some(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_empty/elements' &&
+        String(c.body?.elements ?? '').includes('plan_live'))).toBe(false)
+
+      // 空数组首次 → 未建立;有效更新 → 此时才建立(POST add,内容含有效步骤)
+      proc.emit('turn_plan_updated', { explanation: '有效', plan: [{ step: '有效步骤', status: 'inProgress' }] })
+      await cardkit.flush('card_plan_empty')
+      expect(session.currentTurn.planLiveInserted).toBe(true)
+      const addLive = calls.filter(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_empty/elements' &&
+        String(c.body?.elements ?? '').includes('plan_live'))
+      expect(addLive).toHaveLength(1)
+      expect(addLive[0].body.elements).toContain('有效步骤')
+
+      // 建立后再来空更新 → 不 replace,上次有效计划保留(0 条 PUT)
+      proc.emit('turn_plan_updated', { explanation: null, plan: [] })
+      await cardkit.flush('card_plan_empty')
+      const putLive = calls.filter(c =>
+        c.method === 'PUT' && c.path === '/cards/card_plan_empty/elements/plan_live')
+      expect(putLive).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_plan_empty')
+    }
+  })
+})
+
+describe('Session live_elapsed second mode', () => {  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
     // claude-agent-process.test 的 mock.module('./config') 会在全量 suite 里
     // 把 config 换成缺 runtime 的 stub;这里先补上 runtime 再改 mode。
     const cfg = config as any

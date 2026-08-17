@@ -12,6 +12,7 @@ import {
   hostAskCard,
   mainConversationCard,
   planElement,
+  planLiveElement,
   readBatchElement,
   summarizeToolInput,
   toolCallElement,
@@ -492,6 +493,30 @@ describe('plan and goal rendering', () => {
     expect(body).toContain('正在生成计划草稿')
     expect(body).toContain('1. 探查代码')
     expect(body).toContain('2. 修改卡片')
+  })
+
+  test('planLiveElement — 实时计划面板(常驻末尾,默认展开,统计 header)', () => {
+    const el = planLiveElement([
+      { step: '读取协议', status: 'completed' },
+      { step: '接入通知', status: 'inProgress' },
+    ], '按当前协议渲染。', 'plan_live') as any
+
+    expect(el.element_id).toBe('plan_live')
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(true) // 与 timeline 快照(expanded:false)的关键区别
+    expect(el.header.title.content).toBe('📋 当前计划 · 2 项 · 1 进行中 · 1 完成')
+    const body = el.elements[0].content
+    expect(body).toContain('**📋 当前计划**')
+    expect(body).toContain('按当前协议渲染。')
+    expect(body).toContain('- ✅ 读取协议')
+    expect(body).toContain('- 🔄 接入通知')
+  })
+
+  test('planLiveElement — 空计划渲染占位,不抛', () => {
+    const el = planLiveElement([], null, 'plan_live') as any
+    expect(el.expanded).toBe(true)
+    expect(el.header.title.content).toBe('📋 当前计划')
+    expect(el.elements[0].content).toContain('--')
   })
 
   test('renders thread goal status and budget', () => {

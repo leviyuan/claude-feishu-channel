@@ -16,8 +16,11 @@ import * as feishu from './feishu'
 /** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
  * 建立后,新元素 insert_before 它(让实时区永远压在 footer 正前,过程记录堆在它
  * 上方、相对顺序不变);否则 insert_before footer(本 turn 没 Task 工具时,行为同
- * 改前)。turn=null 兜底 footer —— 调用方都在 turn 生命周期内,turn 非空,仅类型安全。 */
+ * 改前)。plan_live 常驻更前(任务总览正上)—— codex plan 更新频繁,不该把任务
+ * 总览挤离 footer。turn=null 兜底 footer —— 调用方都在 turn 生命周期内,turn 非
+ * 空,仅类型安全。 */
 export function taskLiveAnchor(turn: TurnState | null | undefined): string {
+  if (turn?.planLiveInserted) return cards.ELEMENTS.planLive
   return turn?.taskLiveInserted ? cards.ELEMENTS.taskBoardLive : cards.ELEMENTS.footer
 }
 

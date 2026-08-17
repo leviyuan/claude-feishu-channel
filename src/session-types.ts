@@ -86,6 +86,11 @@ export interface TurnState {
    *  rebuildToolsOnRotate 在新卡重建。建立后它成为插入锚点 —— 后续过程元素
    *  insert_before 它而非 footer(见 session-tools.taskLiveAnchor)。per-turn。 */
   taskLiveInserted: boolean
+  /** 实时计划区(plan_live)是否已在本 turn 卡片建立。codex 首次 turn/plan/updated
+   *  触发建立(任务总览正上、footer 正前),之后每次 plan 更新 replace 成最新快照,
+   *  让最新计划永远压在卡片末尾(对齐 claude 侧任务总览的常驻语义)。per-turn,
+   *  swap 不重置(换卡由 startMidTurnRotate 重建)。 */
+  planLiveInserted: boolean
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string
