@@ -19,7 +19,7 @@ function withTimeout<T>(p: Promise<T>, ms = TIMEOUT_MS): Promise<T> {
   })
 }
 
-const CODEX_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+const CODEX_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 function codexEffort(e: unknown): AgentReasoningEffort | null {
   return typeof e === 'string' && (CODEX_EFFORTS as string[]).includes(e)
     ? e as AgentReasoningEffort

@@ -78,12 +78,14 @@ export interface SpawnOpts {
   tokenSourceId?: string | null
 }
 
-export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+// gpt-5.6 起服务端新增 max(单 agent 最深推理)与 ultra(多 agent 并行编排,默认 4 agent);
+// per-model 实际支持集以 model/list 下发为准,这里只做全集枚举。
+export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 export interface CodexReasoningEffortOption {
   reasoningEffort: CodexReasoningEffort
   description: string
 }
-export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
 export const CODEX_EFFORT: CodexReasoningEffort = 'xhigh'
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
