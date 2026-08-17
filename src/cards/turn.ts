@@ -480,7 +480,7 @@ export function askUserQuestionElement(
   const currentIdx = state?.currentIdx
   const isTerminal = currentIdx === undefined && answered.size > 0
   const bodyElements: any[] = []
-  let headerText
+  let headerText: string
 
   if (isTerminal) {
     headerText = `${status} 已回答 · ${total}/${total}`
