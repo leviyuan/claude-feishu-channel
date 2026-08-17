@@ -3153,22 +3153,26 @@ export class Session {
 
   /** codex 双窗口 footer 后缀,形如 `4.1h·7%·[6.9d·17%]`:
    * 5h 窗口(重置倒计时·已用%)+ 方括号内周窗口(重置倒计时·已用%)。
-   * 缺哪段就省哪段(no_fallbacks 不假数据):5h percent 缺 → 空串;
-   * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比;周窗口整段缺 → 只剩 5h 段。 */
+   * Prolite 等套餐只有周窗口(无 5h)→ 退化为裸周窗口段 `[6.9d·9%]`。
+   * 缺哪段就省哪段(no_fallbacks 不假数据):两窗口都缺 → 空串;
+   * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比。 */
   private fmtCodexUsageSuffix(
     fiveHour: { percent: number | null; resetsAt: Date | null } | null,
     weekly: { percent: number | null; resetsAt: Date | null } | null,
   ): string {
-    if (fiveHour?.percent == null) return ''
     const resetIn = (w: { resetsAt: Date | null }): string =>
       w.resetsAt && w.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(w.resetsAt) : ''
-    const seg = (w: { percent: number | null; resetsAt: Date | null }): string => {
+    const seg = (w: { percent: number | null; resetsAt: Date | null }): string | null => {
+      if (w?.percent == null) return null
       const ri = resetIn(w)
-      return ri ? `${ri}·${Math.round(w.percent!)}%` : `${Math.round(w.percent!)}%`
+      return ri ? `${ri}·${Math.round(w.percent)}%` : `${Math.round(w.percent)}%`
     }
-    const parts = [seg(fiveHour)]
-    if (weekly?.percent != null) parts.push(`[${seg(weekly)}]`)
-    return `  |  ${parts.join('·')}`
+    const five = seg(fiveHour)
+    const week = seg(weekly)
+    if (five && week) return `  |  ${five}·[${week}]`
+    if (five) return `  |  ${five}`
+    if (week) return `  |  [${week}]`
+    return ''
   }
 
   async closeTurnCard(

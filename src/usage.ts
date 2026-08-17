@@ -112,13 +112,38 @@ function windowFromRateLimit(w: any): UsageWindow | null {
   }
 }
 
+/** 窗口归类:codex 不保证 primary/secondary 位置语义 —— Prolite 等套餐把
+ * 唯一的周窗口塞在 primary(secondary=null),Plus/Pro 才是 primary=5h +
+ * secondary=周。按 windowDurationMins 真实时长归类(300→5h,10080→周),
+ * 位置只作 fallback(时长缺失时)。 */
+function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: UsageWindow | null } {
+  const primary = windowFromRateLimit(limits?.primary)
+  const secondary = windowFromRateLimit(limits?.secondary)
+  const byDuration = (w: UsageWindow | null, mins: number): boolean =>
+    w?.durationMins === mins
+  if (byDuration(primary, 10_080) && byDuration(secondary, 300)) {
+    // 未见过的倒挂形态(primary=周、secondary=5h),按时长纠正
+    return { fiveHour: secondary, weekly: primary }
+  }
+  if (byDuration(primary, 10_080) && !secondary) {
+    // Prolite 形态:唯一的周窗口在 primary
+    return { fiveHour: null, weekly: primary }
+  }
+  if (byDuration(primary, 300) || (!primary?.durationMins && primary)) {
+    // 常规 Plus/Pro:primary=5h;或时长缺失按位置
+    return { fiveHour: primary, weekly: secondary }
+  }
+  // primary 是其他时长(如自定义 individualLimit):按位置保守处理
+  return { fiveHour: primary, weekly: secondary }
+}
+
+
 export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
   if (!rateLimits) return cache ?? { state: 'network', reason: 'empty rate limit update' }
   const snapshot: UsageSnapshotOk = {
     state: 'ok',
     subscriptionType: rateLimits.planType,
-    fiveHour: windowFromRateLimit(rateLimits.primary),
-    weekly: windowFromRateLimit(rateLimits.secondary),
+    ...classifyWindows(rateLimits),
     fetchedAt: Date.now(),
   }
   cache = snapshot
@@ -144,8 +169,7 @@ async function fetchUsage(): Promise<UsageSnapshot> {
     return {
       state: 'ok',
       subscriptionType: account.planType ?? limits.planType ?? 'chatgpt',
-      fiveHour: windowFromRateLimit(limits.primary),
-      weekly: windowFromRateLimit(limits.secondary),
+      ...classifyWindows(limits),
       fetchedAt: Date.now(),
     }
   } catch (e: any) {
