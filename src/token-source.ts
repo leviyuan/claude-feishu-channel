@@ -25,8 +25,6 @@ export interface TokenSourceCapabilities {
   /** 支持 resumeSessionAt / fork(claude=true, codex=false —— codex 无此能力) */
   resumeSessionAt: boolean
   fork: boolean
-  /** host-ask marker(codex=true 走 askusr;claude 走 SDK AskUserQuestion) */
-  hostAsk: boolean
 }
 
 /** 该账号下可选的具体模型(codex 订阅 7 个、glm 账号 8 个) */

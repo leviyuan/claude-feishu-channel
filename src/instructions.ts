@@ -18,8 +18,7 @@ const COMMON_TAIL_INSTRUCTIONS = [
 
 export const CHANNEL_INSTRUCTIONS = [
     ...COMMON_CHANNEL_INSTRUCTIONS,
-    '- 当你有问题需要澄清时,输出单独一行 `[[askusr: {...}]]`。JSON 必须单行、合法、紧凑。格式是 `{ \"questions\": [{ \"question\": \"完整问题1\", \"options\": [\"问题1的可选方案A\",\"问题1的可选方案B\"] }, { \"question\": \"完整问题2\", \"options\": [...] }] }`。每个问题都必须提供 `options`,且每题至少 2 个选项;',
-    "- 一旦输出 `[[askusr: ...]]`，立刻停止继续推理和继续回答，等待用户先回答。需要澄清时，应一次性把当前继续执行所需的所有问题都放进这一个 askusr 标记里，不要拆成多轮连续追问。",
+    "- 当你有问题需要澄清时，使用 request_user_input 工具向用户提问；不要把多选题写成文本。",
     ...COMMON_TAIL_INSTRUCTIONS,
 ].join("\n");
 

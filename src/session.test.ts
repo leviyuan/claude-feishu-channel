@@ -147,7 +147,6 @@ function turnState(cardId = 'card_session_turn'): any {
     rotateGivenUp: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
-    hostAskMarkersSeen: new Set(),
   }
 }
 
@@ -274,7 +273,7 @@ describe('Session assistant rendering', () => {
     }
   })
 
-  test('treats askusr host markers as Codex-only', async () => {
+  test('passes assistant text through unmodified without the askusr marker protocol', async () => {
     const session = new Session('probe', 'chat_id') as any
     const turn = turnState()
     const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -288,14 +287,14 @@ describe('Session assistant rendering', () => {
       session.finalizeCurrentAssistantSegment()
       await cardkit.flush(turn.cardId)
 
-      expect(session.pendingHostAsks.size).toBe(0)
+      // askusr marker 协议已退役:正文原样上卡,不再剥离/替换/建独立问答卡。
       expect(sentCards.length).toBe(0)
       const assistantAdd = calls.find(call =>
         call.method === 'POST' &&
         call.path === `/cards/${turn.cardId}/elements`
       )
       const elements = JSON.parse(assistantAdd?.body.elements ?? '[]')
-      expect(elements[0]?.content).not.toContain('askusr')
+      expect(elements[0]?.content).toContain('[[askusr:')
       expect(elements[0]?.content).not.toContain('已发起澄清问题')
     } finally {
       session.stopFooterStatus(turn)
@@ -366,12 +365,12 @@ describe('Session provider switching', () => {
     const session = new Session('probe', 'chat_id') as any
 
     session.selectedProvider = 'codex'
-    expect(session.spawnDeveloperInstructions()).toContain('[[askusr:')
+    expect(session.spawnDeveloperInstructions()).toContain('request_user_input')
 
     session.selectedProvider = 'claude'
     const instructions = session.spawnDeveloperInstructions()
     expect(instructions).toContain('AskUserQuestion')
-    expect(instructions).not.toContain('[[askusr:')
+    expect(instructions).not.toContain('request_user_input')
   })
 
   test('keeps selected provider resume id from being overwritten by stale backend events', () => {

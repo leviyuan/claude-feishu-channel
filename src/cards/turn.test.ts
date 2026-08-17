@@ -9,7 +9,6 @@ import {
   footerTokenDetailLine,
   goalElement,
   goalDisplaySignature,
-  hostAskCard,
   mainConversationCard,
   planElement,
   planLiveElement,
@@ -579,11 +578,11 @@ describe('ask card rendering', () => {
         [0, { customText: '第一个答案' }],
       ]),
     }
-    const el = askUserQuestionElement(0, 'host_ask_demo', [
+    const el = askUserQuestionElement(0, 'ask_demo', [
       { header: '背景', question: '先确认背景', options: [] },
       { header: '目标', question: '你要哪个目标？', options: [{ label: 'A' }, { label: 'B' }] },
       { header: '期限', question: '什么时候要？', options: [] },
-    ], '🤔', state as any, 'host_ask') as any
+    ], '🤔', state as any) as any
 
     expect(el.header.title.content).toBe('🤔 等你确认 · 2/3')
     const body = JSON.stringify(el.elements)
@@ -592,19 +591,6 @@ describe('ask card rendering', () => {
     expect(body).toContain('🤔 2/3 · 你要哪个目标？')
     expect(body).toContain('⏳ 3/3 · 什么时候要？')
     expect(body).toContain('也可以直接在群里回复你的答案')
-  })
-
-  test('host ask card summary carries current progress', () => {
-    const card = hostAskCard('host_ask_demo', [
-      { header: '背景', question: '先确认背景', options: [] },
-      { header: '目标', question: '你要哪个目标？', options: [{ label: 'A' }] },
-    ], {
-      currentIdx: 0,
-      answered: new Map(),
-    }) as any
-
-    expect(card.config.summary.content).toContain('1/2')
-    expect(card.body.elements).toHaveLength(1)
   })
 })
 

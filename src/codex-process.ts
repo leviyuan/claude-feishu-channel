@@ -718,7 +718,10 @@ export class CodexProcess extends EventEmitter {
     const key = String(id)
     const req = this.serverRequests.get(key)
     this.serverRequests.delete(key)
-    this.write({ id: req?.id ?? id, error: { message } })
+    // code 必填:app-server 的 JSONRPCMessage 反序列化只认带 code 的 error
+    // 对象,只回 {message} 会 deserialize 失败、request 永久悬挂(2026-08-17
+    // 探针实测)。-32601 MethodNotFound 语义最接近"host 拒绝/不支持"。
+    this.write({ id: req?.id ?? id, error: { code: -32601, message } })
   }
 
   sendInitialize(): void {
@@ -779,11 +782,15 @@ export class CodexProcess extends EventEmitter {
   private threadParams(): Record<string, unknown> {
     // model/effort 由 token source 决定、经 opts 下发(取代自治 ~/.codex/config.toml)。
     // opts 为空(无 token source,如旧路径)则不下发,走 codex 原生配置 —— 平滑过渡。
+    // request_user_input 工具默认只在 Plan mode 注册;开 flag 让 Default mode 也能用,
+    // 澄清问题走原生阻塞式工具调用(2026-08-17 探针验证全链路)。answer 回包格式见
+    // sendPermissionResponse 的 item/tool/requestUserInput 分支。
     return {
       cwd: this.opts.workDir,
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
+      config: { 'features.default_mode_request_user_input': true },
       ...(this.opts.model ? { model: this.opts.model } : {}),
       ...(this.opts.effort ? { effort: this.opts.effort } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),

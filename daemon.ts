@@ -418,11 +418,6 @@ async function handleMessage(data: any): Promise<void> {
     return
   }
 
-  if (msgType === 'text' && text && session.hasPendingHostAsk()) {
-    await session.onHostAskMessageAnswer(text, userOpenId, msgId ?? '')
-    return
-  }
-
   if (msgType === 'image' && contentObj.image_key) {
     const p = await feishu.downloadAttachment(message.message_id, contentObj.image_key, 'image')
     if (p) filePaths.push(p)
@@ -523,20 +518,6 @@ async function handleCardAction(data: any): Promise<any> {
       }
       await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
       return { toast: { type: 'success', content: '已回答' } }
-    }
-    case 'host_ask': {
-      if (value.custom) {
-        const fv = action?.form_value ?? action?.input ?? {}
-        const customText: string = fv?.custom_answer ?? action?.input_value ?? ''
-        const result = await session.onHostAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
-        return result.card
-          ? actionCardResponse(result.card)
-          : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
-      }
-      const result = await session.onHostAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))

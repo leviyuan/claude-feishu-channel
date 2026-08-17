@@ -393,7 +393,6 @@ function renderAskQuestionOptions(
   q: AskQuestion,
   toolUseId: string,
   questionIdx: number,
-  callbackKind: 'ask' | 'host_ask' = 'ask',
 ): any[] {
   const els: any[] = []
   for (let oi = 0; oi < q.options.length; oi++) {
@@ -409,7 +408,7 @@ function renderAskQuestionOptions(
       behaviors: [{
         type: 'callback',
         value: {
-          kind: callbackKind,
+          kind: 'ask',
           tool_use_id: toolUseId,
           question_idx: questionIdx,
           option_idx: oi,
@@ -426,7 +425,6 @@ function renderAskTimeline(
   toolUseId: string,
   currentIdx: number | undefined,
   answered: Map<number, AskAnswered>,
-  callbackKind: 'ask' | 'host_ask',
 ): any | null {
   if (questions.length === 0) return null
   const total = questions.length
@@ -445,7 +443,7 @@ function renderAskTimeline(
     if (idx === currentIdx) {
       body.push({ tag: 'markdown', content: `**🤔 ${title}**` })
       if (q.options.length > 0) {
-        body.push(...renderAskQuestionOptions(q, toolUseId, idx, callbackKind))
+        body.push(...renderAskQuestionOptions(q, toolUseId, idx))
       }
       body.push({
         tag: 'markdown',
@@ -476,18 +474,17 @@ export function askUserQuestionElement(
   questions: AskQuestion[],
   status: '🤔' | '✅' | '❌' = '🤔',
   state?: AskState,
-  callbackKind: 'ask' | 'host_ask' = 'ask',
 ): object {
   const total = questions.length
   const answered = state?.answered ?? new Map<number, AskAnswered>()
   const currentIdx = state?.currentIdx
   const isTerminal = currentIdx === undefined && answered.size > 0
   const bodyElements: any[] = []
-  let headerText: string
+  let headerText
 
   if (isTerminal) {
     headerText = `${status} 已回答 · ${total}/${total}`
-    bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered, callbackKind) ?? []))
+    bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered) ?? []))
     const lastUser = [...answered.values()].reverse().find(a => a.user)?.user
     if (lastUser) {
       bodyElements.push({
@@ -497,7 +494,7 @@ export function askUserQuestionElement(
     }
   } else if (currentIdx !== undefined && questions[currentIdx]) {
     headerText = `${status} 等你确认 · ${currentIdx + 1}/${total}`
-    bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered, callbackKind) ?? []))
+    bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered) ?? []))
   } else {
     // Defensive fallback — neither answered nor a valid currentIdx.
     headerText = `${status} 等你确认`
@@ -512,27 +509,5 @@ export function askUserQuestionElement(
     header: { title: { tag: 'plain_text', content: headerText } },
     expanded: !isTerminal,
     elements: bodyElements,
-  }
-}
-
-export function hostAskCard(
-  askId: string,
-  questions: AskQuestion[],
-  state: AskState,
-): object {
-  const total = questions.length || 1
-  const currentIdx = state.currentIdx ?? Math.max(0, Math.min(total - 1, state.answered.size))
-  const summary = questions[currentIdx]?.question?.trim() || questions[0]?.question?.trim() || 'Codex 请求澄清'
-  return {
-    schema: '2.0',
-    config: {
-      update_multi: true,
-      summary: { content: `❓ ${Math.min(currentIdx + 1, total)}/${total} ${summary.slice(0, 54)}` },
-    },
-    body: {
-      elements: [
-        askUserQuestionElement(0, askId, questions, state.currentIdx === undefined ? '✅' : '🤔', state, 'host_ask'),
-      ],
-    },
   }
 }

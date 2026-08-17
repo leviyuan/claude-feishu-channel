@@ -46,7 +46,7 @@ registerTokenSourceFactory({
       kind: 'claude-native',
       agent: 'claude',
       display: 'Claude',
-      capabilities: { resumeSessionAt: true, fork: true, hostAsk: false },
+      capabilities: { resumeSessionAt: true, fork: true },
       enabled: false,  // buildTokenSourcesFromConfig 后处理:无 claude source 启用时置 true
       models: NATIVE_MODELS,
       defaultModel: 'opus',

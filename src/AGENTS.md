@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-08-01 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-08-17 -->
 
 # src
 
@@ -19,8 +19,7 @@
 | `session-model.ts` | `model` 三级面板流程（账号 → 模型 → effort）：账号和模型列表来自 `listTokenSources()`（声明式 token sources，非固定枚举）。`showModelPanel` 发第 1 级（账号）、`onProviderSelect` 发第 2 级（该账号模型）、`onModelSelect` 进第 3 级（effort）、`onModelEffortSelect` 落选并 `setModelSettings` 热切换 + `applyModelSelection` 持久化；同 provider 切 model/effort 不重启，跨 provider / Claude profile 变更在 turn 进行或排队时拒绝。 |
 | `session-compact.ts` | 手动 `compact` 命令流程：发起 app-server 上下文压缩、监听完成事件和 token usage 快照、更新状态卡。 |
 | `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑；连续 Read / 连续 Edit 系(Edit/MultiEdit/NotebookEdit)各自合并成单个批次面板。 |
-| `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
-| `session-host-ask.ts` | 解析 assistant 输出中的 `[[askusr: ...]]` 主机澄清标记，创建独立问答卡并把用户答案回填到 session。 |
+| `session-ask.ts` | `AskUserQuestion` 交互流程（Claude SDK 工具与 Codex `request_user_input` 经 app-server 映射成同构事件），处理按钮、自定义回答和权限 request 回填。 |
 | `session-permission.ts` | 工具权限请求的卡片渲染与用户决策回传。 |
 | `session-multimsg.ts` | 入站多条消息缓冲状态机:`>>>`(≥3) 开缓冲、`<<<`(≥3) 合并 flush 成一条发给 agent、缓冲中的普通消息原样追加;缓冲期间每条打 📌,flush 释放,`stop`/`kill`/`restart`/`clear` 经 `clearMultiMsgBuffer` 丢弃并打 ❌;永不超时,只活在内存(daemon 重启会丢并打 ❌ 让失败可见)。 |
 | `session-temp.ts` | 临时会话 / fork / back / rs 恢复:`fk` 列 turn 锚点 fork、`bk` 终止当前 + 列 turn 回滚(选后回滚 + 发 Write 记录卡)、`rs` 空闲态列项目最近 24h 会话、`btw` 建临时群启动干净会话、`bye` 散临时群;`rs` 历史数据源是 claude code 自己的 transcript 目录(`~/.claude/projects/<encoded-cwd>/*.jsonl`,同 cwd 天然同目录,worktree 不混入),不维护自有会话索引(旧 resume-map + 后缀归属判断是错的)。 |
@@ -29,7 +28,7 @@
 | `tasklist-worker.ts` | 任务清单轮询 worker；按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组驱动 Codex/agy 规划、选择、执行、审核和本地合并。 |
 | `tasklist-worker-git.ts` | `tasklist-worker` 的本地 Git worktree、artifact tag 和 local review ref 辅助逻辑。 |
 | `agent-process.ts` | 统一 agent 后端接口：定义 `AgentProcess`（`EventEmitter`）、`AgentProvider = 'codex' \| 'claude'`、统一 `AgentProcessEventMap`、Claude reasoning effort 集合（`low`/`medium`/`high`/`xhigh`/`max`，默认 `max`）和 `providerFromModel` 等 provider 辅助；`CodexProcess` 与 `ClaudeAgentProcess` 都实现该接口。 |
-| `codex-process.ts` | 实现 `AgentProcess` 的 Codex 后端：启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、thread 启停和 app-server 事件映射。 |
+| `codex-process.ts` | 实现 `AgentProcess` 的 Codex 后端：启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、thread 启停和 app-server 事件映射；`thread/start` 下发 `features.default_mode_request_user_input` 让 Default mode 注册 `request_user_input` 工具（阻塞式澄清提问，走 can_use_tool 问答流，与 Claude AskUserQuestion 同构）。 |
 | `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`permissionMode: default` + `canUseTool` 回调：`AskUserQuestion` 经 canUseTool 下发、host 拦下渲染卡片并回填 answers，其余工具秒放（复刻旧 bypassPermissions「不弹审批」语义；bypassPermissions 会 shadow canUseTool，AskUserQuestion 就废了）；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |

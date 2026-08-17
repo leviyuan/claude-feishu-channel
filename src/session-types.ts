@@ -135,9 +135,6 @@ export interface TurnState {
   outboundSeenPaths: Set<string>
   /** 已实际排队上传的绝对路径。用于 footer 计数和跨 rotate 去重。 */
   outboundSentPaths: Set<string>
-  /** 已识别过的宿主 askusr marker 原文。assistant 文本是累积增量，
-   * 不去重会在每次 delta 上重复建 ask 卡。 */
-  hostAskMarkersSeen: Set<string>
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

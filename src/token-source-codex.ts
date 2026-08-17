@@ -65,7 +65,7 @@ registerTokenSourceFactory({
       kind: 'codex-subscription',
       agent: 'codex',
       display: cfg.display?.trim() || 'Codex 订阅',
-      capabilities: { resumeSessionAt: false, fork: false, hostAsk: true },
+      capabilities: { resumeSessionAt: false, fork: false },
       enabled,
       models: [],
       defaultModel: cfgDefaultModel ?? '',

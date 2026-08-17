@@ -106,7 +106,7 @@ registerTokenSourceFactory({
       kind: 'glm-coding-plan',
       agent: 'claude',
       display: cfg.display?.trim() || 'GLM Coding Plan',
-      capabilities: { resumeSessionAt: true, fork: true, hostAsk: false },
+      capabilities: { resumeSessionAt: true, fork: true },
       enabled,
       models: [],
       defaultModel: cfgDefaultModel ?? '',

@@ -66,13 +66,12 @@ import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
 } from './context-window'
-import { extractAskUsrMarkers, extractSendMarkerPaths, normalizeOutboundPath, stripAskUsrMarkers } from './outbound-markers'
+import { extractSendMarkerPaths, normalizeOutboundPath } from './outbound-markers'
 import * as sessionMultimsg from './session-multimsg'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
-import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
 import {
   messageOf,
@@ -243,22 +242,6 @@ export class Session {
      * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
      * 一来立即 finalize。 */
     currentIdx?: number
-  }>()
-  /** Host-side askusr cards triggered by assistant marker protocol.
-   * Kept separate from SDK AskUserQuestion because there is no
-   * can_use_tool/requestId handshake here — the host injects the
-   * synthetic tool call/tool result into thread history after the user
-   * answers, then starts a fresh continuation turn. */
-  pendingHostAsks = new Map<string, {
-    questions: cards.AskQuestion[]
-    answered: Map<number, cards.AskAnswered>
-    currentIdx?: number
-    toolCallId: string
-    inputJson: string
-    cardId?: string
-    messageId?: string
-    creatingCard?: boolean
-    resumeStarted?: boolean
   }>()
   /** Thread-scoped goal reported by Codex app-server. Pure progress
    * accounting updates refresh this snapshot without adding card elements;
@@ -1079,7 +1062,6 @@ export class Session {
     // 用户主动停止:孤儿缓冲随轮作废,不兜底推送。
     this.discardOrphanAssistant()
     this.pendingAsks.clear()
-    this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
@@ -1136,7 +1118,6 @@ export class Session {
     this.openingTurn = false
     // bgResumePending / 孤儿缓冲已在 kill 前作废(见上)。
     this.pendingAsks.clear()
-    this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
@@ -1730,10 +1711,6 @@ export class Session {
     return sessionAsk.hasPendingAsk(this)
   }
 
-  hasPendingHostAsk(): boolean {
-    return sessionHostAsk.hasPendingHostAsk(this)
-  }
-
   /** 多条消息缓冲入口(`>>>` 开始 / `<<<` 收尾 / 中段普通消息)。返回 true
    *  表示这条已被缓冲或已合并 flush,daemon 不应再调 onUserMessage。*/
   onMultiMessageInbound(text: string, files: string[], userOpenId: string, msgId: string): Promise<boolean> {
@@ -1749,44 +1726,16 @@ export class Session {
     return sessionAsk.onAskMessageAnswer(this, text, user, msgId)
   }
 
-  onHostAskMessageAnswer(text: string, user: string, msgId: string): Promise<void> {
-    return sessionHostAsk.onHostAskMessageAnswer(this, text, user, msgId)
-  }
-
   onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
     return sessionAsk.onAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
-  }
-
-  onHostAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<ModelActionResult> {
-    return sessionHostAsk.onHostAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
   }
 
   onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<boolean> {
     return sessionAsk.onAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
   }
 
-  onHostAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<ModelActionResult> {
-    return sessionHostAsk.onHostAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
-  }
-
   onPermissionDecision(requestId: string, decision: 'allow' | 'allow_always' | 'deny', user: string): Promise<void> {
     return sessionPermission.onPermissionDecision(this, requestId, decision, user)
-  }
-
-  async startHostAskContinuation(wireText: string): Promise<void> {
-    if (!this.isRunning()) throw new Error(`${this.backendLabel()} is not running`)
-    if (this.proc?.provider !== 'codex') throw new Error('askusr host continuation is only supported by Codex')
-    if (this.currentTurn || this.openingTurn) throw new Error(`${this.backendLabel()} turn still active`)
-    this.openingTurn = true
-    try {
-      await this.openTurnCard('', 'user_message')
-      if (!this.currentTurn) throw new Error('failed to open continuation turn card')
-      this.proc!.sendUserText(wireText, [])
-      this.pendingUserMessageCount++
-      this.status = 'working'
-    } finally {
-      this.openingTurn = false
-    }
   }
 
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
@@ -2224,13 +2173,12 @@ export class Session {
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
-      const hostAskFlowActive = this.pendingHostAsks.size > 0
 
       let suffix: string | undefined
       let forcePush = false
 
       const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
-      if (hasMidTurn && !hostAskFlowActive) {
+      if (hasMidTurn) {
         suffix = isError ? `⚠️ ${backend} ${subtype},用户已介入` : '📨 转交新卡'
       } else if (isError) {
         suffix = `⚠️ ${backend} ${subtype}`
@@ -2240,9 +2188,8 @@ export class Session {
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
       void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true })
       this.status = 'idle'
-      sessionHostAsk.resumeAnsweredHostAsks(this)
 
-      if (hasMidTurn && !hostAskFlowActive) {
+      if (hasMidTurn) {
         void this.drainMidTurnAndOpen()
       }
     })
@@ -2301,7 +2248,6 @@ export class Session {
       // onAskMessageAnswer 当僵尸答案吞掉,session 焊死到下次 daemon 重启
       // (kill/restart 同样在上面补了这一清理)。
       this.pendingAsks.clear()
-      this.pendingHostAsks.clear()
       this.pendingPermissions.clear()
       this.userInterrupted = false
       this.currentTurnUsageBaseline = null
@@ -2529,7 +2475,6 @@ export class Session {
       rotateGivenUp: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
-      hostAskMarkersSeen: new Set(),
     }
     this.currentTurn = turnState
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
@@ -2977,7 +2922,6 @@ export class Session {
     if (!segId) return
     turn.segmentTexts.set(segId, turn.currentAssistantText)
     this.processOutboundMarkers(turn.currentAssistantText)
-    this.processHostAskMarkers(turn.currentAssistantText, turn)
     const displayText = this.cleanAssistantTextForDisplay(turn.currentAssistantText)
     // Chat-list preview: tail of the latest assistant text. Feishu
     // truncates anyway; ~60 chars is what shows on a typical phone
@@ -3062,23 +3006,10 @@ export class Session {
     }
   }
 
-  private processHostAskMarkers(text: string, turn: TurnState): void {
-    if (this.proc?.provider !== 'codex') return
-    for (const marker of extractAskUsrMarkers(text)) {
-      if (turn.hostAskMarkersSeen.has(marker.raw)) continue
-      turn.hostAskMarkersSeen.add(marker.raw)
-      sessionHostAsk.queueHostAskFromMarker(this, marker.payload, marker.raw)
-    }
-  }
-
   private cleanAssistantTextForDisplay(text: string): string {
-    const replacement = this.proc?.provider === 'codex'
-      ? '\n\n_已发起澄清问题，请回答对应卡片。_'
-      : ''
-    // stripAskUsrMarkers 剥离 ask 标记;sanitize 再把外链图片降级、HTML 实体
-    // 转义 —— LLM 正文里出现 ![alt](url) 会让该 assistant 段 CardKit 更新
-    // 失败(ErrCode 200570),必须先清掉。
-    return cards.sanitizeMarkdownForCardKit(stripAskUsrMarkers(text, replacement))
+    // sanitize 把外链图片降级、HTML 实体转义 —— LLM 正文里出现 ![alt](url)
+    // 会让该 assistant 段 CardKit 更新失败(ErrCode 200570),必须先清掉。
+    return cards.sanitizeMarkdownForCardKit(text)
   }
 
   sendOutboundPath(rawPath: string, source: string): void {
@@ -3235,7 +3166,7 @@ export class Session {
     }
 
     // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
-    // 这里只是收尾清洗 askusr 标记和兜住异常路径。
+    // 这里只是收尾重渲兜住异常路径。
     for (const [segId, fullText] of segmentTexts) {
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
     }
