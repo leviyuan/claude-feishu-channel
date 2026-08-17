@@ -3137,7 +3137,7 @@ export class Session {
     }
     if (provider === 'codex') {
       const u = peekUsage()
-      return u?.state === 'ok' ? this.fmtFiveHourSuffix(u.fiveHour?.percent ?? null, u.fiveHour?.resetsAt ?? null) : ''
+      return u?.state === 'ok' ? this.fmtCodexUsageSuffix(u.fiveHour ?? null, u.weekly ?? null) : ''
     }
     // claude 无匹配 token source(理论不发生,token source 总有)→ 回退 readGlmUsage 兼容
     const g = await readGlmUsage()
@@ -3149,6 +3149,26 @@ export class Session {
     if (percent == null) return ''
     const resetIn = resetsAt && resetsAt.getTime() > Date.now() ? cards.fmtResetIn(resetsAt) : ''
     return resetIn ? `  |  5h·${Math.round(percent)}%·[${resetIn}]` : `  |  5h·${Math.round(percent)}%`
+  }
+
+  /** codex 双窗口 footer 后缀,形如 `4.1h·7%·[6.9d·17%]`:
+   * 5h 窗口(重置倒计时·已用%)+ 方括号内周窗口(重置倒计时·已用%)。
+   * 缺哪段就省哪段(no_fallbacks 不假数据):5h percent 缺 → 空串;
+   * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比;周窗口整段缺 → 只剩 5h 段。 */
+  private fmtCodexUsageSuffix(
+    fiveHour: { percent: number | null; resetsAt: Date | null } | null,
+    weekly: { percent: number | null; resetsAt: Date | null } | null,
+  ): string {
+    if (fiveHour?.percent == null) return ''
+    const resetIn = (w: { resetsAt: Date | null }): string =>
+      w.resetsAt && w.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(w.resetsAt) : ''
+    const seg = (w: { percent: number | null; resetsAt: Date | null }): string => {
+      const ri = resetIn(w)
+      return ri ? `${ri}·${Math.round(w.percent!)}%` : `${Math.round(w.percent!)}%`
+    }
+    const parts = [seg(fiveHour)]
+    if (weekly?.percent != null) parts.push(`[${seg(weekly)}]`)
+    return `  |  ${parts.join('·')}`
   }
 
   async closeTurnCard(

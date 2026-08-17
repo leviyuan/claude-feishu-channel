@@ -1037,6 +1037,22 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(snap?.subscriptionType).toBe('pro')
     expect(snap?.fiveHour?.percent).toBe(7)
   })
+
+  test('codex footer 双窗口:5h 倒计时·% + 方括号周窗口;缺周数据退回纯 5h 段', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const h = (ms: number) => new Date(Date.now() + ms)
+    // 4.1h 后重置 5h 额度、已用 7%;6.9d 后重置周额度、已用 17%。
+    const fiveHour = { percent: 7, resetsAt: h(4.1 * 3600_000) }
+    const weekly = { percent: 17, resetsAt: h(6.9 * 24 * 3600_000) }
+    expect(session.fmtCodexUsageSuffix(fiveHour, weekly)).toBe('  |  4.1h·7%·[6.9d·17%]')
+    // 周窗口缺 → 只剩 5h 段(倒计时仍在,格式同 fmtFiveHourSuffix)。
+    expect(session.fmtCodexUsageSuffix(fiveHour, null)).toBe('  |  4.1h·7%')
+    // 5h percent 缺 → 整段空(不假数据)。
+    expect(session.fmtCodexUsageSuffix({ percent: null, resetsAt: h(3600_000) }, weekly)).toBe('')
+    expect(session.fmtCodexUsageSuffix(null, weekly)).toBe('')
+    // resetsAt 已过期 → 该窗口只剩百分比。
+    expect(session.fmtCodexUsageSuffix({ percent: 7, resetsAt: new Date(Date.now() - 1000) }, weekly)).toBe('  |  7%·[6.9d·17%]')
+  })
 })
 
 describe('Session resetBackgroundTasks on kill/restart', () => {
