@@ -792,9 +792,15 @@ export class CodexProcess extends EventEmitter {
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
-      config: { 'features.default_mode_request_user_input': true },
+      // config 键合并下发:request_user_input flag + effort。effort 走
+      // config.model_reasoning_effort —— codex 0.147 顶层 effort 参数是摆设
+      // (下发任何值都被无视、回落 ~/.codex/config.toml),config 键才真生效
+      // (2026-08-18 探针:effort=ultra 顶层回包 xhigh,config 路径回包 ultra)。
+      config: {
+        'features.default_mode_request_user_input': true,
+        ...(this.opts.effort ? { model_reasoning_effort: this.opts.effort } : {}),
+      },
       ...(this.opts.model ? { model: this.opts.model } : {}),
-      ...(this.opts.effort ? { effort: this.opts.effort } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: 'lodestar',
     }
