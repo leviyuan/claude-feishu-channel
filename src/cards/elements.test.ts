@@ -94,3 +94,19 @@ describe('downgradeExternalImagesForCardKit', () => {
     expect(downgradeExternalImagesForCardKit(src)).toBe(src)
   })
 })
+
+describe('latex downgrade for cardkit markdown', () => {
+  test('display math \\[..\] and $$..$$ become code blocks', () => {
+    const out = sanitizeMarkdownForCardKit('公式:\n\\[\\text{IM} \\frac{a}{b}\\]\n结束')
+    expect(out).toContain('```\n\\text{IM} \\frac{a}{b}\n```')
+    const out2 = sanitizeMarkdownForCardKit('$$x^2 + y^2 = r^2$$')
+    expect(out2).toContain('```\nx^2 + y^2 = r^2\n```')
+  })
+  test('inline \\(..\\) becomes inline code; math-flavored $..$ downgraded', () => {
+    expect(sanitizeMarkdownForCardKit('\\(a_1 + b_2\\)')).toBe('`a_1 + b_2`')
+    expect(sanitizeMarkdownForCardKit('$x = 1$')).toBe('`x = 1`')
+  })
+  test('plain dollar amounts are not mangled', () => {
+    expect(sanitizeMarkdownForCardKit('价格 $5 和 $10')).toBe('价格 $5 和 $10')
+  })
+})

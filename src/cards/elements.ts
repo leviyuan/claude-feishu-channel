@@ -106,7 +106,24 @@ function downgradeExternalImagesInProse(s: string): string {
  *  彩色的场景(如 notify opts.text)用 downgradeExternalImagesForCardKit。
  *  保留 **粗体** / [文字](url) / 列表 / 代码块等合法 markdown。 */
 export function sanitizeMarkdownForCardKit(text: string): string {
-  return transformProseOutsideCode(text, s => downgradeExternalImagesInProse(escapeHtmlEntities(s)))
+  return transformProseOutsideCode(text, s => downgradeMathBlocksInProse(downgradeExternalImagesInProse(escapeHtmlEntities(s))))
+}
+
+/** 飞书卡片 markdown 不渲染 LaTeX($$…$$ / \\[…\\] / \\(…\\) / $…$ 以及
+ *  \\text{}/\\frac{}{}{} 这类裸命令)——原样透传会得到夹着反斜杠命令的乱码
+ *  正文。降级成代码块:公式至少等宽完整可读,不再和正文混排。
+ *  $…$ inline 需带数学特征(\\ 命令或 ^ _ =)才降级 —— 「$5 和 $10」这类
+ *  普通美元文本不误伤。 */
+function downgradeMathBlocksInProse(s: string): string {
+  return s
+    // \[ … \] 与 $$ … $$(display math)→ 代码块
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_m, body: string) => `\n\`\`\`\n${body.trim()}\n\`\`\`\n`)
+    .replace(/\$\$([\s\S]*?)\$\$/g, (_m, body: string) => `\n\`\`\`\n${body.trim()}\n\`\`\`\n`)
+    // \( … \)(inline math)→ 行内 code;\(…\) 定界符无歧义,直接降级
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_m, body: string) => `\`${body.trim()}\``)
+    // $…$ 仅在含数学特征(反斜杠命令 / ^ / _ / =)时降级,防美元金额误伤
+    .replace(/\$([^$\n]+)\$/g, (m, body: string) =>
+      /\\|\^|_|=/.test(body) ? `\`${body.trim()}\`` : m)
 }
 
 /** 只降级外链图片、不转义 HTML —— 给 notify 这种调用方用:opts.text 里想用

@@ -351,7 +351,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     const panel = backgroundTaskPanel(t, 45000) as any
     expect(panel.tag).toBe('collapsible_panel')
     expect(panel.expanded).toBe(false)
-    expect(panel.element_id).toBe('bg_t1')
+    expect(panel.element_id).toBe(BG_ELEMENTS.panel('t1'))
     expect(panel.header.title.content).toContain('Explore')
     expect(panel.header.title.content).toContain('搜索认证')
     expect(panel.header.title.content).toContain('运行中')
@@ -382,7 +382,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     const t = mk({ id: 't1', type: 'subagent', description: 'd', status: 'running', subagentType: 'Explore', usage: { total_tokens: 1200, tool_uses: 8, duration_ms: 1000 }, summary: '命中 3 处' })
     const panel = backgroundTaskPanel(t, 1000) as any
     const body = panel.elements[0]
-    expect(body.element_id).toBe('bg_body_t1')
+    expect(body.element_id).toBe(BG_ELEMENTS.body('t1'))
     expect(body.content).not.toContain('1.2K tok')
     expect(body.content).not.toContain('命中 3 处')
     expect(body.content).toContain('暂无执行记录')
@@ -413,8 +413,8 @@ describe('整卡三态', () => {
     expect(card.config.summary.content).toBe('🧭 后台任务 · 1 进行中 · 1 已结束')
     const els = card.body.elements
     expect(els[0].tag).toBe('collapsible_panel')
-    expect(els[0].element_id).toBe('bg_t1')
-    expect(els[1].element_id).toBe('bg_t2')
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('t1'))
+    expect(els[1].element_id).toBe(BG_ELEMENTS.panel('t2'))
   })
 
   test('backgroundHistoryCard:streaming 关 + 只渲染终态任务 panel', () => {
@@ -427,7 +427,7 @@ describe('整卡三态', () => {
     const els = card.body.elements
     expect(els).toHaveLength(1)
     expect(els[0].tag).toBe('collapsible_panel')
-    expect(els[0].element_id).toBe('bg_t2')
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('t2'))
     expect(els[0].header.title.content).toContain('完成的')
   })
 
@@ -438,8 +438,8 @@ describe('整卡三态', () => {
   })
 
   test('BG_ELEMENTS id 生成', () => {
-    expect(BG_ELEMENTS.panel('t1')).toBe('bg_t1')
-    expect(BG_ELEMENTS.body('t1')).toBe('bg_body_t1')
+    expect(BG_ELEMENTS.panel('t1')).toBe(BG_ELEMENTS.panel('t1'))
+    expect(BG_ELEMENTS.body('t1')).toBe(BG_ELEMENTS.body('t1'))
   })
 })
 
@@ -476,5 +476,20 @@ describe('promotePendingOnAdvance — 主线程推进判后台', () => {
     expect(s.pending).toHaveLength(0)
     const r = promotePendingOnAdvance(s)
     expect(r.active).toHaveLength(0)
+  })
+})
+
+describe('background element ids for UUID task ids', () => {
+  test('codex agent thread UUID maps to cardkit-legal short element id (<=20 chars, stable)', () => {
+    const uuid = '01a01228-ebc1-7593-95b3-3175513ed9a4'
+    const panel = BG_ELEMENTS.panel(uuid)
+    const body = BG_ELEMENTS.body(uuid)
+    // 飞书规则:字母开头、字母数字下划线、<=20 字符
+    expect(panel).toMatch(/^[a-zA-Z][a-zA-Z0-9_]*$/)
+    expect(panel.length).toBeLessThanOrEqual(20)
+    expect(body.length).toBeLessThanOrEqual(20)
+    // 稳定:同 id 同 hash;不同 id 不同 hash(此样本对)
+    expect(BG_ELEMENTS.panel(uuid)).toBe(panel)
+    expect(BG_ELEMENTS.panel('01a01228-ebc1-7593-95b3-3175513ed9a5')).not.toBe(panel)
   })
 })

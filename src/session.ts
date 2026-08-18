@@ -1821,6 +1821,13 @@ export class Session {
     this.backgroundCard = { messageId, cardId }
     this.backgroundDetailAdded = new Set(this.backgroundTasks.map(t => t.id))
     log(`session "${this.sessionName}": background card opened cardId=${cardId.slice(0, 12)} tasks=${this.backgroundTasks.length}`)
+    // 开卡 await 窗口内任务可能已全部终态(短命 agent:start/settle 同批到达,
+    // settle 那刻 backgroundCard 还是 null 空转了)—— 落地后复查,直接沉降,
+    // 否则活卡带着终态快照永不 settle,后台 tick 还在推「运行中」计时。
+    if (!cards.hasActiveBgTask(this.backgroundTasks)) {
+      void this.settleBackgroundCard()
+      return
+    }
     this.startBackgroundRefreshTick()
   }
 
@@ -1924,21 +1931,28 @@ export class Session {
     // 同步清空句柄 —— 防止并发 bg_task_settled(多任务同毫秒结算)触发两次 settle
     // 都读到非 null 的 race。后续 await 期间再来的 settle 看到 null 直接 return。
     this.backgroundCard = null
+    // 历史快照用进入沉降那一刻的终态代:await 窗口内若有 followup 翻活,
+    // 可变 backgroundTasks 里的 entry 会变回 running,backgroundHistoryCard
+    // 会把它滤掉 —— 旧卡被定稿成「0 已结束」。快照定格后再进 await。
+    const snapshot = [...this.backgroundTasks]
     if (this.backgroundRefreshTimer) {
       clearTimeout(this.backgroundRefreshTimer)
       this.backgroundRefreshTimer = null
     }
     this.stopBackgroundRefreshTick()
     await cardkit.flush(handle.cardId)
-    await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(this.backgroundTasks))
+    await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(snapshot))
     cardkit.cancelSummary(handle.cardId)
     await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 后台任务已结束' }))
     await cardkit.dispose(handle.cardId)
-    // 全部终态 → 清空 active 跟踪(已固化在历史卡);下次新后台 task 从空数组起步。
+    // 终态 entry 已固化在历史卡,从跟踪移除。沉降 await 窗口内若有 followup 翻活
+    // (running 重新入池)或新 spawn 进来,它们的 entry 是非终态 —— 保留,由
+    // onBackgroundTaskChanged 重新开活卡;一刀清空会吃掉复活任务的状态。
     // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
-    this.backgroundTasks = []
+    this.backgroundTasks = this.backgroundTasks.filter(t => !cards.isBgTerminal(t))
     this.backgroundDetailAdded.clear()
-    log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)}`)
+    log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)} remaining=${this.backgroundTasks.length}`)
+    if (this.backgroundTasks.length > 0) this.onBackgroundTaskChanged()
   }
 
   /** 游标迁移:发新主卡前调用。旧后台卡沉降 —— 有终态任务则成历史墓碑
@@ -2213,11 +2227,18 @@ export class Session {
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
       this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
       this.onBackgroundTaskChanged()
-      // turn 已收尾后才结算的任务:SDK 会自发开一轮恢复轮合并结果,
-      // 标记给下一个无用户批次的 init 开卡。
-      if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {
+      // turn 已收尾后才结算的任务:Claude SDK 会自发开一轮恢复轮合并结果,
+      // 标记给下一个无用户批次的 init 开卡。Codex 的 collab 子 agent 结果由
+      // 主 turn 内的 wait 收编,app-server 不会自发开轮 —— 不置位。
+      if (p.provider === 'claude' && !this.currentTurn && !this.openingTurn && this.initCount >= 1) {
         this.bgResumePending = true
       }
+    })
+    p.on('subagent_step', (e: { thread_id: string; item_id: string; tool: string; phase: 'started' | 'completed'; brief: string }) => {
+      // Codex 子 agent 的过程步骤 → 后台卡 steps(主卡不承载,见 codex-process
+      // isSubagentThread 过滤)。未知 thread(先于 started 到达的极早期)丢弃。
+      this.applyBgStore(cards.applySubagentStep(this.bgStore(), e.thread_id, e.item_id, e.tool, e.phase, e.brief))
+      this.onBackgroundTaskChanged()
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)

@@ -26,6 +26,11 @@ import {
 } from './codex-compaction'
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 import type { AgentReasoningEffort } from './agent-process'
+import type {
+  BgTaskSettledEvent,
+  BgTaskStartedEvent,
+  BgTaskUpdatedEvent,
+} from './claude-agent-process'
 
 export function resolveCodexBin(): string {
   if (process.platform !== 'win32') {
@@ -241,6 +246,18 @@ export class CodexProcess extends EventEmitter {
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
   private emittedImageGenerationIds = new Set<string>()
+  // ── Codex 多 agent(ultra 并行编排)状态机 ──────────────────────────
+  // agentThreadId → 展示名(agentPath 末段,spawn 那刻从 subAgentActivity /
+  // collabAgentToolCall 抓取)。仅用于 bg_task_* 事件的 description。
+  private collabAgentNames = new Map<string, string>()
+  // agentThreadId → 已 emit 的终态,防同一 agent 的多次 wait item 重复结算。
+  private collabAgentSettled = new Set<string>()
+  // agentThreadId → 是否见过 active(thread/status/changed)。子线程首个 idle 是
+  // 创建态(spawn 后尚未开跑),见过 active 之后的 idle 才是「跑完回闲」。
+  private collabAgentWasActive = new Set<string>()
+  // agentThreadId → 子 agent 最终 agentMessage 文本(exec-cell 模式没有
+  // agentsStates.message,它的末段答复是墓碑 summary 的唯一来源)。
+  private collabAgentSummaries = new Map<string, string>()
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -303,10 +320,22 @@ export class CodexProcess extends EventEmitter {
       const line = this.stdoutBuf.slice(0, nl).trim()
       this.stdoutBuf = this.stdoutBuf.slice(nl + 1)
       if (!line) continue
+      let msg: any
       try {
-        this.handleMessage(JSON.parse(line))
+        msg = JSON.parse(line)
       } catch (e) {
         log(`codex-process: bad json: ${line.slice(0, 200)} (${e})`)
+        continue
+      }
+      try {
+        this.handleMessage(msg)
+      } catch (e) {
+        // 分发异常(handler/emit listener 抛出)与坏 JSON 分开暴露:2026-08-18
+        // 事故 —— cards barrel 漏导出 applySubagentStep,session listener 每个
+        // subagent item 抛 TypeError,被这里误标成 bad json,整条消息分发中断,
+        // 后台卡僵死、主卡混乱。解析与分发分离后,一条 item 的 handler 异常只
+        // 丢自己,不连坐后续消息;异常照实记日志等修复。
+        log(`codex-process: dispatch error: ${JSON.stringify(msg).slice(0, 200)} (${e})`)
       }
     }
   }
@@ -360,6 +389,20 @@ export class CodexProcess extends EventEmitter {
   }
 
   private handleNotification(method: string, params: any): void {
+    // ── 子 agent 线程分流(入口级)────────────────────────────────────
+    // app-server 的 v2 通知(thread/turn/item 级)全部附带发出线程的 threadId。
+    // 子 agent 的 turn/completed、agentMessage/delta、tokenUsage、turn/diff
+    // 等若不在这里拦下,会冒充主轮信号:子 agent 一完成就 emit result 关掉主卡、
+    // 子 delta 流进主卡正文、子 usage 覆盖主线程状态(2026-08-18 CrossEX 实测:
+    // 每个子线程 idle 后紧跟一条 SDK result)。子线程通知只允许驱动后台卡:
+    // item 级转 subagent_step,状态级由 handleThreadStatusChanged 消费,其余丢弃。
+    if (this.isSubagentThread(params)) {
+      if (method === 'thread/status/changed') this.handleThreadStatusChanged(params)
+      else if (method === 'item/started') this.handleSubagentItemStarted(params)
+      else if (method === 'item/completed') this.handleSubagentItemCompleted(params)
+      // 其余(delta/turn/usage/diff/plan):子 agent 过程噪音,吞掉。
+      return
+    }
     const compaction = contextCompactionNoticeFromNotification(method, params)
     if (compaction) {
       const notice = this.withSessionId(compaction)
@@ -449,6 +492,10 @@ export class CodexProcess extends EventEmitter {
         this.emit('thread_goal_cleared', params)
         return
       }
+      case 'thread/status/changed': {
+        this.handleThreadStatusChanged(params)
+        return
+      }
       case 'item/agentMessage/delta': {
         if (typeof params.delta === 'string' && params.delta.length > 0) {
           this.emit('assistant_text', { uuid: params.itemId, text: params.delta })
@@ -496,12 +543,41 @@ export class CodexProcess extends EventEmitter {
       logUnhandledAppServerPayload('ITEM_STARTED_MISSING_ID', { method: 'item/started', params })
       return
     }
+    // 多 agent 编排 item 不走通用 tool_use 映射,先喂给 collab 状态机。
+    if (this.feedCollabItem(item, 'started', params)) return
     const mapped = mapStartedItem(item, this.opts.workDir)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_STARTED_UNMAPPED', { method: 'item/started', params })
       return
     }
     this.emit('tool_use', { id: item.id, name: mapped.name, input: mapped.input })
+  }
+
+  /** 子 agent 线程的 item/started —— 入口分流后的专用通路,只转 subagent_step
+   *  (后台卡 steps),collab 编排 item(subAgentActivity 等)仍走 feedCollabItem。 */
+  private handleSubagentItemStarted(params: any): void {
+    const item = params?.item
+    if (!item?.id) return
+    if (this.feedCollabItem(item, 'started', params)) return
+    this.emitSubagentStep(item, 'started', params)
+  }
+
+  /** 子 agent 线程的 item/completed:工具 item 转 step;agentMessage 捕获末段
+   *  文本作 idle 结算的 summary(exec-cell 模式没有 agentsStates message,
+   *  子 agent 的最终答复是唯一信息源 —— 保留有界预览,墓碑不再「暂无执行记录」)。 */
+  private handleSubagentItemCompleted(params: any): void {
+    const item = params?.item
+    if (!item?.id) return
+    if (item.type === 'agentMessage') {
+      const text = typeof item.text === 'string' ? item.text : ''
+      if (text) {
+        const threadId = typeof params?.threadId === 'string' ? params.threadId : ''
+        this.collabAgentSummaries.set(threadId, text)
+      }
+      return
+    }
+    if (this.feedCollabItem(item, 'completed', params)) return
+    this.emitSubagentStep(item, 'completed', params)
   }
 
   private handleItemCompleted(params: any): void {
@@ -515,6 +591,7 @@ export class CodexProcess extends EventEmitter {
       this.emit('assistant_block_stop', { index: item.id })
       return
     }
+    if (this.feedCollabItem(item, 'completed', params)) return
     const mapped = mapCompletedItem(item, this.sessionId ?? undefined)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
@@ -526,6 +603,271 @@ export class CodexProcess extends EventEmitter {
       is_error: mapped.isError,
     })
     if (item.type === 'imageGeneration') this.emittedImageGenerationIds.add(item.id)
+  }
+
+  // ── Codex 多 agent(ultra)→ bg_task_* 翻译 ────────────────────────
+  // Codex 的编排 item(app-server v2 协议):
+  //  - subAgentActivity {kind, agentThreadId, agentPath}:子 agent 生命周期信号。
+  //    kind=started 是子 agent 首个可靠信号(带 agentPath 任务名)→ bg_task_started。
+  //  - collabAgentToolCall {tool, agentsStates}:编排调用(spawn/wait/…)。它的
+  //    agentsStates 是每个 receiver agent 的最新状态 —— 每次到达都 diff 出
+  //    running / 终态,终态(completed 带 message / errored)→ bg_task_settled。
+  // phase 区分 started/completed 两条通路:spawn 面板 tool_use 只在 started 落,
+  // tool_result 只在 completed 回 —— 同 id 两次到达不会重复渲染。
+  // 返回 true 表示 item 已被 collab 通路消费,不再走通用 tool_use 映射。
+
+  /** item 通知的 threadId 是否属于子 agent(≠ 主线程 sessionId)。collab 编排
+   *  下,子 agent 的 commandExecution/fileChange/agentMessage 都以自己的
+   *  threadId 广播 —— 它们不属于主卡 timeline。sessionId 未落地前(极早期)
+   *  不过滤,保持旧行为。 */
+  private isSubagentThread(params: any): boolean {
+    const threadId = typeof params?.threadId === 'string' ? params.threadId : ''
+    return !!this.sessionId && !!threadId && threadId !== this.sessionId
+  }
+
+  /** thread/status/changed → 子 agent 生命周期。这是 exec-cell 编排(gpt-5.6-sol
+   *  默认)下子 agent 的**唯一**终态信号 —— 该模式不发 collabAgentToolCall
+   *  item,agentsStates 无从到达;子线程状态序列 idle(创建)→ active(跑)→
+   *  idle(跑完)。见过 active 之后的 idle = 结算 completed。collab 工具编排
+   *  (老路径)的子线程同样发这个通知,两条编排路径统一在这里兜底结算。 */
+  private handleThreadStatusChanged(params: any): void {
+    const threadId = typeof params?.threadId === 'string' ? params.threadId : ''
+    const status = params?.status?.type
+    if (!threadId || typeof status !== 'string') return
+    // 只关心已知子 agent(名字表里有);主线程 / 未知线程(尚未 spawn 信号的)
+    // 的状态变化不驱动后台卡。
+    if (!this.collabAgentNames?.has(threadId)) return
+    if (status === 'active') {
+      this.collabAgentWasActive.add(threadId)
+      // 翻活:collabAgentSettled 里的老终态(如 closeAgent 后线程又被重新拉起)
+      // 在重新 active 时作废 —— 复用 translateAgentState 的翻活路径不合适
+      // (它面向 agentsStates 形状),这里直接清标记 + running patch。
+      if (this.collabAgentSettled.has(threadId)) {
+        this.collabAgentSettled.delete(threadId)
+        this.emit('bg_task_started', {
+          task_id: threadId,
+          task_type: 'local_agent',
+          description: this.collabAgentNames.get(threadId) ?? threadId.slice(0, 8),
+        } satisfies BgTaskStartedEvent)
+        this.emit('bg_task_updated', {
+          task_id: threadId,
+          patch: { is_backgrounded: true },
+        } satisfies BgTaskUpdatedEvent)
+      }
+      this.emit('bg_task_updated', {
+        task_id: threadId,
+        patch: { status: 'running' },
+      } satisfies BgTaskUpdatedEvent)
+      return
+    }
+    if (status === 'idle' || status === 'systemError') {
+      // systemError:子 agent 出错(独立于主线程),结算成 failed;后续 active
+      // 仍可复活(followup 重试)。notLoaded 不算 —— 那是空闲卸载的正常回闲。
+      // 首个 idle 是创建态(spawn 后未开跑)—— 没见过 active 不结算。
+      if (!this.collabAgentWasActive.has(threadId)) return
+      if (this.collabAgentSettled.has(threadId)) return
+      this.collabAgentSettled.add(threadId)
+      this.emit('bg_task_settled', {
+        task_id: threadId,
+        status: status === 'systemError' ? 'failed' : 'completed',
+        summary: this.collabAgentSummaries.get(threadId) ?? undefined,
+      } satisfies BgTaskSettledEvent)
+    }
+  }
+
+  /** 子 agent 的过程 item → subagent_step 事件(session 据此累积进 bg task 的
+   *  steps,后台卡展开可见),不进主卡。只转有信息量的工具类 item —— reasoning
+   *  这类(mapStartedItem 不认识)每轮上百条,转成空 step 会把 steps 的 ~1000
+   *  字符预算刷满,挤掉真正有用的 Bash/FileChange 记录(trimSteps 保新丢旧)。 */
+  private emitSubagentStep(item: any, phase: 'started' | 'completed', params: any): void {
+    const threadId = typeof params?.threadId === 'string' ? params.threadId : ''
+    const mapped = phase === 'started'
+      ? mapStartedItem(item, this.opts.workDir)
+      : mapCompletedItem(item, this.sessionId ?? undefined)
+    if (!mapped) return // reasoning/agentMessage 等非工具 item:不出 step
+    this.emit('subagent_step', {
+      thread_id: threadId,
+      item_id: item.id,
+      tool: mapped.name,
+      phase,
+      brief: subagentStepBrief(mapped.name, mapped.input, mapped.output),
+    })
+  }
+
+  private feedCollabItem(item: any, phase: 'started' | 'completed', params?: any): boolean {
+    if (item.type === 'subAgentActivity') {
+      const threadId = typeof item.agentThreadId === 'string' ? item.agentThreadId : ''
+      if (!threadId) return true // 吞掉,不进通用映射也不进 UNHANDLED 噪音
+      if (item.kind === 'started' && !this.collabAgentNames.has(threadId)) {
+        const name = collabAgentDisplayName(item.agentPath, threadId)
+        this.collabAgentNames.set(threadId, name)
+        this.emit('bg_task_started', {
+          task_id: threadId,
+          task_type: 'local_agent',
+          description: name,
+        } satisfies BgTaskStartedEvent)
+        // Codex ultra 编排的子 agent 生而并行(主 agent spawn 后自己继续跑),
+        // 直接后台化入卡 —— 不等主线程推进信号。
+        this.emit('bg_task_updated', {
+          task_id: threadId,
+          patch: { is_backgrounded: true },
+        } satisfies BgTaskUpdatedEvent)
+      } else if (item.kind === 'started') {
+        // 已知 id(collabAgentToolCall 先落时占了「子 agent」占位名)—— agentPath
+        // 才是真名,发一次 started 让 applyBgTaskStarted 的已知 id patch 补名。
+        // 已 settle 的不发:沉降已清 entry,started 会被当新任务重新入池成
+        // running 僵尸(晚到的纯元数据修正不该有生命周期语义)。
+        const prev = this.collabAgentNames.get(threadId)
+        const name = collabAgentDisplayName(item.agentPath, threadId)
+        if (prev !== name && !this.collabAgentSettled.has(threadId)) {
+          this.collabAgentNames.set(threadId, name)
+          this.emit('bg_task_started', {
+            task_id: threadId,
+            task_type: 'local_agent',
+            description: name,
+          } satisfies BgTaskStartedEvent)
+        }
+      } else if (item.kind === 'interrupted') {
+        // 打断等待新输入 → paused(计时停走),不冒充 running。
+        this.emit('bg_task_updated', {
+          task_id: threadId,
+          patch: { status: 'paused' },
+        } satisfies BgTaskUpdatedEvent)
+      }
+      return true
+    }
+    if (item.type === 'collabAgentToolCall') {
+      const states = item.agentsStates
+      if (states && typeof states === 'object') {
+        for (const [threadId, state] of Object.entries(states)) {
+          this.translateAgentState(threadId, state as any, item)
+        }
+      }
+      // closeAgent 完成时 agentsStates 带的是关闭前快照(常见 running,见官方
+      // close_agent.rs:subscribe_status 先取再 close)—— 收到的 receiver 无条件
+      // 结算成 stopped,否则 agent 已关、后台卡还在跑计时。
+      if (item.tool === 'closeAgent' && phase === 'completed' && item.status !== 'failed') {
+        const ids = collabReceiverThreadIds(item)
+        for (const threadId of ids) {
+          if (this.collabAgentSettled.has(threadId)) continue
+          this.collabAgentSettled.add(threadId)
+          if (!this.collabAgentNames.has(threadId)) {
+            this.collabAgentNames.set(threadId, collabAgentDisplayName(null, threadId))
+          }
+          this.emit('bg_task_settled', {
+            task_id: threadId,
+            status: 'stopped',
+          } satisfies BgTaskSettledEvent)
+        }
+      }
+      // spawn 在主卡 timeline 留一行「派生 agent」摘要面板(状态由后台卡承载);
+      // 纯编排(wait/sendInput/resumeAgent/closeAgent)无独立信息量,不出面板。
+      if (item.tool === 'spawnAgent') {
+        if (phase === 'started') {
+          this.emit('tool_use', {
+            id: item.id,
+            name: 'Agent',
+            input: {
+              tool: 'spawnAgent',
+              // fork_turns=all 的 prompt 是服务端密文(gAAAAB…),渲染时归一成占位。
+              prompt: collabPromptText(item.prompt),
+              description: collabSpawnDescription(item),
+              model: typeof item.model === 'string' ? item.model : undefined,
+            },
+          })
+        } else if (item.status !== 'inProgress') {
+          this.emit('tool_result', {
+            tool_use_id: item.id,
+            content: collabSpawnResult(item),
+            is_error: item.status === 'failed',
+          })
+        }
+      }
+      return true
+    }
+    return false
+  }
+
+  /** agentsStates 单项 → bg_task_updated / bg_task_settled。 */
+  private translateAgentState(threadId: string, state: any, item: any): void {
+    const status = state?.status
+    if (typeof status !== 'string') return
+    // 已终态的 agent 又收到 running —— followup_task/interaction 重新激活:
+    // 清 settled 标记并补 started+promote(bgStore 全终态沉降后可能已清空该
+    // entry,updated 对未知 task 是 no-op —— 重新入池才能翻活)。其余情况
+    // (终态快照重复到达)直接跳过 —— 防重复结算,唯一例外:权威终态纠正
+    // (见下方分支)。
+    if (this.collabAgentSettled.has(threadId)) {
+      if (status !== 'running' && status !== 'pendingInit') {
+        // 权威终态纠正:thread/status idle 兜底结算已写成 completed,随后
+        // agentsStates 带真实终态到达 —— 不翻活,用 updated 把墓碑改成正确
+        // 终态(errored→failed / shutdown·notFound→killed)。summary 通道
+        // applyBgTaskUpdated 不支持,兜底结算已尽量带了子 agent 末段答复。
+        if (status === 'errored' || status === 'shutdown' || status === 'notFound' || status === 'interrupted') {
+          this.emit('bg_task_updated', {
+            task_id: threadId,
+            patch: {
+              status: status === 'errored' ? 'failed' : 'killed',
+              error: typeof state?.message === 'string' && state.message ? state.message : undefined,
+            },
+          } satisfies BgTaskUpdatedEvent)
+        }
+        return
+      }
+      this.collabAgentSettled.delete(threadId)
+      const name = this.collabAgentNames.get(threadId) ?? collabAgentDisplayName(null, threadId)
+      this.emit('bg_task_started', {
+        task_id: threadId,
+        task_type: 'local_agent',
+        description: name,
+      } satisfies BgTaskStartedEvent)
+      this.emit('bg_task_updated', {
+        task_id: threadId,
+        patch: { is_backgrounded: true },
+      } satisfies BgTaskUpdatedEvent)
+    }
+    if (!this.collabAgentNames.has(threadId)) {
+      // 先于 subAgentActivity 到达(spawn 的 inProgress item 先落)。v2 wire 不带
+      // receiverAgents,这里没有 agentPath —— 先用中性占位名入卡,subAgentActivity
+      // (带 agentPath)到达时经 applyBgTaskStarted 的已知 id patch 补真名。
+      const name = '子 agent'
+      this.collabAgentNames.set(threadId, name)
+      const started: BgTaskStartedEvent = {
+        task_id: threadId,
+        task_type: 'local_agent',
+        description: name,
+        prompt: collabPromptText(item.prompt),
+      }
+      this.emit('bg_task_started', started)
+      const promoted: BgTaskUpdatedEvent = {
+        task_id: threadId,
+        patch: { is_backgrounded: true },
+      }
+      this.emit('bg_task_updated', promoted)
+    }
+    if (status === 'running' || status === 'pendingInit' || status === 'interrupted') {
+      const updated: BgTaskUpdatedEvent = {
+        task_id: threadId,
+        // interrupted = 被打断等待新输入(可能 followup)→ paused 计时停走,
+        // 不冒充 running。
+        patch: { status: status === 'pendingInit' ? 'pending' : status === 'interrupted' ? 'paused' : 'running' },
+      }
+      this.emit('bg_task_updated', updated)
+      return
+    }
+    // 终态:completed(message 即最终答复)/ errored / shutdown / notFound。
+    // 同一 agent 的后续 wait item 会重复携带终态 —— settled 去重(顶部 guard 已滤)。
+    // session 复用 alive 进程跨 turn,settled 随子 agent 数增长 —— 超上限清空
+    // 重来:最坏后果是极老 agent 的重复终态快照多发一次 settled(store 对已终态
+    // entry 幂等),比无界增长可接受。
+    if (this.collabAgentSettled.size >= 5000) this.collabAgentSettled.clear()
+    this.collabAgentSettled.add(threadId)
+    const settled: BgTaskSettledEvent = {
+      task_id: threadId,
+      status: status === 'completed' ? 'completed' : status === 'errored' ? 'failed' : 'stopped',
+      summary: typeof state?.message === 'string' && state.message ? state.message : undefined,
+    }
+    this.emit('bg_task_settled', settled)
   }
 
   private primeRolloutImageGenerationScan(): void {
@@ -1010,8 +1352,6 @@ function mapStartedItem(item: any, workDir: string): { name: string; input: any 
       return { name: 'WebSearch', input: { query: item.query, action: item.action } }
     case 'imageGeneration':
       return { name: 'ImageGeneration', input: { status: item.status, revisedPrompt: imageGenerationRevisedPrompt(item) } }
-    case 'collabAgentToolCall':
-      return { name: 'Agent', input: { tool: item.tool, prompt: item.prompt, model: item.model } }
   }
   return null
 }
@@ -1189,8 +1529,86 @@ function mapCompletedItem(item: any, threadId?: string): { output: string; isErr
       return { output: JSON.stringify(item.action ?? {}, null, 2), isError: false }
     case 'imageGeneration':
       return { output: imageGenerationOutput(item, threadId), isError: item.status === 'failed' }
-    case 'collabAgentToolCall':
-      return { output: JSON.stringify(item.agentsStates ?? {}, null, 2), isError: item.status === 'failed' }
   }
   return null
+}
+
+// ── 多 agent 编排 item 的展示辅助 ───────────────────────────────────
+
+/** agentPath(如 "/root/order_schema/official_history_orders")末段作展示名;
+ *  无 path 时退回 threadId 前 8 位。 */
+function collabAgentDisplayName(agentPath: unknown, threadId: string): string {
+  if (typeof agentPath === 'string' && agentPath) {
+    const last = agentPath.split('/').filter(Boolean).pop()
+    if (last) return last
+  }
+  return threadId.slice(0, 8)
+}
+
+/** spawn/followup 的 prompt 文本:fork_turns=all 时是服务端 Fernet 密文
+ *  (gAAAAAB…,2000 字乱码会糊满面板),归一成占位说明。 */
+function collabPromptText(prompt: unknown): string | undefined {
+  if (typeof prompt !== 'string' || !prompt) return undefined
+  if (prompt.startsWith('gAAAA') && !/[一-鿿]/.test(prompt)) return '(继承主线程历史的密文任务书)'
+  return prompt
+}
+
+/** 子 agent 过程步骤的单行简报(后台卡 steps 展示用)。 */
+function subagentStepBrief(name: string, input: any, output?: string): string {
+  const s = (x: unknown): string => typeof x === 'string' ? x : ''
+  switch (name) {
+    case 'Bash': {
+      // completed 的 output 是命令输出,取首行;started 显示命令本身。
+      if (output != null) {
+        const c = output.replace(/\s+/g, ' ').trim()
+        return c ? `→ ${c.slice(0, 60)}` : ''
+      }
+      return `\`${s(input?.command).slice(0, 60)}\``
+    }
+    case 'FileChange': {
+      const changes = Array.isArray(input?.changes) ? input.changes.length : 0
+      if (output != null) {
+        // completed:output 是 changes JSON —— 重复 started 的信息,显示应用状态。
+        return ''
+      }
+      return changes > 0 ? `改 ${changes} 个文件` : '文件变更'
+    }
+    case 'MCP': return `${s(input?.server)}/${s(input?.tool)}`.slice(0, 60)
+    case 'WebSearch': return `"${s(input?.query).slice(0, 50)}"`
+    default: {
+      if (output != null) {
+        const c = output.replace(/\s+/g, ' ').trim()
+        return c ? `→ ${c.slice(0, 60)}` : ''
+      }
+      return JSON.stringify(input ?? {}).replace(/\s+/g, ' ').slice(0, 60)
+    }
+  }
+}
+
+/** v2 wire 的 receiver 线程 id 列表(receiverThreadIds;内部 proto 的
+ *  receiver_agents 在 v2 转换时被丢弃,agentPath/nickname 不下发)。 */
+function collabReceiverThreadIds(item: any): string[] {
+  const ids = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []
+  return ids.filter((id: unknown): id is string => typeof id === 'string' && !!id)
+}
+
+/** spawn 面板描述:receiver 线程数(wire 无名字,只有 id)。 */
+function collabSpawnDescription(item: any): string {
+  const ids = collabReceiverThreadIds(item)
+  return ids.length > 0 ? `派生 ${ids.length} 个子 agent` : '派生子 agent'
+}
+
+/** spawn 面板完成态输出:agentsStates 的可读摘要(每 agent 一行「线程:状态」),
+ *  替代旧的 agentsStates JSON dump。真名由后台卡(subAgentActivity agentPath)
+ *  承载,这里只有线程 id 前 8 位。 */
+function collabSpawnResult(item: any): string {
+  const states = item.agentsStates
+  if (!states || typeof states !== 'object') return ''
+  const lines: string[] = []
+  for (const [threadId, state] of Object.entries(states)) {
+    const s = state as any
+    const status = typeof s?.status === 'string' ? s.status : 'unknown'
+    lines.push(`${threadId.slice(0, 8)}: ${status}`)
+  }
+  return lines.join('\n')
 }

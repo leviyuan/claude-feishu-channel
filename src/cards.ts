@@ -128,6 +128,7 @@ export {
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,
+  applySubagentStep,
   isBgTerminal,
   hasActiveBgTask,
   summarizeBackground,
