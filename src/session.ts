@@ -2123,32 +2123,36 @@ export class Session {
       this.onMainThreadAdvance()
     })
     p.on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
-      sessionTools.addTool(this, id, name, input)
-      // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
-      // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
-      if (!parentToolUseId) this.onMainThreadAdvance()
-      // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
-      if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
-      // 子 agent 内的工具调用(parentToolUseId 非空)额外累积进对应后台 task 的 steps[]。
-      // 同时覆盖 active 和 pending:前台子 agent 跑时 steps 暂存 pending,
-      // is_backgrounded 提升后自带 steps 带到 active。
+      // 子 agent 内的工具调用(parentToolUseId 非空)不上主卡 —— 只累积进对应后台
+      // task 的 steps[](后台卡展开可见)。与 codex 侧 isSubagentThread 分流同构:
+      // 主卡只承载主 agent,子 agent 过程不把主卡面板数刷爆。parentToolUseId 无
+      // 归属 task(如 canUseTool 合成的 AskUserQuestion)不在此列,仍走主卡。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolUse(
           { active: this.backgroundTasks, pending: this.pendingBgTasks },
           parentToolUseId, id, name, input,
         ))
         this.onBackgroundTaskChanged()
+        return
       }
+      sessionTools.addTool(this, id, name, input)
+      // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
+      // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
+      if (!parentToolUseId) this.onMainThreadAdvance()
+      // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
+      if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
     })
     p.on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId }: any) => {
-      sessionTools.completeTool(this, tool_use_id, content, is_error)
+      // 子 agent 内的工具结果同 tool_use:只回填后台 task steps,不上主卡面板。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolResult(
           { active: this.backgroundTasks, pending: this.pendingBgTasks },
           parentToolUseId, tool_use_id, content, is_error,
         ))
         this.onBackgroundTaskChanged()
+        return
       }
+      sessionTools.completeTool(this, tool_use_id, content, is_error)
     })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)

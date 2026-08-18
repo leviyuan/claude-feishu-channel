@@ -1007,6 +1007,70 @@ describe('Session SDK-initiated bg-task resume turns', () => {
   })
 })
 
+describe('Session claude subagent tool calls stay off the main card', () => {
+  // 2026-08-18 对齐 codex 侧 isSubagentThread 分流(cf41941):claude 子 agent 的
+  // 工具调用按 parent_tool_use_id 归属后台 task,只累积 steps,不上主卡面板 ——
+  // 主卡只承载主 agent,多 agent 时面板数不爆表。
+  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+    const t0 = Date.now()
+    while (!cond()) {
+      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+
+  test('子 agent tool_use/tool_result 只进 bg steps,不 addTool/completeTool', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_iso')
+    cardkit.recordCardCreated('card_subagent_iso', 1)
+
+    try {
+      // 主线程 Task tool_use 触发子 agent → bg task 建立(toolUseId 关联)
+      proc.emit('tool_use', { id: 'task_main_1', name: 'Task', input: { description: 'review' }, parentToolUseId: null })
+      proc.emit('bg_task_started', { task_id: 't1', tool_use_id: 'task_main_1', description: 'review' })
+      // 子 agent 内的工具调用:parentToolUseId 指向主线程 Task
+      proc.emit('tool_use', { id: 'sub_read_1', name: 'Read', input: { file_path: '/tmp/a.ts' }, parentToolUseId: 'task_main_1' })
+      proc.emit('tool_result', { tool_use_id: 'sub_read_1', content: 'file body', is_error: false, parentToolUseId: 'task_main_1' })
+
+      // steps 已累积(含结果回填)
+      const t1 = session.backgroundTasks.concat(session.pendingBgTasks).find((t: any) => t.id === 't1')
+      expect(t1).toBeDefined()
+      expect(t1.steps.length).toBe(1)
+      expect(t1.steps[0].tool).toBe('Read')
+      expect(t1.steps[0].brief).toContain('→ file body')
+      // 主卡 toolByUseId 不含子 agent 工具 —— 没走 addTool/completeTool
+      expect(session.currentTurn.toolByUseId.has('sub_read_1')).toBe(false)
+      // 主线程 Task 本身照常上主卡
+      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(true)
+      await cardkit.flush('card_subagent_iso')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_subagent_iso')
+    }
+  })
+
+  test('parentToolUseId 无归属 task 的 tool_use(如合成 AskUserQuestion)仍走主卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_orphan')
+    cardkit.recordCardCreated('card_subagent_orphan', 1)
+
+    try {
+      proc.emit('tool_use', { id: 'orphan_1', name: 'Bash', input: { command: 'echo hi' }, parentToolUseId: 'unknown_parent' })
+      expect(session.currentTurn.toolByUseId.has('orphan_1')).toBe(true)
+      await cardkit.flush('card_subagent_orphan')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_subagent_orphan')
+    }
+  })
+})
+
 describe('Session usage cache cross-backend isolation', () => {
   test('claude 的 rate_limit_event payload 不得覆盖 codex 用量缓存', () => {
     // 先用一条 codex 形状的 payload 播种缓存(模块级单例)。

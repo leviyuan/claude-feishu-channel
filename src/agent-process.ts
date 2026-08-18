@@ -12,6 +12,14 @@ import type {
   TokenUsageUpdated,
   TurnPlanUpdated,
 } from './codex-process'
+// type-only:claude-agent-process 运行时也 import 本模块(CLAUDE_EFFORT 等),
+// 双向仅类型引用,无运行时环。
+import type {
+  BgTaskStartedEvent,
+  BgTaskProgressEvent,
+  BgTaskUpdatedEvent,
+  BgTaskSettledEvent,
+} from './claude-agent-process'
 
 export type AgentProvider = 'codex' | 'claude'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -96,10 +104,21 @@ export type AgentProcessEventMap = {
   thread_goal_cleared: any
   assistant_text: { uuid?: string; text: string }
   assistant_block_stop: { index?: string }
-  tool_use: { id: string; name: string; input: any }
-  tool_result: { tool_use_id: string; content: any; is_error: boolean }
+  /** parentToolUseId 非空 = 子 agent 内的调用,session 只累积进后台 task steps,
+   *  不上主卡(与 codex isSubagentThread 分流同构)。 */
+  tool_use: { id: string; name: string; input: any; parentToolUseId: string | null }
+  tool_result: { tool_use_id: string; content: any; is_error: boolean; parentToolUseId: string | null }
   can_use_tool: CanUseToolRequest
   hook_callback: HookCallbackRequest
+  /** 后台任务/子 agent 生命周期(claude: SDK task_* 消息族;codex: collab 状态机
+   *  翻译)。session 据此维护双池(active/pending)驱动后台游标卡。 */
+  bg_task_started: BgTaskStartedEvent
+  bg_task_progress: BgTaskProgressEvent
+  bg_task_updated: BgTaskUpdatedEvent
+  bg_task_settled: BgTaskSettledEvent
+  /** 子 agent 过程步骤(codex: 子线程 item 按 thread_id 归属;claude 走
+   *  tool_use/tool_result 的 parentToolUseId 路径,不发此事件)。 */
+  subagent_step: { thread_id: string; item_id: string; tool: string; phase: 'started' | 'completed'; brief: string }
   result: any
   exit: { code: number | null; signal: string | null; expected: boolean }
 }

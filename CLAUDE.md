@@ -58,6 +58,7 @@ bun scripts/test-all.ts "<group name>"
 - **不静默兜底**: API/传输/卡片失败要 log 并向用户暴露(MISS / `—` / 红字),不要悄悄换通道、换卡片或返回假数据。
 - **Git 操作收口**: `wt` 的 worktree 逻辑集中在 `src/worktree.ts`,`agy` 的 CLI/Git 快照集中在 `src/agy-task.ts`,不在 `session.ts` 散写 `git` shell。
 - **群内裸词命令**(大小写不敏感,不加斜杠): `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`task`、`wt`/`worktree`、`btw`、`bye`、`fk`/`fork`、`bk`/`back`;外加 `agy <prompt>`、`>>>`/`<<<` 多条合并。在 `Session.runCommand` 里作保留字处理。
+- **通用改动必须全 provider 生效(硬性)**: 聊天列表预览、卡片渲染、footer、任务板、后台卡这类 session 层通用能力,改动必须同时覆盖 Claude 和 Codex 两个后端——**通用型修改只改一个 provider = 未完成,不许交付**。实现上通用逻辑只落在 session 层统一入口(`p.on(...)` 事件面 / `session-tools` / `cards/*` 模板),两个进程实现 emit 同一套事件进来,不在一侧进程里另写渲染分支。新增/变更事件时必须同步 `src/agent-process.ts` 的 `AgentProcessEventMap`(统一契约,两侧实际 emit 面都要在此声明,契约落后 = 缺口)。两后端固有能力差异(如 codex plan 面板、claude `task_progress`)除外,但差异用 provider 分支隔离在进程实现层,不渗进 session 层。
 
 ## restart feishu-daemon(铁律)
 
