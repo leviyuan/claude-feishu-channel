@@ -187,9 +187,44 @@ function bashPresentation(input: any): { description: string; command: string } 
 function unwrapShellCommand(command: string): string {
   const normalized = command.replace(/\r\n/g, '\n').trim()
   const shell = normalized.match(/^(?:\/usr\/bin\/env\s+)?(?:\/[\w./-]+\/)?(?:ba|z|fi)?sh\s+-[A-Za-z]*c[A-Za-z]*\s+([\s\S]+)$/)
-  if (!shell) return unwrapQuotedDescCommand(normalized)
-  const inner = stripShellArgQuotes(shell[1])
-  return unwrapQuotedDescCommand(inner || normalized)
+  if (shell) {
+    const inner = stripShellArgQuotes(shell[1])
+    return unwrapQuotedDescCommand(inner || normalized)
+  }
+  const powerShell = unwrapPowerShellCommand(normalized)
+  if (powerShell) return powerShell
+  return unwrapQuotedDescCommand(normalized)
+}
+
+/**
+ * Windows 上 Codex 把整条命令包进 PowerShell 调用:
+ *   "C:\...\powershell.exe" -NoProfile -Command "# desc: ...\nGet-Content ..."
+ * 剥掉外层可执行文件与参数,返回 -Command 的内容,让 # desc 注释照常被提取。
+ * 路径反斜杠在 PowerShell 双引号串里不是转义符,原样保留。
+ */
+function unwrapPowerShellCommand(command: string): string | null {
+  const head = command.match(/^("[^"]*"|\S+)\s+([\s\S]*)$/)
+  if (!head) return null
+  const exe = head[1].replace(/^"|"$/g, '').replace(/\.exe$/i, '')
+  if (!/(?:^|[\\/])(?:powershell|pwsh)$/i.test(exe)) return null
+  let rest = head[2]
+  for (;;) {
+    const flag = rest.match(/^(-[A-Za-z][\w-]*)\s+([\s\S]*)$/)
+    if (!flag) break
+    const name = flag[1].toLowerCase()
+    if (name === '-command' || name === '-c') return stripDoubleQuotes(flag[2])
+    rest = flag[2]
+    if (name === '-executionpolicy' || name === '-inputformat' || name === '-outputformat') {
+      rest = rest.replace(/^(?:"[^"]*"|\S+)\s+/, '')
+    }
+  }
+  return null
+}
+
+function stripDoubleQuotes(arg: string): string {
+  const s = arg.trim()
+  if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"')) return s
+  return s.slice(1, -1).replace(/\\"/g, '"')
 }
 
 function stripShellArgQuotes(arg: string): string {
