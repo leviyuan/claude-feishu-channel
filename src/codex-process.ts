@@ -25,6 +25,7 @@ import {
   logUnhandledAppServerPayload,
 } from './codex-compaction'
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
+import { shellCommandDescription } from './cards/shell-command'
 import type { AgentReasoningEffort } from './agent-process'
 import type {
   BgTaskSettledEvent,
@@ -1563,7 +1564,9 @@ function subagentStepBrief(name: string, input: any, output?: string): string {
         const c = output.replace(/\s+/g, ' ').trim()
         return c ? `→ ${c.slice(0, 60)}` : ''
       }
-      return `\`${s(input?.command).slice(0, 60)}\``
+      // 与主卡工具面板共用 shell-command 解析,Windows PowerShell 包装 / desc
+      // 注释统一剥掉,后台卡 steps 显示中文说明而非 powershell.exe 路径。
+      return shellCommandDescription(s(input?.command)) || '(空命令)'
     }
     case 'FileChange': {
       const changes = Array.isArray(input?.changes) ? input.changes.length : 0

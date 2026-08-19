@@ -618,6 +618,23 @@ describe('codex subagent item filtering (main-card cleanliness)', () => {
     expect(steps[0][1]).toMatchObject({ thread_id: 'sub-thread-1', tool: 'Bash', phase: 'started' })
   })
 
+  test('subagent Bash step brief unwraps PowerShell-wrapped desc command', () => {
+    // Windows 上 Codex 把命令包进 powershell.exe 调用,子 agent 后台卡 steps
+    // 的 brief 也要显示中文说明,不显示 powershell.exe 路径。
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'commandExecution', id: 'exec-ps', cwd: 'C:\\repo',
+        command: `'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看模板目录状态\nGet-ChildItem "C:\\repo\\templates" -Recurse'`,
+      },
+      threadId: 'sub-thread-1',
+      turnId: 'turn-1',
+    })
+    const steps = events.filter(([e]) => e === 'subagent_step')
+    expect(steps).toHaveLength(1)
+    expect((steps[0][1] as any).brief).toBe('查看模板目录状态')
+  })
+
   test('subagent agentMessage does not leak into main assistant stream', () => {
     const { proc, events } = makeProc()
     proc.handleNotification('item/completed', {

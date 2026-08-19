@@ -44,6 +44,7 @@ import type {
   BgTaskStatus,
 } from '../claude-agent-process'
 import { sanitizeMarkdownForCardKit } from './elements'
+import { shellCommandDescription } from './shell-command'
 
 export type { BgTaskStatus }
 
@@ -313,7 +314,9 @@ function trimSteps(steps: BgTaskStep[]): BgTaskStep[] {
 function briefInput(name: string, input: any): string {
   const s = (x: unknown): string => typeof x === 'string' ? x : ''
   switch (name) {
-    case 'Bash': return `\`${s(input?.command).slice(0, 60)}\``
+    // 与主卡工具面板共用 shell-command 解析:Windows PowerShell 包装 / desc 注释
+    // 统一剥掉,steps 里显示中文说明而非 powershell.exe 路径。
+    case 'Bash': return shellCommandDescription(s(input?.command)) || '(空命令)'
     case 'Read': return s(input?.file_path)
     case 'Edit': return s(input?.file_path)
     case 'Write': return s(input?.file_path)

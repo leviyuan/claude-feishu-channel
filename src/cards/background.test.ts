@@ -250,6 +250,18 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.pending[0].steps[0].brief).toBe('Grep "auth" in src → 命中 3 处')
   })
 
+  test('Bash step 的 brief 走 shell-command 解析:PowerShell 包装显示 desc 说明', () => {
+    // Windows 子 agent 的命令被包进 powershell.exe -Command '...',steps 里
+    // 应显示中文说明,不显示 powershell.exe 路径 / # desc 注释。
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', {
+      command: `'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看 xyq 项目模板状态\nGet-ChildItem "C:\\xyq" -Recurse'`,
+    })
+    expect(s.active[0].steps[0].brief).toBe('Bash 查看 xyq 项目模板状态')
+    expect(s.active[0].steps[0].brief).not.toContain('powershell')
+    expect(s.active[0].steps[0].brief).not.toContain('# desc')
+  })
+
   test('tool_result 错误加 ❌', () => {
     let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
     s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'npm test' })

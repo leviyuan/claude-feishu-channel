@@ -5,6 +5,7 @@
 
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
+import { shellCommandPresentation } from './shell-command'
 
 const BASH_OUTPUT_PREVIEW_CHARS = 300
 
@@ -171,92 +172,11 @@ function summarizeShellSessionInput(input: any): string {
 }
 
 function bashPresentation(input: any): { description: string; command: string } {
-  const rawCommand = unwrapShellCommand(String(input?.command ?? input?.cmd ?? input?.script ?? ''))
-  const firstLine = rawCommand.split('\n', 1)[0]?.trim() ?? ''
-  const comment = firstLine.startsWith('#') && !firstLine.startsWith('#!')
-    ? firstLine.replace(/^#\s*/, '').trim()
-    : ''
-  const commentDesc = comment.replace(/^(?:desc|dec|description|说明|目的|用途)\s*[:：]\s*/i, '').trim()
-  const command = commentDesc
-    ? rawCommand.split('\n').slice(1).join('\n').trimStart()
-    : rawCommand
+  const rawCommand = String(input?.command ?? input?.cmd ?? input?.script ?? '')
   const explicit = String(input?.description ?? input?.reason ?? '').trim()
-  return { description: commentDesc || explicit, command: command || rawCommand }
-}
-
-function unwrapShellCommand(command: string): string {
-  const normalized = command.replace(/\r\n/g, '\n').trim()
-  const shell = normalized.match(/^(?:\/usr\/bin\/env\s+)?(?:\/[\w./-]+\/)?(?:ba|z|fi)?sh\s+-[A-Za-z]*c[A-Za-z]*\s+([\s\S]+)$/)
-  if (shell) {
-    const inner = stripShellArgQuotes(shell[1])
-    return unwrapQuotedDescCommand(inner || normalized)
-  }
-  const powerShell = unwrapPowerShellCommand(normalized)
-  if (powerShell) return powerShell
-  return unwrapQuotedDescCommand(normalized)
-}
-
-/**
- * Windows 上 Codex 把整条命令包进 PowerShell 调用,引号风格随命令内容漂移:
- *   "C:\...\powershell.exe" -Command "# desc: ...\nGet-Content ..."
- *   'C:\...\powershell.exe' -Command '# desc: ...\nGet-ChildItem ...'
- * 剥掉外层可执行文件与参数,返回 -Command 的内容,让 # desc 注释照常被提取。
- * 路径反斜杠在 PowerShell 字符串里不是转义符,原样保留。
- */
-function unwrapPowerShellCommand(command: string): string | null {
-  const head = command.match(/^("[^"]*"|'[^']*'|“[^”]*”|\S+)\s+([\s\S]*)$/)
-  if (!head) return null
-  const exe = stripQuotes(head[1]).replace(/\.exe$/i, '')
-  if (!/(?:^|[\\/])(?:powershell|pwsh)$/i.test(exe)) return null
-  let rest = head[2]
-  for (;;) {
-    const flag = rest.match(/^(-[A-Za-z][\w-]*)\s+([\s\S]*)$/)
-    if (!flag) break
-    const name = flag[1].toLowerCase()
-    if (name === '-command' || name === '-c') return unwrapQuotedDescCommand(stripQuotes(flag[2]))
-    rest = flag[2]
-    if (name === '-executionpolicy' || name === '-inputformat' || name === '-outputformat') {
-      rest = rest.replace(/^(?:"[^"]*"|'[^']*'|\S+)\s+/, '')
-    }
-  }
-  return null
-}
-
-/** 剥掉参数外层引号:单引号串 `''` 还原为 `'`,双引号串 `\"` 还原为 `"`。 */
-function stripQuotes(arg: string): string {
-  const s = arg.trim()
-  if (s.length < 2) return s
-  const closer: Record<string, string> = { '"': '"', "'": "'", '“': '”' }
-  const end = closer[s[0]]
-  if (!end || !s.endsWith(end)) return s
-  const body = s.slice(1, -1)
-  if (s[0] === "'") return body.replace(/''/g, "'")
-  if (s[0] === '"') return body.replace(/\\"/g, '"')
-  return body
-}
-
-function stripShellArgQuotes(arg: string): string {
-  const s = arg.trim()
-  if (s.length < 2) return s
-  const pairs: Record<string, string> = { '"': '"', "'": "'", '“': '”' }
-  const close = pairs[s[0]]
-  if (!close || !s.endsWith(close)) return s
-  const body = s.slice(1, -1)
-  if (s[0] === "'") return body.replace(/'\\''/g, "'")
-  return body.replace(/\\(["\\$`])/g, '$1').replace(/\\n/g, '\n')
-}
-
-function unwrapQuotedDescCommand(command: string): string {
-  const s = command.trim()
-  const quote = s[0]
-  if (quote !== '"' && quote !== "'" && quote !== '“') return s
-  const body = s.slice(1)
-  if (!/^#\s*(?:desc|dec|description|说明|目的|用途)\s*[:：]/i.test(body)) return s
-  if (quote !== '"') return body
-  return body
-    .replace(/\\(["\\$`])/g, '$1')
-    .replace(/\\n/g, '\n')
-    .replace(/\s*"\s*'\$\(([^)]*)\)'/g, (_m, inner) => ` $(${inner})`)
+  // desc 注释 / 包装剥离统一走 shell-command 模块,与后台卡、子 agent 简报共用一份解析。
+  const info = shellCommandPresentation(rawCommand)
+  return { description: info.description || explicit, command: info.command }
 }
 
 function fenceBlock(text: string, lang = ''): string {
