@@ -114,6 +114,25 @@ describe('shellCommandPresentation — 包装剥离', () => {
     expect(description).toBe('查状态')
     expect(command).toBe('git status')
   })
+
+  test('Codex exec 引号包装但无 desc:整条被包时也剥引号(mac 回退摘要不带引号)', () => {
+    const { description, command } = shellCommandPresentation('"ls -la"')
+    expect(description).toBe('')
+    expect(command).toBe('ls -la')
+  })
+
+  test('非整条被包的引号(命令自身参数)不剥', () => {
+    // grep 的参数引号不是包装;"a b" "c d" 两个引号参数同样不是包装。
+    expect(shellCommandPresentation('grep "pattern" file.txt').command).toBe('grep "pattern" file.txt')
+    expect(shellCommandPresentation('"a b" "c d"').command).toBe('"a b" "c d"')
+  })
+
+  test('多行脚本无 desc:跳过 set -e / cd / heredoc 起手取首条有效命令', () => {
+    // FOO=1 bun test 也是被 env-prefix 过滤的行,且是最后一行 → 回退取尾行。
+    expect(shellCommandDescription('set -e\ncd /app\nFOO=1 bun test')).toBe('FOO=1 bun test')
+    // 有非前置行时取首条有效命令。
+    expect(shellCommandDescription('set -e\ncd /app\nbun install\nbun test')).toBe('bun install')
+  })
 })
 
 describe('shellCommandDescription — 后台卡 steps 简报用', () => {

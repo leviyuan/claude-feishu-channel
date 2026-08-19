@@ -5,7 +5,7 @@
 
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
-import { shellCommandPresentation } from './shell-command'
+import { shellCommandPresentation, shellCommandDescription } from './shell-command'
 
 const BASH_OUTPUT_PREVIEW_CHARS = 300
 
@@ -145,17 +145,11 @@ function summarizeBashInput(input: any): string {
   if (info.description) return truncate(info.description.replace(/\s+/g, ' '), 80)
   const command = info.command
   if (!command) return ''
-  const oneLine = command.replace(/\s+/g, ' ')
   const lines = command.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
-  if (lines.length <= 1) return truncate(oneLine, 80)
-  const firstMeaningful = lines.find(line =>
-    !line.startsWith('#') &&
-    !/^set\s+-/.test(line) &&
-    !/^cd\s+/.test(line) &&
-    !/^[A-Za-z_][A-Za-z0-9_]*=/.test(line) &&
-    !/^cat\s+<<['"]?\w+['"]?/.test(line)
-  ) ?? lines[0]
-  return `Shell 脚本 · ${lines.length} 行 · ${truncate(firstMeaningful, 46)}`
+  // 单行:命令本身;多行:Shell 脚本 + 首条有效命令(与后台卡/子 agent 的
+  // shellCommandDescription 回退同构,各 surface 格式一致)。
+  if (lines.length <= 1) return truncate(command.replace(/\s+/g, ' '), 80)
+  return `Shell 脚本 · ${lines.length} 行 · ${truncate(shellCommandDescription(command), 46)}`
 }
 
 function shellSessionAction(input: any): string {

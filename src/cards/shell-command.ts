@@ -31,7 +31,7 @@ export function stripQuotes(arg: string): string {
 
 /**
  * 命令的展示拆分:description = desc 注释里的中文说明(无则空),
- * command = 剥掉注释后的真正命令体。
+ * command = 剥掉注释后的真正命令体(平台包装已剥,无 desc 时也剥干净引号)。
  */
 export function shellCommandPresentation(raw: unknown): { description: string; command: string } {
   const rawCommand = unwrapShellCommand(String(raw ?? ''))
@@ -46,11 +46,32 @@ export function shellCommandPresentation(raw: unknown): { description: string; c
   return { description: commentDesc, command: command || rawCommand }
 }
 
-/** 便捷封装:只想要 desc 说明(无则回退到命令首行截断)。 */
+/**
+ * 便捷封装:只想要一句单行说明(后台卡 steps / 子 agent 简报用)。
+ * 无 desc 时回退到首个有意义的命令行截断 —— 与主卡 header 的回退同构,
+ * 各平台(mac 裸命令 / Codex exec 引号 / Windows PowerShell)格式一致。
+ */
 export function shellCommandDescription(raw: unknown, fallbackChars = 60): string {
   const { description, command } = shellCommandPresentation(raw)
   if (description) return description
-  return command.replace(/\s+/g, ' ').trim().slice(0, fallbackChars)
+  const firstMeaningful = firstMeaningfulCommandLine(command)
+  return firstMeaningful.replace(/\s+/g, ' ').trim().slice(0, fallbackChars)
+}
+
+/**
+ * 无 desc 时的摘要行:跳过 set -e / cd / 环境变量赋值 / heredoc 起手这类
+ * 前置行,取第一行真正干活的命令;全是前置行时取最后一行(脚本的目的
+ * 行,而不是回头显示 set -e)。
+ */
+function firstMeaningfulCommandLine(command: string): string {
+  const lines = command.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+  return lines.find(line =>
+    !line.startsWith('#') &&
+    !/^set\s+-/.test(line) &&
+    !/^cd\s+/.test(line) &&
+    !/^[A-Za-z_][A-Za-z0-9_]*=/.test(line) &&
+    !/^cat\s+<<['"]?\w+['"]?/.test(line)
+  ) ?? lines[lines.length - 1] ?? ''
 }
 
 function unwrapShellCommand(command: string): string {
@@ -95,15 +116,44 @@ function stripShellArgQuotes(arg: string): string {
   return body.replace(/\\(["\\$`])/g, '$1').replace(/\\n/g, '\n')
 }
 
+/** 剥掉整条命令最外层的引号包装(Codex 统一 exec 形态)。
+ *  有 desc 注释时必须剥 —— 注释与命令体都在引号里;无 desc 时,只有当
+ *  整串就是一对引号(第一个字符是开引号、最后一个字符是配对闭引号、
+ *  中间的闭引号都被转义或成对出现在内部)才剥 —— 区分「包装」与「命令
+ *  自身的引号参数」(grep "x" file / "a" "b" 不能当包装剥)。 */
 function unwrapQuotedDescCommand(command: string): string {
   const s = command.trim()
   const quote = s[0]
   if (!QUOTE_CLOSER[quote]) return s
-  const body = s.slice(1).replace(/\s*[”"]\s*$/, '')
-  if (!/^#\s*(?:desc|dec|description|说明|目的|用途)\s*[:：]/i.test(body)) return s
-  if (quote !== '"') return body
-  return body
+  const body = s.slice(1)
+  const hasDesc = /^#\s*(?:desc|dec|description|说明|目的|用途)\s*[:：]/i.test(body)
+  if (!hasDesc && !isSingleQuotedWrap(body, quote)) return s
+  if (quote !== '"') {
+    // 单引号串:去掉尾部闭引号即可(内部无转义语义)。
+    return body.replace(/'\s*$/, '')
+  }
+  // 双引号串:desc 场景尾部可能带有多余闭引号/全角引号,一并清掉;
+  // 之后还原 \" → "、\n → 换行、"'$(cmd)'" → "$(cmd)"(Codex exec 的
+  // $() 引号逃逸形态)。
+  const inner = body
+    .replace(/\s*[”"]\s*$/, '')
     .replace(/\\(["\\$`])/g, '$1')
     .replace(/\\n/g, '\n')
-    .replace(/\s*"\s*'\$\(([^)]*)\)'/g, (_m, inner) => ` $(${inner})`)
+    .replace(/\s*"\s*'\$\(([^)]*)\)'/g, (_m, g1) => ` $(${g1})`)
+  return inner
+}
+
+/** 整串恰好是一对引号包住的内容(可当包装剥):从 body 头开始扫描,
+ *  转义(\")跳过,遇到非转义闭引号时 —— 它必须是最后一个非空白字符,
+ *  否则后面还有裸 token,说明引号只是首个参数("a b" "c d" / grep "x" f)。 */
+function isSingleQuotedWrap(body: string, quote: string): boolean {
+  const closer = QUOTE_CLOSER[quote]
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]
+    if (quote === '"' && ch === '\\' && i + 1 < body.length) { i++; continue }
+    if (ch === closer) {
+      return /^[\s]*$/.test(body.slice(i + 1))
+    }
+  }
+  return false
 }
