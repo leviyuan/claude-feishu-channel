@@ -197,34 +197,42 @@ function unwrapShellCommand(command: string): string {
 }
 
 /**
- * Windows 上 Codex 把整条命令包进 PowerShell 调用:
- *   "C:\...\powershell.exe" -NoProfile -Command "# desc: ...\nGet-Content ..."
+ * Windows 上 Codex 把整条命令包进 PowerShell 调用,引号风格随命令内容漂移:
+ *   "C:\...\powershell.exe" -Command "# desc: ...\nGet-Content ..."
+ *   'C:\...\powershell.exe' -Command '# desc: ...\nGet-ChildItem ...'
  * 剥掉外层可执行文件与参数,返回 -Command 的内容,让 # desc 注释照常被提取。
- * 路径反斜杠在 PowerShell 双引号串里不是转义符,原样保留。
+ * 路径反斜杠在 PowerShell 字符串里不是转义符,原样保留。
  */
 function unwrapPowerShellCommand(command: string): string | null {
-  const head = command.match(/^("[^"]*"|\S+)\s+([\s\S]*)$/)
+  const head = command.match(/^("[^"]*"|'[^']*'|“[^”]*”|\S+)\s+([\s\S]*)$/)
   if (!head) return null
-  const exe = head[1].replace(/^"|"$/g, '').replace(/\.exe$/i, '')
+  const exe = stripQuotes(head[1]).replace(/\.exe$/i, '')
   if (!/(?:^|[\\/])(?:powershell|pwsh)$/i.test(exe)) return null
   let rest = head[2]
   for (;;) {
     const flag = rest.match(/^(-[A-Za-z][\w-]*)\s+([\s\S]*)$/)
     if (!flag) break
     const name = flag[1].toLowerCase()
-    if (name === '-command' || name === '-c') return stripDoubleQuotes(flag[2])
+    if (name === '-command' || name === '-c') return unwrapQuotedDescCommand(stripQuotes(flag[2]))
     rest = flag[2]
     if (name === '-executionpolicy' || name === '-inputformat' || name === '-outputformat') {
-      rest = rest.replace(/^(?:"[^"]*"|\S+)\s+/, '')
+      rest = rest.replace(/^(?:"[^"]*"|'[^']*'|\S+)\s+/, '')
     }
   }
   return null
 }
 
-function stripDoubleQuotes(arg: string): string {
+/** 剥掉参数外层引号:单引号串 `''` 还原为 `'`,双引号串 `\"` 还原为 `"`。 */
+function stripQuotes(arg: string): string {
   const s = arg.trim()
-  if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"')) return s
-  return s.slice(1, -1).replace(/\\"/g, '"')
+  if (s.length < 2) return s
+  const closer: Record<string, string> = { '"': '"', "'": "'", '“': '”' }
+  const end = closer[s[0]]
+  if (!end || !s.endsWith(end)) return s
+  const body = s.slice(1, -1)
+  if (s[0] === "'") return body.replace(/''/g, "'")
+  if (s[0] === '"') return body.replace(/\\"/g, '"')
+  return body
 }
 
 function stripShellArgQuotes(arg: string): string {

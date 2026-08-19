@@ -699,6 +699,24 @@ describe('bash-like tool card rendering', () => {
     expect(toolCallElement(2, 'Bash', input, null, '✅').elements[0].content).toContain('netstat -ano')
   })
 
+  test('unwraps single-quoted PowerShell exe and command', () => {
+    const input = {
+      command: "'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看 xyq 项目里的鼠标模板、任务和当前数据目录状态\nGet-ChildItem \"C:\\Users\\maoxiandao2\\xyq\\templates\" -Recurse'",
+      cwd: 'C:\\Users\\maoxiandao2\\xyq',
+    }
+
+    expect(summarizeToolInput('Bash', input)).toBe('查看 xyq 项目里的鼠标模板、任务和当前数据目录状态')
+
+    const el = toolCallElement(0, 'Bash', input, null, '✅') as any
+    const body = el.elements[0].content
+
+    expect(el.header.title.content).toBe('✅ 🔧 Bash: 查看 xyq 项目里的鼠标模板、任务和当前数据目录状态')
+    expect(body).toContain('**目的**: 查看 xyq 项目里的鼠标模板、任务和当前数据目录状态')
+    expect(body).toContain('Get-ChildItem "C:\\Users\\maoxiandao2\\xyq\\templates" -Recurse')
+    expect(body).not.toContain('powershell.exe')
+    expect(body).not.toContain('# desc:')
+  })
+
   test('renders write_stdin shell session polling as Bash', () => {
     const input = {
       session_id: 97146,
