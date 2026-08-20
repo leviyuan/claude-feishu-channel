@@ -60,7 +60,7 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
-import { readUsage, updateUsageFromRateLimits, peekUsage, type UsageSnapshot } from './usage'
+import { readUsage, refreshUsageFromConnection, observeRateLimitsNotification, peekUsage, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
 import {
   contextLimitFromAppServer,
@@ -2099,10 +2099,12 @@ export class Session {
       this.handleContextCompacted(notice)
     })
     p.on('rate_limits_updated', (rateLimits: any) => {
-      // usage.ts 的缓存是 codex 专属(planType/primary/secondary 形状)。claude
-      // 的 rate_limit_info 形状不同但同样 truthy,写入会把 codex 快照覆盖成
-      // 全 null 的假 ok 数据 —— 只放行 codex 进程的事件。
-      if (p.provider === 'codex') updateUsageFromRateLimits(rateLimits)
+      // codex rolling 通知 limitId 不可信(2026-08-20 源码核实:上游 SSE/WS
+      // 事件缺 metered_limit_name 时,codex 解析器把 limitId 强补 "codex",
+      // Spark 桶内容会被贴上主桶标签)—— 通知不写 cache,只观察日志;
+      // 权威状态在 turn 收尾用现有连接 read 端点整体刷新(closeTurnCard)。
+      // claude 的 rate_limit_info 形状不同,同样不进 codex 快照。
+      if (p.provider === 'codex') observeRateLimitsNotification(rateLimits)
     })
     p.on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)
@@ -3104,8 +3106,8 @@ export class Session {
   /** turn footer 末尾的额度后缀,按当前 token source 渲染(不再硬编码 GLM):
    *   claude source(glm/deepseek)→ ts.readUsage(轻量 HTTP):glm 显示 5h+周双窗口,
    *                deepseek 等标量余额 source 显示 planLabel「剩余 ¥X」
-   *   codex        → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
-   *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
+   *   codex        → 先在现有 codex 连接上 read rateLimits(权威多桶,毫秒级;
+   *                rolling 通知 limitId 不可信只当失效信号),显示服务端默认桶
    * 拿不到数据返回空串;缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
   private async footerUsageSuffix(provider: AgentProvider): Promise<string> {
     const ts = this.currentTokenSource()
@@ -3118,7 +3120,12 @@ export class Session {
       return snap.state === 'ok' && snap.planLabel ? `  |  ${snap.planLabel}` : ''
     }
     if (provider === 'codex') {
-      const u = peekUsage()
+      // turn 收尾:现有连接 read 端点刷新权威快照(整体替换桶 map),再渲染。
+      // 进程已死(中断/退出)时拿不到连接 → 用最近一次权威快照;没有就省略额度段。
+      const proc = this.proc?.isAlive() && this.proc.provider === 'codex' && this.proc.readRateLimits
+        ? this.proc as CodexProcess : null
+      const fresh = proc ? await refreshUsageFromConnection(() => proc.readRateLimits!()) : null
+      const u = fresh ?? peekUsage()
       return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : ''
     }
     // claude 无匹配 token source(理论不发生,token source 总有)→ 回退 readGlmUsage 兼容

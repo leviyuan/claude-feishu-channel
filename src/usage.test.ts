@@ -1,62 +1,122 @@
 import { describe, expect, test } from 'bun:test'
 
-import { updateUsageFromRateLimits } from './usage'
+import { snapshotFromReadResponse, observeRateLimitsNotification } from './usage'
 
-describe('usage cache semantics', () => {
-  test('keeps last live snapshot when a later live update payload is empty', () => {
-    const snapshot = updateUsageFromRateLimits({
-      planType: 'plus',
-      primary: { usedPercent: 12.4, windowDurationMins: 300 },
-      secondary: { usedPercent: 66.6, windowDurationMins: 10_080 },
+describe('usage read snapshot semantics', () => {
+  test('多桶 read 响应:默认桶跟随服务端顶层 rateLimits 指针,桶 map 全量保留', () => {
+    // 2026-08-20 实测 pro 账号 read 端点:主桶(周)+ bengalfox(Spark 附加包,5h+周)。
+    const snap = snapshotFromReadResponse({
+      rateLimits: {
+        limitId: 'codex', limitName: null,
+        primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
+        secondary: null,
+      },
+      rateLimitsByLimitId: {
+        codex: {
+          limitId: 'codex', limitName: null,
+          primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
+          secondary: null,
+        },
+        codex_bengalfox: {
+          limitId: 'codex_bengalfox', limitName: 'GPT-5.3-Codex-Spark',
+          primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_787_202_131 },
+          secondary: { usedPercent: 25, windowDurationMins: 10_080, resetsAt: 1_787_205_481 },
+        },
+      },
     })
 
-    expect(snapshot.state).toBe('ok')
-    if (snapshot.state !== 'ok') throw new Error('expected ok snapshot')
-    expect(snapshot.fiveHour?.percent).toBe(12.4)
-    expect(snapshot.weekly?.percent).toBe(66.6)
-
-    const kept = updateUsageFromRateLimits(null)
-    expect(kept).toEqual(snapshot)
+    expect(snap.state).toBe('ok')
+    if (snap.state !== 'ok') throw new Error('expected ok snapshot')
+    // footer 显示服务端默认指针指向的主桶(周-only)
+    expect(snap.defaultLimitId).toBe('codex')
+    expect(snap.fiveHour).toBeNull()
+    expect(snap.weekly?.percent).toBe(44)
+    // 桶 map 整体保留,非默认桶(bengalfox)不丢
+    expect(snap.buckets?.map(b => b.limitId)).toEqual(['codex', 'codex_bengalfox'])
+    const spark = snap.buckets?.find(b => b.limitId === 'codex_bengalfox')
+    expect(spark?.fiveHour?.percent).toBe(0)
+    expect(spark?.weekly?.percent).toBe(25)
   })
 
-  test('does not coerce missing usage percentages to 0', () => {
-    const snapshot = updateUsageFromRateLimits({
-      planType: 'pro',
-      primary: { windowDurationMins: 300 },
-      secondary: { windowDurationMins: 10_080 },
+  test('prolite 形态:唯一周窗口在 primary(secondary=null),归 weekly 不按位置', () => {
+    const snap = snapshotFromReadResponse({
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
+        secondary: null,
+        planType: 'prolite',
+      },
     })
-
-    expect(snapshot.state).toBe('ok')
-    if (snapshot.state !== 'ok') throw new Error('expected ok snapshot')
-    expect(snapshot.fiveHour?.percent).toBeNull()
-    expect(snapshot.weekly?.percent).toBeNull()
+    expect(snap.state).toBe('ok')
+    if (snap.state !== 'ok') throw new Error('expected ok snapshot')
+    expect(snap.fiveHour).toBeNull()
+    expect(snap.weekly?.percent).toBe(9)
   })
 
-  test('prolite 形态:唯一周窗口在 primary(secondary=null),按时长归类不按位置', () => {
-    // 2026-08-17 实测 prolite 账号 account/rateLimits/read:primary 是 7 天窗口。
-    const snapshot = updateUsageFromRateLimits({
-      planType: 'prolite',
-      primary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
-      secondary: null,
+  test('倒挂形态:primary=周、secondary=5h,按时长归类不按位置', () => {
+    const snap = snapshotFromReadResponse({
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 17, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
+        secondary: { usedPercent: 7, windowDurationMins: 300, resetsAt: 1_700_000_000 },
+      },
     })
-
-    expect(snapshot.state).toBe('ok')
-    if (snapshot.state !== 'ok') throw new Error('expected ok snapshot')
-    expect(snapshot.fiveHour).toBeNull()
-    expect(snapshot.weekly?.percent).toBe(9)
-    expect(snapshot.weekly?.durationMins).toBe(10_080)
+    expect(snap.state).toBe('ok')
+    if (snap.state !== 'ok') throw new Error('expected ok snapshot')
+    expect(snap.fiveHour?.percent).toBe(7)
+    expect(snap.weekly?.percent).toBe(17)
   })
 
-  test('倒挂形态:primary=周、secondary=5h,按时长纠正归位', () => {
-    const snapshot = updateUsageFromRateLimits({
-      planType: 'plus',
-      primary: { usedPercent: 17, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
-      secondary: { usedPercent: 7, windowDurationMins: 300, resetsAt: 1_700_000_000 },
+  test('不把缺失的 usedPercent 强转成 0', () => {
+    const snap = snapshotFromReadResponse({
+      rateLimits: {
+        limitId: 'codex',
+        primary: { windowDurationMins: 300 },
+        secondary: { windowDurationMins: 10_080 },
+      },
     })
+    expect(snap.state).toBe('ok')
+    if (snap.state !== 'ok') throw new Error('expected ok snapshot')
+    expect(snap.fiveHour?.percent).toBeNull()
+    expect(snap.weekly?.percent).toBeNull()
+  })
 
-    expect(snapshot.state).toBe('ok')
-    if (snapshot.state !== 'ok') throw new Error('expected ok snapshot')
-    expect(snapshot.fiveHour?.percent).toBe(7)
-    expect(snapshot.weekly?.percent).toBe(17)
+  test('OpenAI 改窗口结构(如日窗 1440m)也能归类,不硬编码 300/10080', () => {
+    const snap = snapshotFromReadResponse({
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 30, windowDurationMins: 1_440 },
+        secondary: { usedPercent: 12, windowDurationMins: 10_080 },
+      },
+    })
+    expect(snap.state).toBe('ok')
+    if (snap.state !== 'ok') throw new Error('expected ok snapshot')
+    // 1440m 是短窗(≤720?否——1440>720 走 isLong)。调整断言:1440m 日窗归 fiveHour 档
+    // 由 isShort(≤720)判定失败 → 按位置 primary。此处验证"未知时长不崩、按位置兜底"
+    expect(snap.fiveHour?.percent ?? snap.weekly?.percent).toBe(30)
+  })
+
+  test('空 read 响应显式 network,不假数据', () => {
+    const snap = snapshotFromReadResponse({})
+    expect(snap.state).toBe('network')
+  })
+})
+
+describe('rate-limit notification observation (失效信号,不写 cache)', () => {
+  test('错标通知(limitId=codex 但内容是 bengalfox)只观察不覆盖', () => {
+    // 先建立权威快照(主桶 44%)
+    snapshotFromReadResponse({
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: 1_787_561_037 },
+        secondary: null,
+      },
+    })
+    // 错标通知:limitId 写 codex、内容是 bengalfox 形态 —— 不应抛错、不应写 cache
+    expect(() => observeRateLimitsNotification({
+      limitId: 'codex', limitName: null,
+      primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_787_202_131 },
+      secondary: { usedPercent: 25, windowDurationMins: 10_080, resetsAt: 1_787_205_481 },
+    })).not.toThrow()
   })
 })

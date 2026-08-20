@@ -19,6 +19,14 @@ export interface UsageWindow {
   durationMins?: number | null
 }
 
+/** 额度快照里单个计量桶(read 端点 rateLimitsByLimitId 的一个条目)。 */
+export interface UsageBucket {
+  limitId: string
+  limitName: string | null
+  fiveHour: UsageWindow | null
+  weekly: UsageWindow | null
+}
+
 export type UsageSnapshot =
   | { state: 'no_credentials' }
   | { state: 'auth_failed' }
@@ -29,6 +37,10 @@ export type UsageSnapshot =
       subscriptionType?: string
       fiveHour: UsageWindow | null
       weekly: UsageWindow | null
+      /** read 端点全量桶 map(按服务端 limitId 键控)。权威状态,每次 read 整体替换。 */
+      buckets?: UsageBucket[]
+      /** 服务端在 read 响应里指定的默认桶 limitId(顶层 rateLimits 指针)。 */
+      defaultLimitId?: string
       fetchedAt: number
     }
 
@@ -112,42 +124,68 @@ function windowFromRateLimit(w: any): UsageWindow | null {
   }
 }
 
-/** 窗口归类:codex 不保证 primary/secondary 位置语义 —— Prolite 等套餐把
- * 唯一的周窗口塞在 primary(secondary=null),Plus/Pro 才是 primary=5h +
- * secondary=周。按 windowDurationMins 真实时长归类(300→5h,10080→周),
- * 位置只作 fallback(时长缺失时)。 */
+/** 窗口归类:按 windowDurationMins 真实时长归类(短窗→5h 档,周量级→weekly),
+ * 位置只作 fallback。不硬编码"当前套餐必然 300/10080"——只把时长最接近
+ * 5h 量级的认作 fiveHour,其余(含缺失时长)按 primary/secondary 位置。 */
 function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: UsageWindow | null } {
   const primary = windowFromRateLimit(limits?.primary)
   const secondary = windowFromRateLimit(limits?.secondary)
-  const byDuration = (w: UsageWindow | null, mins: number): boolean =>
-    w?.durationMins === mins
-  if (byDuration(primary, 10_080) && byDuration(secondary, 300)) {
-    // 未见过的倒挂形态(primary=周、secondary=5h),按时长纠正
-    return { fiveHour: secondary, weekly: primary }
-  }
-  if (byDuration(primary, 10_080) && !secondary) {
-    // Prolite 形态:唯一的周窗口在 primary
-    return { fiveHour: null, weekly: primary }
-  }
-  if (byDuration(primary, 300) || (!primary?.durationMins && primary)) {
-    // 常规 Plus/Pro:primary=5h;或时长缺失按位置
-    return { fiveHour: primary, weekly: secondary }
-  }
-  // primary 是其他时长(如自定义 individualLimit):按位置保守处理
+  const isShort = (w: UsageWindow | null): boolean =>
+    w?.durationMins != null && w.durationMins > 0 && w.durationMins <= 720
+  const isLong = (w: UsageWindow | null): boolean =>
+    w?.durationMins != null && w.durationMins > 720
+  if (isShort(primary) && isLong(secondary)) return { fiveHour: primary, weekly: secondary }
+  if (isShort(secondary) && isLong(primary)) return { fiveHour: secondary, weekly: primary }
+  if (isLong(primary) && !secondary) return { fiveHour: null, weekly: primary }
+  if (isLong(secondary) && !primary) return { fiveHour: null, weekly: secondary }
+  // 时长缺失或均为短窗:按位置(primary=5h 档,secondary=周)
   return { fiveHour: primary, weekly: secondary }
 }
 
-
-export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
-  if (!rateLimits) return cache ?? { state: 'network', reason: 'empty rate limit update' }
-  const snapshot: UsageSnapshotOk = {
-    state: 'ok',
-    subscriptionType: rateLimits.planType,
-    ...classifyWindows(rateLimits),
-    fetchedAt: Date.now(),
+/** read 端点响应 → 桶列表。空形态(has neither window)跳过,保持 map 干净。 */
+function bucketsFromReadResponse(limitsRes: any): { buckets: UsageBucket[]; defaultLimitId: string | undefined } {
+  const byId = limitsRes?.rateLimitsByLimitId
+  const entryList: [string, any][] = byId && typeof byId === 'object'
+    ? Object.entries(byId)
+    : limitsRes?.rateLimits ? [[limitsRes.rateLimits.limitId ?? 'codex', limitsRes.rateLimits]] : []
+  const buckets: UsageBucket[] = []
+  for (const [id, raw] of entryList) {
+    const { fiveHour, weekly } = classifyWindows(raw)
+    if (!fiveHour && !weekly) continue
+    buckets.push({ limitId: id, limitName: raw?.limitName ?? null, fiveHour, weekly })
   }
-  cache = snapshot
-  return snapshot
+  return { buckets, defaultLimitId: limitsRes?.rateLimits?.limitId ?? undefined }
+}
+
+/** 通知负载的形态签名,只用于日志(归属判断不可信,2026-08-20 源码核实:
+ * 上游 SSE/WS 事件缺 metered_limit_name 时客户端解析器把 limitId 强补
+ * "codex" —— Spark 桶的内容会被贴上主桶标签)。 */
+function describeNotification(rateLimits: any): string {
+  if (!rateLimits) return 'empty'
+  const w = (x: any): string => x ? `${x.usedPercent ?? '?'}%/${x.windowDurationMins ?? '?'}m` : 'null'
+  return `limitId=${rateLimits.limitId ?? 'null'} name=${rateLimits.limitName ?? 'null'} primary=${w(rateLimits.primary)} secondary=${w(rateLimits.secondary)}`
+}
+
+/** rolling 通知的观察日志:记录通知形态,并和 cache 里已知桶对比。通知
+ * limitId 与内容可能错标(见 describeNotification),只用于异常可见性,
+ * 不写 cache —— 权威状态只来自 readUsage 的 read 端点(整体替换)。 */
+export function observeRateLimitsNotification(rateLimits: any): void {
+  const desc = describeNotification(rateLimits)
+  const known = cache?.state === 'ok' ? (cache.buckets ?? []) : []
+  const matches = known.filter(b =>
+    windowsEqual(b.fiveHour, windowFromRateLimit(rateLimits?.primary))
+    && windowsEqual(b.weekly, windowFromRateLimit(rateLimits?.secondary)))
+  if (known.length > 0 && matches.length === 0) {
+    log(`usage: rate-limit notification matches NO known bucket — possible relabel or new bucket, will resolve on next read. (${desc})`)
+  } else if (rateLimits?.limitId && matches.length === 1 && matches[0].limitId !== rateLimits.limitId) {
+    log(`usage: rate-limit notification labeled limitId=${rateLimits.limitId} but content matches bucket ${matches[0].limitId} (known codex parser fallback relabels; ignoring notification payload)`)
+  }
+}
+
+function windowsEqual(a: UsageWindow | null, b: UsageWindow | null): boolean {
+  if (!a || !b) return !a && !b
+  return a.percent === b.percent && a.durationMins === b.durationMins
+    && a.resetsAt?.getTime() === b.resetsAt?.getTime()
 }
 
 async function fetchUsage(): Promise<UsageSnapshot> {
@@ -164,14 +202,7 @@ async function fetchUsage(): Promise<UsageSnapshot> {
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
     const limitsRes = await withTimeout(app.request('account/rateLimits/read', {}), API_TIMEOUT_MS)
-    const limits = limitsRes?.rateLimitsByLimitId?.codex ?? limitsRes?.rateLimits
-    if (!limits) return { state: 'network', reason: 'empty rate limit response' }
-    return {
-      state: 'ok',
-      subscriptionType: account.planType ?? limits.planType ?? 'chatgpt',
-      ...classifyWindows(limits),
-      fetchedAt: Date.now(),
-    }
+    return snapshotFromReadResponse(limitsRes, account.planType)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
     return { state: 'network', reason: e?.message ?? String(e) }
@@ -180,11 +211,25 @@ async function fetchUsage(): Promise<UsageSnapshot> {
   }
 }
 
-/** 读最近一次 usage cache,不触发 fetch。给 turn footer 用 —— codex turn
- * 中 `updateUsageFromRateLimits` 已把当轮 rateLimit 写进 cache,这里直接
- * 复用,避免每轮 turn 都为拿一个百分比去 spawn 一个 codex app-server
- * 子进程(readUsage 的代价)。cache 为空(turn 中没收到 rateLimit)返回 null,
- * 调用方按 no_fallbacks 省略 5h 段。 */
+/** read 端点响应 → 权威快照。默认桶跟随服务端顶层 rateLimits 指针;
+ * 桶 map 整体替换(OpenAI 加/删桶自动跟上)。 */
+export function snapshotFromReadResponse(limitsRes: any, planType?: string | null): UsageSnapshot {
+  const { buckets, defaultLimitId } = bucketsFromReadResponse(limitsRes)
+  const def = buckets.find(b => b.limitId === defaultLimitId) ?? buckets[0]
+  if (!def) return { state: 'network', reason: 'empty rate limit response' }
+  return {
+    state: 'ok',
+    subscriptionType: planType ?? def.limitName ?? limitsRes?.rateLimits?.planType ?? 'chatgpt',
+    fiveHour: def.fiveHour,
+    weekly: def.weekly,
+    buckets,
+    defaultLimitId: def.limitId,
+    fetchedAt: Date.now(),
+  }
+}
+
+/** 读最近一次 usage cache,不触发 fetch。给 turn footer 用 —— cache 为空
+ * (turn 中没收到 rateLimit)返回 null,调用方按 no_fallbacks 省略 5h 段。 */
 export function peekUsage(): UsageSnapshot | null {
   return cache
 }
@@ -206,3 +251,25 @@ export async function readUsage(): Promise<UsageSnapshot> {
     })
   return inFlight
 }
+
+/** 用现有 codex app-server 连接拉权威快照并整体替换 cache。给 turn 收尾
+ * 用(通知只当失效信号):不 spawn 新进程,毫秒级;失败返回 null 让
+ * 调用方省略额度段(no_fallbacks,不拿旧值冒充——cache 保留但 footer
+ * 按调用方约定处理)。 */
+export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>): Promise<UsageSnapshot | null> {
+  refreshInFlight ??= withTimeout(request('account/rateLimits/read', {}), API_TIMEOUT_MS)
+    .then((limitsRes: any) => {
+      const snap = snapshotFromReadResponse(limitsRes)
+      if (snap.state === 'ok') cache = snap
+      else log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
+      return snap
+    })
+    .catch((e: any) => {
+      log(`usage: refresh from connection failed: ${e?.message ?? e}`)
+      return null
+    })
+    .finally(() => { refreshInFlight = null })
+  return refreshInFlight
+}
+
+let refreshInFlight: Promise<UsageSnapshot | null> | null = null

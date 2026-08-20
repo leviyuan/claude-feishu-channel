@@ -10,7 +10,7 @@ const cardkit = await import('./cardkit')
 const { config } = await import('./config')
 const { resetTokenSourceRegistry } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
-const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
+const { peekUsage, refreshUsageFromConnection } = await import('./usage')
 
 const DETERMINISTIC_FOOTER_HANDLE = 0xdeadbeef as unknown as ReturnType<typeof setTimeout>
 
@@ -1072,26 +1072,30 @@ describe('Session claude subagent tool calls stay off the main card', () => {
 })
 
 describe('Session usage cache cross-backend isolation', () => {
-  test('claude 的 rate_limit_event payload 不得覆盖 codex 用量缓存', () => {
-    // 先用一条 codex 形状的 payload 播种缓存(模块级单例)。
-    const seeded = updateUsageFromRateLimits({
-      planType: 'plus',
-      primary: { usedPercent: 42, resetsAt: 1_700_000_000, windowDurationMins: 300 },
-    })
-    expect(seeded.state).toBe('ok')
+  test('claude 的 rate_limit_event payload 不触碰 codex 用量缓存', async () => {
+    // 用 read 端点形状经真实 cache 写入路径(refresh)播种缓存(模块级单例)。
+    const seeded = await refreshUsageFromConnection(async () => ({
+      rateLimits: {
+        limitId: 'codex', planType: 'plus',
+        primary: { usedPercent: 42, resetsAt: 1_700_000_000, windowDurationMins: 300 },
+        secondary: null,
+      },
+    }))
+    expect(seeded?.state).toBe('ok')
 
     const session = new Session('probe', 'chat_id') as any
     const claudeProc = new FakeAgentProc('claude')
     session.wireProc(claudeProc)
-    // claude 的 rate_limit_info 形状(无 planType/primary/secondary):
-    // truthy 但与 codex 完全不同,穿过共享 handler 会被包成空窗口 ok 快照。
+    // claude 的 rate_limit_info 形状(无 planType/primary/secondary):truthy 但
+    // 与 codex 完全不同。新架构下通知一律不写 cache(rolling limitId 不可信),
+    // claude 事件更不能。
     claudeProc.emit('rate_limits_updated', { status: 'allowed', unified_status: 'allowed' })
 
     // 缓存对象必须原封不动(恒等,而非结构相等)。
     expect(peekUsage()).toBe(seeded)
   })
 
-  test('codex 的 rate_limits_updated 照常更新用量缓存', () => {
+  test('codex 的 rate_limits_updated 只观察不写缓存(权威在 read 端点)', () => {
     const session = new Session('probe', 'chat_id') as any
     const codexProc = new FakeAgentProc('codex')
     session.wireProc(codexProc)
@@ -1100,10 +1104,11 @@ describe('Session usage cache cross-backend isolation', () => {
       primary: { usedPercent: 7, resetsAt: 1_700_000_000, windowDurationMins: 300 },
     })
 
+    // rolling 通知不再驱动 cache —— 2026-08-20 源码核实 codex 解析器在
+    // 上游缺 metered_limit_name 时把 limitId 强补 "codex",通知归属不可信;
+    // turn 收尾由 closeTurnCard 在现有连接 read 端点整体刷新。
     const snap = peekUsage() as any
-    expect(snap?.state).toBe('ok')
-    expect(snap?.subscriptionType).toBe('pro')
-    expect(snap?.fiveHour?.percent).toBe(7)
+    expect(snap?.fiveHour?.percent).not.toBe(7)
   })
 
   test('双窗口额度后缀(codex/GLM 共用):5h 倒计时·% + 方括号周窗口;缺周数据退回纯 5h 段', () => {

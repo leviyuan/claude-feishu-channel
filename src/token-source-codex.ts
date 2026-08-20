@@ -44,6 +44,21 @@ function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
   return { state: 'ok', planLabel: s.subscriptionType, windows, fetchedAt: s.fetchedAt }
 }
 
+/** read 端点全量桶列表 → unified(console `hi` 面板可显示非默认桶,如 Spark
+ *  附加包)。空桶列表(旧快照/读取失败)返回 null,调用方省略。 */
+export function codexBucketsToUnified(s: UsageSnapshot): UsageWindowUnified[] | null {
+  if (s.state !== 'ok' || !s.buckets?.length) return null
+  const out: UsageWindowUnified[] = []
+  for (const b of s.buckets) {
+    const label = b.limitId === s.defaultLimitId
+      ? (b.limitName ?? '默认配额')
+      : (b.limitName ?? b.limitId)
+    if (b.fiveHour) out.push(windowToUnified(b.fiveHour, 'fiveHour', `${label} 5h`))
+    if (b.weekly) out.push(windowToUnified(b.weekly, 'weekly', `${label} 周`))
+  }
+  return out.length ? out : null
+}
+
 /** codex 本地登录态:~/.codex/auth.json 存在即视为已配置(廉价同步信号;
  *  订阅是否有效在 account/rateLimits 查询时如实暴露 MISS)。 */
 function codexLoggedIn(): boolean {
@@ -94,7 +109,13 @@ registerTokenSourceFactory({
         return model
       },
       async readUsage(): Promise<UsageSnapshotUnified> {
-        return codexUsageToUnified(await readUsage())
+        const snap = await readUsage()
+        const unified = codexUsageToUnified(snap)
+        // 多桶透出:read 端点全量桶(如 Spark 附加包)在 console 额度行各占一行,
+        // 服务端加/删桶自动跟进;单桶账号行为不变(就是默认桶的 5h+周)。
+        const all = codexBucketsToUnified(snap)
+        if (all) unified.windows = all
+        return unified
       },
     }
     return ts

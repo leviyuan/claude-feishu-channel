@@ -89,6 +89,9 @@ export interface AgentProcess extends EventEmitter {
   setModel(model: string): Promise<void>
   compactThread(): Promise<void>
   injectThreadItems(items: any[]): Promise<void>
+  /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
+   *  claude:无此通道,返回 null(session 的额度走 token source)。 */
+  readRateLimits?(): Promise<any>
 }
 
 export type AgentProcessEventMap = {

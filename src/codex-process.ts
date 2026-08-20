@@ -1080,6 +1080,15 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
+  /** 在本进程的 app-server 连接上读账号额度(read 端点,权威多桶视图)。
+   *  给 turn 收尾刷新 usage cache 用 —— rolling 通知 limitId 不可信
+   *  (2026-08-20 源码核实:上游缺 meter 名时 codex 解析器强补 "codex"),
+   *  额度状态只认 read。须在 initialize 之后调用。 */
+  async readRateLimits(): Promise<any> {
+    await this.readyPromise
+    return this.request('account/rateLimits/read', {})
+  }
+
   private initializeParams(): Record<string, unknown> {
     return {
       clientInfo: { name: 'lodestar', version: '0.0.0' },
