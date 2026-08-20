@@ -26,31 +26,33 @@ import { log } from './log.ts'
 import * as feishu from './feishu.ts'
 
 // ── MathJax/resvg 懒加载单例(首次渲染时初始化) ────────────────────────
-const EM = 18 // 正文 14px 放大一点,卡片里看清细节
-const EX = 9
-let mjx: {
+// MathJax 按 em 排版;inline 与 display 各一套字号单例:
+//   inline  em=14 —— 对齐卡片正文 normal(14px),单字母小图不再撑行
+//   display em=22 —— 独立成段的展示公式稍大,层级清楚
+const EX_RATIO = 0.5 // MathJax 默认 ex = em/2
+let mjxByEm = new Map<number, {
   adaptor: ReturnType<typeof import('mathjax-full/js/adaptors/liteAdaptor.js')['liteAdaptor']>
   doc: ReturnType<typeof import('mathjax-full/js/mathjax.js')['mathjax']['document']>
-} | null = null
-function mathjaxRuntime() {
-  if (mjx) return mjx
+}>()
+function mathjaxRuntime(em: number) {
+  let rt = mjxByEm.get(em)
+  if (rt) return rt
   const { liteAdaptor } = require_('mathjax-full/js/adaptors/liteAdaptor.js')
   const { RegisterHTMLHandler } = require_('mathjax-full/js/handlers/html.js')
   const { mathjax } = require_('mathjax-full/js/mathjax.js')
   const { TeX } = require_('mathjax-full/js/input/tex.js')
   const { AllPackages } = require_('mathjax-full/js/input/tex/AllPackages.js')
   const { SVG } = require_('mathjax-full/js/output/svg.js')
-  const adaptor = liteAdaptor({ fontSize: EM })
+  const adaptor = liteAdaptor({ fontSize: em })
   RegisterHTMLHandler(adaptor)
   const doc = mathjax.document('', { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: 'none' }) })
-  mjx = { adaptor, doc }
-  return mjx
+  rt = { adaptor, doc }
+  mjxByEm.set(em, rt)
+  return rt
 }
 
 /** 飞书卡片正文默认文字色(浅色主题 near-black,深色主题由卡片底色衬底)。 */
 const INK = '#1F2329'
-/** PNG 放大倍数:ex→px 后 ×3,对抗卡片图片压缩后的锯齿。 */
-const SCALE = 3
 
 /** CJK(含全角符号/假名/谚文)+ 常用非拉丁(Greek/Cyrillic 也占位换掉,
  *  MathJax 对部分 Greek 有字形、Cyrillic 没有,统一走系统字体最稳)。 */
@@ -89,33 +91,44 @@ function swapStashedPaths(svg: string, map: Stash['map']): string {
   })
 }
 
-/** TeX 源码 → PNG bytes。渲染失败(MathJax 报错/无 TeX 特征)返回 null。 */
-export function renderTeXToPNG(texSrc: string): { png: Uint8Array } | null {
+/** TeX 源码 → PNG bytes。em 控制排版字号(display=22 展示级);fitTo 按
+ *  ex→px 目标宽光栅化。返回 PNG 及其真实像素尺寸(从 IHDR 读 —— resvg
+ *  实例的 width/height 属性是默认视口,不反映 fitTo 后的真实输出)。
+ *  渲染失败(MathJax 报错)返回 null。 */
+export function renderTeXToPNG(texSrc: string, em = 22, display = true): { png: Uint8Array; width: number; height: number } | null {
   try {
-    const { adaptor, doc } = mathjaxRuntime()
+    const ex = em * EX_RATIO
+    const { adaptor, doc } = mathjaxRuntime(em)
     const { src, map } = stashNonLatin(texSrc)
-    const node = doc.convert(src, { display: true, em: EM, ex: EX, containerWidth: 80 * EM })
+    const node = doc.convert(src, { display, em, ex, containerWidth: 80 * em })
     let markup = adaptor.outerHTML(node)
     // liteAdaptor 输出裹一层 <mjx-container>,resvg 只要 <svg> 根。
     markup = markup.replace(/^[\s\S]*?(<svg\b)/, '$1').replace(/<\/svg>[\s\S]*$/, '</svg>')
     if (map.length) markup = swapStashedPaths(markup, map)
     const svgTag = markup.match(/<svg[^>]*>/)?.[0] ?? ''
     const wex = parseFloat(svgTag.match(/ width="([\d.]+)ex"/)?.[1] ?? '0')
-    const hex_ = parseFloat(svgTag.match(/ height="([\d.]+)ex"/)?.[1] ?? '0')
     // MathJax svg 自带 style 属性,resvg 拒重复定义 → 追加而非新增。
     const colored = markup
       .replace(/(<svg\b[^>]*style="[^"]*)"/, `$1; color:${INK}"`)
       .replace(/currentColor/g, INK)
     const { Resvg } = require_('@resvg/resvg-js') as typeof import('@resvg/resvg-js')
+    // 超采样:按 3 倍宽出图(矢量内部光栅化密度高),渲染出的 PNG 尺寸
+    // 即最终显示尺寸,3 倍宽会撑大卡片 —— resvg 的 fitTo 在光栅化时缩放,
+    // 不是 CSS 缩放,所以这里超采样思路只作用于矢量精度:
+    // 直接以目标宽(1x)光栅化,字号小时曲线锯齿由 resvg 亚像素抗锯齿兜。
+    const targetW = Math.max(1, Math.round(wex * ex))
     const resvg = new Resvg(colored, {
       font: {
         loadSystemFonts: true,
         serifFamily: 'Noto Serif CJK SC',
         sansSerifFamily: 'Noto Sans CJK SC',
       },
-      fitTo: { mode: 'width', value: Math.max(1, Math.ceil(wex * EX * SCALE)) },
+      fitTo: { mode: 'width', value: targetW },
     })
-    return { png: resvg.render().asPng() }
+    const png = resvg.render().asPng()
+    // 真实输出尺寸从 PNG IHDR 读(字节 16-23:width/height big-endian uint32)
+    const dv = new DataView(png.buffer, png.byteOffset, png.byteLength)
+    return { png, width: dv.getUint32(16), height: dv.getUint32(20) }
   } catch (e) {
     log(`math-render: TeX→PNG failed for ${texSrc.slice(0, 60)}…: ${e}`)
     return null
@@ -166,54 +179,150 @@ function fnv1a(s: string): string {
   return (h >>> 0).toString(36)
 }
 
-async function uploadTeX(tex: string): Promise<string | null> {
-  const h = fnv1a(tex)
-  const cached = keyCache.get(h)
-  if (cached) return cached
-  const failedAt = failedHashes.get(h)
+/** 一个已渲染公式图:img 组件元素 + 在段内的锚序号(第几个公式)。 */
+export interface RenderedFormulaImg {
+  /** 飞书 img 组件 JSON(tag=img + crop_center + 精确 size)。调用方按
+   *  锚序号紧贴对应 markdown 段后插入卡片。 */
+  element: object
+  /** 段内序号:本段第几个公式图,插入顺序锚。 */
+  index: number
+}
+
+async function uploadTeX(tex: string): Promise<{ key: string; w: number; h: number } | null> {
+  // 缓存键带字号版本前缀:字号策略改版后旧缓存(不同 em)不命中,防错尺寸
+  const h_ = fnv1a('v2:' + tex)
+  const cached = keyCache.get(h_)
+  if (cached) return JSON.parse(cached)
+  const failedAt = failedHashes.get(h_)
   if (failedAt !== undefined) {
     if (Date.now() - failedAt < FAIL_TTL_MS) return null
-    failedHashes.delete(h)
+    failedHashes.delete(h_)
   }
-  const rendered = renderTeXToPNG(tex)
-  if (!rendered) { failedHashes.set(h, Date.now()); return null }
-  // resvg 产 PNG bytes,直接 multipart 上传(不经临时文件)。飞书 im/v1/images
-  // 收 image_type=message + 二进制;文件名带 .png 后缀供服务端嗅探。
-  const tmp = `${import.meta.dir}/../../.math-tmp-${h}.png`
+  const rendered = renderTeXToPNG(tex, 22, true)
+  if (!rendered) { failedHashes.set(h_, Date.now()); return null }
+  const tmp = `${import.meta.dir}/../../.math-tmp-${h_}.png`
   try {
     await Bun.write(tmp, rendered.png)
     const key = await feishu.uploadImageKey(tmp)
-    if (key) keyCache.set(h, key)
-    else failedHashes.set(h, Date.now())
-    return key
+    if (key) {
+      const dims = { key, w: rendered.width, h: rendered.height }
+      keyCache.set(h_, JSON.stringify(dims))
+      return dims
+    }
+    failedHashes.set(h_, Date.now())
+    return null
   } finally {
     await Bun.file(tmp).delete().catch(() => {})
   }
 }
 
-/** 把一段 assistant 文本里的公式替换成 ![公式](img_key)。渲染/上传失败
- *  的公式原样保留(后续 sanitize 降级成代码块,可见、不造假)。 */
-export async function renderMathInText(text: string): Promise<string> {
+/** Unicode 转写:inline 公式(\(…\))留在文字流里。飞书 markdown 的
+ *  ![alt](img_key) 会撑满卡片宽,没有可控的内联图;简单 inline 式子
+ *  (单符号 / β=0.25 / N=P+F−C−R)转 Unicode 文本零突兀。转不动的
+ *  (\frac/矩阵/积分)退回 display 渲染成图。 */
+const GREEK: Record<string, string> = {
+  alpha:'α',beta:'β',gamma:'γ',delta:'δ',epsilon:'ε',zeta:'ζ',eta:'η',theta:'θ',
+  iota:'ι',kappa:'κ',lambda:'λ',mu:'μ',nu:'ν',xi:'ξ',pi:'π',rho:'ρ',sigma:'σ',
+  tau:'τ',phi:'φ',chi:'χ',psi:'ψ',omega:'ω',Gamma:'Γ',Delta:'Δ',Theta:'Θ',
+  Lambda:'Λ',Pi:'Π',Sigma:'Σ',Phi:'Φ',Psi:'Ψ',Omega:'Ω',
+}
+function unicodeMathify(tex: string): string | null {
+  let s = tex
+  // \text{…} → 原文(CJK/常规词直接露出)
+  s = s.replace(/\\text\{([^}]*)\}/g, '$1')
+  // \left \right 定界符命令先剥(留括号本体)
+  s = s.replace(/\\left\s*/g, '').replace(/\\right\s*/g, '')
+  // 希腊字母与运算符
+  s = s.replace(/\\([A-Za-z]+)\b/g, (m, name: string) => {
+    if (GREEK[name]) return GREEK[name]
+    if (name === 'times') return '×'
+    if (name === 'cdot') return '·'
+    if (name === 'div') return '÷'
+    if (name === 'pm') return '±'
+    if (name === 'leq' || name === 'le') return '≤'
+    if (name === 'geq' || name === 'ge') return '≥'
+    if (name === 'neq' || name === 'ne') return '≠'
+    if (name === 'approx') return '≈'
+    if (name === 'sim') return '~'
+    if (name === 'infty') return '∞'
+    if (name === 'partial') return '∂'
+    if (name === 'nabla') return '∇'
+    if (name === 'sqrt') return '√'
+    if (name === 'to') return '→'
+    return m // 认不得的命令 → 整体转写失败信号
+  })
+  // 还有残留 TeX 命令(\frac \sum \int \begin …)→ 转写失败,提级 display 图
+  if (/\\[A-Za-z]/.test(s)) return null
+  // ^{…}/_{…} 平写成 ^x / _x
+  s = s.replace(/\^\{([^}]+)\}/g, '^$1').replace(/_\{([^}]+)\}/g, '_$1')
+  return s
+}
+
+/** 渲染一段 assistant 文本:display 公式($$…$$ / \[…\])从文本中摘出、
+ *  渲染成 img 元素列表返回(调用方按序紧贴本段 markdown 后插入卡片),
+ *  摘出后的文本继续走正常 sanitize;inline 公式(\(…\))Unicode 转写
+ *  留在文字流,转写失败(复杂结构)的 inline 提级为 display 图。
+ *  渲染/上传失败的 display 公式保留原码(可见降级,不吞内容)。 */
+export async function renderMathInText(
+  text: string,
+): Promise<{ text: string; formulaImgs: RenderedFormulaImg[] }> {
   const spans = findMathSpans(text)
-  if (!spans.length) return text
+  const formulaImgs: RenderedFormulaImg[] = []
+  if (!spans.length) return { text, formulaImgs }
   let out = ''
   let last = 0
+  let imgIdx = 0
   for (const span of spans) {
-    if (span.start < last) continue // 重叠(不该发生)防御
+    if (span.start < last) continue
     out += text.slice(last, span.start)
-    const key = await uploadTeX(span.tex)
-    if (key) {
-      const imgMd = `![formula](${key})`
-      out += span.display ? `\n\n${imgMd}\n\n` : imgMd
+    if (span.display) {
+      const dims = await uploadTeX(span.tex)
+      if (dims) {
+        formulaImgs.push({
+          element: {
+            tag: 'img',
+            img_key: dims.key,
+            alt: { tag: 'plain_text', content: span.tex.slice(0, 40) },
+            scale_type: 'crop_center',
+            size: `${dims.w}px ${dims.h}px`,
+            preview: false,
+          },
+          index: imgIdx++,
+        })
+        out += '\n\n'
+      } else {
+        out += text.slice(span.start, span.end) // 失败保留原码
+      }
     } else {
-      // 失败保留原样:display 语法 $$…$$ sanitize 会转代码块,inline
-      // \(…\) 会转行内 code —— 两条路都是可见降级,不吞内容。
-      out += text.slice(span.start, span.end)
+      const uni = unicodeMathify(span.tex)
+      if (uni !== null) out += uni
+      else {
+        // inline 转不动 → 提级 display 图;上传失败保留原码(可见降级)
+        const dims = await uploadTeX(span.tex)
+        if (dims) {
+          formulaImgs.push({
+            element: {
+              tag: 'img',
+              img_key: dims.key,
+              alt: { tag: 'plain_text', content: span.tex.slice(0, 40) },
+              scale_type: 'crop_center',
+              size: `${dims.w}px ${dims.h}px`,
+              preview: false,
+            },
+            index: imgIdx++,
+          })
+          out += ' '
+        } else {
+          out += text.slice(span.start, span.end)
+        }
+        // 注:测试环境无真实凭据时 uploadTeX 返回 null 走原码保留;
+        // 上面的 ' ' 分支只在真图落地时执行。
+      }
     }
     last = span.end
   }
   out += text.slice(last)
-  return out
+  return { text: out.trim(), formulaImgs }
 }
 
 /** 同步探测:文本是否含公式(调用方决定是否走 async 渲染路径)。 */
@@ -222,4 +331,4 @@ export function hasMathSpans(text: string): boolean {
 }
 
 /** 确定性渲染(不经上传),给测试用。 */
-export const __test = { findMathSpans, stashNonLatin, swapStashedPaths, renderTeXToPNG }
+export const __test = { findMathSpans, stashNonLatin, swapStashedPaths, renderTeXToPNG, unicodeMathify }

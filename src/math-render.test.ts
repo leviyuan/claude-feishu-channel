@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { __test, hasMathSpans } from './math-render.ts'
+import { __test, hasMathSpans, renderMathInText } from './math-render.ts'
 
 const { findMathSpans, stashNonLatin, renderTeXToPNG } = __test
 
@@ -80,5 +80,30 @@ describe('renderTeXToPNG', () => {
     // 真正的 throw 路径(解析崩溃)才返回 null。
     const r = renderTeXToPNG('\\begin{nope}')
     expect(r).not.toBeNull()
+  })
+})
+
+describe('unicodeMathify', () => {
+  test('希腊字母/运算符转写', () => {
+    expect(__test.unicodeMathify('\\beta = 0.25')).toBe('β = 0.25')
+    expect(__test.unicodeMathify('a \\times b \\cdot c')).toBe('a × b · c')
+  })
+  test('\\text 剥壳、上下标平写', () => {
+    expect(__test.unicodeMathify('\\text{评分} = S_{net}')).toBe('评分 = S_net')
+    expect(__test.unicodeMathify('E^{2}')).toBe('E^2')
+  })
+  test('\\left\\right 剥壳后括号保留', () => {
+    expect(__test.unicodeMathify('\\left(1 + \\beta\\right)')).toBe('(1 + β)')
+  })
+  test('复杂命令(\\frac)转写失败返回 null', () => {
+    expect(__test.unicodeMathify('\\frac{a}{b}')).toBeNull()
+  })
+})
+
+describe('renderMathInText(inline 转写路径,不触上传)', () => {
+  test('inline 简单式子全部转写为纯文本', async () => {
+    const { text, formulaImgs } = await renderMathInText('其中 \\(S\\) 是评分,\\(\\beta = 0.25\\) 是系数')
+    expect(text).toBe('其中 S 是评分,β = 0.25 是系数')
+    expect(formulaImgs).toHaveLength(0)
   })
 })
