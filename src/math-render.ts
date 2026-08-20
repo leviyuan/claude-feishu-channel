@@ -15,25 +15,37 @@
  * (走既有 downgradeMathBlocksInProse 的代码块降级),并 log 暴露 ——
  * 不悄悄吞、不造假图。
  */
-import { mathjax } from 'mathjax-full/js/mathjax.js'
-import { TeX } from 'mathjax-full/js/input/tex.js'
-import { SVG } from 'mathjax-full/js/output/svg.js'
-import { AllPackages } from 'mathjax-full/js/input/tex/AllPackages.js'
-import { RegisterHTMLHandler } from 'mathjax-full/js/handlers/html.js'
-import { liteAdaptor } from 'mathjax-full/js/adaptors/liteAdaptor.js'
-import { Resvg } from '@resvg/resvg-js'
+// mathjax-full / @resvg/resvg-js 全部延迟到首次渲染时 require(不顶层
+// import):resvg 是 native .node,顶层 import 会让 bun --target=node 的
+// 单文件 build 试图内联 .node asset 而拒绝 outfile 模式;Node 发布包在
+// 运行时从 node_modules 正常加载,native 包走 npm deps 分发。
+import { createRequire } from 'node:module'
+const require_ = createRequire(import.meta.url)
 
 import { log } from './log.ts'
 import * as feishu from './feishu.ts'
 
-// ── MathJax 单例(进程级,init 一次) ─────────────────────────────────
+// ── MathJax/resvg 懒加载单例(首次渲染时初始化) ────────────────────────
 const EM = 18 // 正文 14px 放大一点,卡片里看清细节
 const EX = 9
-const adaptor = liteAdaptor({ fontSize: EM })
-RegisterHTMLHandler(adaptor)
-const texJax = new TeX({ packages: AllPackages })
-const svgJax = new SVG({ fontCache: 'none' })
-const mjxDoc = mathjax.document('', { InputJax: texJax, OutputJax: svgJax })
+let mjx: {
+  adaptor: ReturnType<typeof import('mathjax-full/js/adaptors/liteAdaptor.js')['liteAdaptor']>
+  doc: ReturnType<typeof import('mathjax-full/js/mathjax.js')['mathjax']['document']>
+} | null = null
+function mathjaxRuntime() {
+  if (mjx) return mjx
+  const { liteAdaptor } = require_('mathjax-full/js/adaptors/liteAdaptor.js')
+  const { RegisterHTMLHandler } = require_('mathjax-full/js/handlers/html.js')
+  const { mathjax } = require_('mathjax-full/js/mathjax.js')
+  const { TeX } = require_('mathjax-full/js/input/tex.js')
+  const { AllPackages } = require_('mathjax-full/js/input/tex/AllPackages.js')
+  const { SVG } = require_('mathjax-full/js/output/svg.js')
+  const adaptor = liteAdaptor({ fontSize: EM })
+  RegisterHTMLHandler(adaptor)
+  const doc = mathjax.document('', { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: 'none' }) })
+  mjx = { adaptor, doc }
+  return mjx
+}
 
 /** 飞书卡片正文默认文字色(浅色主题 near-black,深色主题由卡片底色衬底)。 */
 const INK = '#1F2329'
@@ -80,8 +92,9 @@ function swapStashedPaths(svg: string, map: Stash['map']): string {
 /** TeX 源码 → PNG bytes。渲染失败(MathJax 报错/无 TeX 特征)返回 null。 */
 export function renderTeXToPNG(texSrc: string): { png: Uint8Array } | null {
   try {
+    const { adaptor, doc } = mathjaxRuntime()
     const { src, map } = stashNonLatin(texSrc)
-    const node = mjxDoc.convert(src, { display: true, em: EM, ex: EX, containerWidth: 80 * EM })
+    const node = doc.convert(src, { display: true, em: EM, ex: EX, containerWidth: 80 * EM })
     let markup = adaptor.outerHTML(node)
     // liteAdaptor 输出裹一层 <mjx-container>,resvg 只要 <svg> 根。
     markup = markup.replace(/^[\s\S]*?(<svg\b)/, '$1').replace(/<\/svg>[\s\S]*$/, '</svg>')
@@ -93,6 +106,7 @@ export function renderTeXToPNG(texSrc: string): { png: Uint8Array } | null {
     const colored = markup
       .replace(/(<svg\b[^>]*style="[^"]*)"/, `$1; color:${INK}"`)
       .replace(/currentColor/g, INK)
+    const { Resvg } = require_('@resvg/resvg-js') as typeof import('@resvg/resvg-js')
     const resvg = new Resvg(colored, {
       font: {
         loadSystemFonts: true,
