@@ -98,6 +98,11 @@ export interface TurnState {
   // [[send: /path]] markers and replace each segment with a cleaned
   // version, then post the files as separate Feishu messages.
   segmentTexts: Map<string, string>
+  /** Segments already replaced by math rendering (stripped text + inserted
+   *  formula imgs). closeTurnCard's final re-render pass must skip these —
+   *  re-replacing from raw text would clobber the rendered version back to
+   *  degraded $$…$$ source. */
+  mathRenderedSegments?: Set<string>
   startedAt: number
   /** Footer phase timer. `Thinking` is model silence, `Writing` is buffered
    * assistant text, and `Working` is tool execution / visible non-text work. */

@@ -2644,6 +2644,8 @@ export class Session {
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
+        // 段 id 在新卡重编号,旧渲染标记清空;迁移段重新走渲染(或保持原码)。
+        turn.mathRenderedSegments = new Set()
         if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
         // 先在新卡重建实时任务总览区(紧贴 footer)。必须在 assistant/tool 重建
@@ -3000,7 +3002,9 @@ export class Session {
 
   /** 公式渲染后的段替换 + 后续公式图插入:display 公式从段文本摘出渲染成
    *  img 元素(精确尺寸,不撑卡宽),段 markdown 替换为摘出后的文本,公式
-   *  图按序紧贴段后插入。inline 公式 Unicode 转写留在文本里。 */
+   *  图按序插在自己所属段元素正后方(insert_after segId —— 不能插
+   *  taskLiveAnchor,多段轮里后续段落会把先插的图顶到段落流末尾)。
+   *  inline 公式 Unicode 转写留在文本里。 */
   private async replaceSegmentWithMathImgs(turn: TurnState, segId: string, text: string): Promise<void> {
     const { text: stripped, formulaImgs } = await mathRender.renderMathInText(text)
     await cardkit.replaceElement(turn.cardId, segId, {
@@ -3008,11 +3012,19 @@ export class Session {
       element_id: segId,
       content: this.cleanAssistantTextForDisplay(stripped).trim() || ' ',
     })
+    let anchor = segId
     for (const img of formulaImgs) {
+      const imgEl = img.element as { element_id?: string }
+      const imgId = imgEl.element_id ?? `math_${segId}_${img.index}`
+      imgEl.element_id = imgId
       await cardkit.addElement(turn.cardId, img.element, {
-        type: 'insert_before', targetElementId: sessionTools.taskLiveAnchor(turn),
+        type: 'insert_after', targetElementId: anchor,
       })
+      anchor = imgId // 第 N 张图插在第 N-1 张后,保持段内顺序
     }
+    // 标记本段已渲染:closeTurnCard 的收尾重渲不得用原文覆盖渲染版
+    turn.mathRenderedSegments ??= new Set()
+    turn.mathRenderedSegments.add(segId)
   }
 
   private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<void> {
@@ -3230,9 +3242,11 @@ export class Session {
     }
 
     // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
-    // 这里只是收尾重渲兜住异常路径(公式图片在 add 时已回填,重渲走同一
-    // cleanAssistantTextForDisplay,![formula](img_key) 原样保留)。
+    // 这里只是收尾重渲兜住异常路径 —— 但公式段例外:replaceSegmentWithMathImgs
+    // 已经把段替换成摘出文本 + 紧贴插入公式图,这里再用原文重渲会把渲染版
+    // 覆盖回 $$…$$ 原码降级(代码块占位),图也失去归属段。
     for (const [segId, fullText] of segmentTexts) {
+      if (turn.mathRenderedSegments?.has(segId)) continue
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
     }
 
