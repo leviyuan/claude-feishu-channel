@@ -16,6 +16,11 @@ describe('sanitizeMarkdownForCardKit', () => {
     expect(out).toContain('https://x/y.png')
   })
 
+  test('飞书合法 img_key 的公式图不降级(math-render 回填的 ![formula](img_v2_…))', () => {
+    const md = '评分公式:\n\n![formula](img_v2_abc123XYZ)\n\n完'
+    expect(sanitizeMarkdownForCardKit(md)).toContain('![formula](img_v2_abc123XYZ)')
+  })
+
   test('代码块内的图片语法原样保留(字面量,不解析也不转义)', () => {
     const src = '```\n![](https://x/y.png)\n```'
     expect(sanitizeMarkdownForCardKit(src)).toBe(src)

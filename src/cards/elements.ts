@@ -88,12 +88,15 @@ function escapeHtmlEntities(s: string): string {
  *  (含空格也完整保留,trim 首尾空白)——Card Kit 把 ![alt](url) 解析成
  *  image 并拿 url 当 img_key,外链 URL 会被服务端拒(ErrCode 200570),
  *  导致整张卡 create / 元素 update 失败;降级既不触发 image 解析,又保留
- *  原图地址。 */
+ *  原图地址。已上传的合法 image_key(img_v2_… 等飞书 key 格式)除外 ——
+ *  那是 math-render 回填的公式图,原样保留让卡片渲染成图。 */
+const FEISHU_IMG_KEY_RE = /^img_v[12]_[A-Za-z0-9]+$|^img_[a-z0-9_.-]+$/i
 function downgradeExternalImagesInProse(s: string): string {
   return s.replace(
     /!\[([^\]]*)\]\(([^)]*)\)/g,
-    (_m, alt: string, url: string) => {
+    (m, alt: string, url: string) => {
       const u = url.trim()
+      if (FEISHU_IMG_KEY_RE.test(u)) return m
       return alt.trim() ? `🖼️ ${alt.trim()} (${u})` : `🖼️ ${u}`
     },
   )

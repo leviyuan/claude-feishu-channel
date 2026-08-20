@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.14.8",
+  "version": "0.14.9",
   "publishConfig": {
     "access": "public"
   },
@@ -59,6 +59,8 @@
     "@anthropic-ai/sdk": "^0.104.2",
     "@larksuiteoapi/node-sdk": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "mathjax-full": "^3.2.2",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {

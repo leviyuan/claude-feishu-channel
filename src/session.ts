@@ -68,6 +68,7 @@ import {
 } from './context-window'
 import { extractSendMarkerPaths, normalizeOutboundPath } from './outbound-markers'
 import * as sessionMultimsg from './session-multimsg'
+import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
 import * as sessionTools from './session-tools'
@@ -2670,10 +2671,16 @@ export class Session {
           const ri = turn.assistantSegmentCount++
           const reSegId = cards.ELEMENTS.assistant(ri)
           turn.segmentTexts.set(reSegId, fullText)
+          // 同步入队原文占位,公式渲染完成后异步 replace(与主路径同语义)。
           void cardkit.addElement(newCardId, this.completedAssistantElement(reSegId, fullText), {
             type: 'insert_before',
             targetElementId: sessionTools.taskLiveAnchor(turn),
           })
+          if (mathRender.hasMathSpans(fullText)) {
+            void this.completedAssistantElementWithMath(reSegId, fullText).then(el => {
+              if (el) return cardkit.replaceElement(newCardId, reSegId, el)
+            }).catch(e => log(`session "${this.sessionName}": math render replace ${reSegId} failed: ${e}`))
+          }
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
@@ -2992,12 +2999,35 @@ export class Session {
     }
   }
 
+  /** 公式渲染后的段元素:文本含 TeX 公式时先渲染成图片再构建元素。
+   *  渲染失败由 math-render 内部保留原文,此处无需兜底分支。 */
+  private async completedAssistantElementWithMath(segId: string, text: string): Promise<object | null> {
+    if (!mathRender.hasMathSpans(text)) return null
+    const rendered = await mathRender.renderMathInText(text)
+    return {
+      tag: 'markdown',
+      element_id: segId,
+      content: this.cleanAssistantTextForDisplay(rendered).trim() || ' ',
+    }
+  }
+
   private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<void> {
-    return cardkit.addElement(
+    // 不变式:本函数返回时元素已同步入队 —— closeTurnCard 的最终 replace、
+    // rotation 的 dead-element 判断都依赖它。公式渲染是 async 的(秒级),
+    // 不能推迟入队;先同步上原文(公式段此时是 $$…$$ 原码,sanitize 会降级
+    // 成代码块占位),渲染完成后 replace 成图版。渲染/上传失败时
+    // renderMathInText 原样返回文本,replace 内容与占位一致,无害。
+    const p = cardkit.addElement(
       turn.cardId,
       this.completedAssistantElement(segId, text),
       { type: 'insert_before', targetElementId: sessionTools.taskLiveAnchor(turn) },
     )
+    if (mathRender.hasMathSpans(text)) {
+      void this.completedAssistantElementWithMath(segId, text).then(el => {
+        if (el) return cardkit.replaceElement(turn.cardId, segId, el)
+      }).catch(e => log(`session "${this.sessionName}": math render replace ${segId} failed: ${e}`))
+    }
+    return p
   }
 
   /** 收尾当前 assistant 段:正文不再逐字流式输出,只在完整段收到后
@@ -3198,7 +3228,8 @@ export class Session {
     }
 
     // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
-    // 这里只是收尾重渲兜住异常路径。
+    // 这里只是收尾重渲兜住异常路径(公式图片在 add 时已回填,重渲走同一
+    // cleanAssistantTextForDisplay,![formula](img_key) 原样保留)。
     for (const [segId, fullText] of segmentTexts) {
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
     }
