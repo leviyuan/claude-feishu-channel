@@ -103,6 +103,11 @@ export interface TurnState {
    *  re-replacing from raw text would clobber the rendered version back to
    *  degraded $$…$$ source. */
   mathRenderedSegments?: Set<string>
+  /** In-flight math render promises. closeTurnCard awaits these before the
+   *  final re-render pass — otherwise the raw-text replace wins the race,
+   *  clobbers the (not yet landed) rendered version, and the late render
+   *  writes land on a disposed card. */
+  mathRenderInflight?: Set<Promise<void>>
   startedAt: number
   /** Footer phase timer. `Thinking` is model silence, `Writing` is buffered
    * assistant text, and `Working` is tool execution / visible non-text work. */

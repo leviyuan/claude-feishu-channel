@@ -2645,6 +2645,7 @@ export class Session {
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
         // 段 id 在新卡重编号,旧渲染标记清空;迁移段重新走渲染(或保持原码)。
+        // inflight 不清:旧段渲染 promise 还在写旧卡流程里,close 时仍要等。
         turn.mathRenderedSegments = new Set()
         if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
@@ -2679,8 +2680,11 @@ export class Session {
             targetElementId: sessionTools.taskLiveAnchor(turn),
           })
           if (mathRender.hasMathSpans(fullText)) {
-            void this.replaceSegmentWithMathImgs(turn, reSegId, fullText)
+            const rp = this.replaceSegmentWithMathImgs(turn, reSegId, fullText)
               .catch(e => log(`session "${this.sessionName}": math render ${reSegId} failed: ${e}`))
+            turn.mathRenderInflight ??= new Set()
+            turn.mathRenderInflight.add(rp)
+            void rp.finally(() => turn.mathRenderInflight?.delete(rp))
           }
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
@@ -3007,6 +3011,14 @@ export class Session {
    *  inline 公式 Unicode 转写留在文本里。 */
   private async replaceSegmentWithMathImgs(turn: TurnState, segId: string, text: string): Promise<void> {
     const { text: stripped, formulaImgs } = await mathRender.renderMathInText(text)
+    // 渲染完成时卡可能已被 closeTurnCard 收尾 dispose(turn close 不等
+    // 这个 fire-and-forget promise)—— 写入会静默死,段留在原文降级态。
+    // cardkit dispose 后队列 resolve 但不写;这里显式查 dead 卡直接放弃,
+    // 并 log 暴露(不静默)。
+    if (cardkit.isDeadElement(turn.cardId, segId)) {
+      log(`session "${this.sessionName}": math render ${segId} landed after card closed — dropped`)
+      return
+    }
     await cardkit.replaceElement(turn.cardId, segId, {
       tag: 'markdown',
       element_id: segId,
@@ -3025,6 +3037,7 @@ export class Session {
     // 标记本段已渲染:closeTurnCard 的收尾重渲不得用原文覆盖渲染版
     turn.mathRenderedSegments ??= new Set()
     turn.mathRenderedSegments.add(segId)
+    log(`session "${this.sessionName}": math rendered ${segId} (${formulaImgs.length} img)`)
   }
 
   private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<void> {
@@ -3032,15 +3045,20 @@ export class Session {
     // rotation 的 dead-element 判断都依赖它。公式渲染是 async 的(秒级),
     // 不能推迟入队;先同步上原文(公式段此时是 $$…$$ 原码,sanitize 会降级
     // 成代码块占位),渲染完成后 replace 成摘出文本 + 紧贴插入公式图。
+    if (mathRender.hasMathSpans(text)) {
+      const rp = this.replaceSegmentWithMathImgs(turn, segId, text)
+        .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
+      // 记入 in-flight 集合:closeTurnCard 在收尾重渲前 await 全部,
+      // 防原文 replace 赢得竞态覆盖渲染版(渲染晚到即写已 dispose 的卡)。
+      turn.mathRenderInflight ??= new Set()
+      turn.mathRenderInflight.add(rp)
+      void rp.finally(() => turn.mathRenderInflight?.delete(rp))
+    }
     const p = cardkit.addElement(
       turn.cardId,
       this.completedAssistantElement(segId, text),
       { type: 'insert_before', targetElementId: sessionTools.taskLiveAnchor(turn) },
     )
-    if (mathRender.hasMathSpans(text)) {
-      void this.replaceSegmentWithMathImgs(turn, segId, text)
-        .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
-    }
     return p
   }
 
@@ -3241,6 +3259,13 @@ export class Session {
       turn.currentAssistantText = ''
     }
 
+    // 等全部 in-flight 公式渲染落地(渲染+上传是秒级 async)。不等的话下面
+    // 的原文 replace 会先赢,把还没落地的渲染版覆盖回 $$…$$ 原码降级;渲染
+    // promise 晚到再写就打在已 dispose 的卡上静默死 —— 这正是「公式图永远
+    // 不出现、只见代码块」的病根。
+    if (turn.mathRenderInflight?.size) {
+      await Promise.allSettled([...turn.mathRenderInflight])
+    }
     // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
     // 这里只是收尾重渲兜住异常路径 —— 但公式段例外:replaceSegmentWithMathImgs
     // 已经把段替换成摘出文本 + 紧贴插入公式图,这里再用原文重渲会把渲染版
