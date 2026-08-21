@@ -1,56 +1,17 @@
-<!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-06-26 -->
+# `scripts/` 局部指引
 
-# scripts
+这里的脚本面向安装、真实飞书探针和人工 smoke。多数脚本直接加载生产配置、XDG 状态与 `src/` 实现，不是隔离测试；`Session` 按目标群持久选择启动对应后端。
 
-## Purpose
-`scripts/` 存放面向开发、调试、真实飞书群 smoke 和 npm 安装后的辅助脚本。这些脚本通常直接导入 `src/` 模块并复用生产配置，因此会触达真实 Feishu API、真实 Codex 登录和本机 Lodestar runtime state。
+## 边界与副作用
 
-## Key Files
-| File | Description |
-|------|-------------|
-| `smoke.ts` | 最小 smoke 驱动；列出可见群，向目标群发送预告并直接调用 `Session.onUserMessage`。 |
-| `test-all.ts` | 全流程人工测试；覆盖 `kill`、`hi`、流式工具调用、`[[send: ...]]`、中途消息、入站图片、`restart` 和 `clear`。 |
-| `test-inject.ts` | 通过 daemon debug unix socket 注入消息，复用真实 Feishu message id 和 `handleMessage` 路径。 |
-| `test-mid-turn-rotation.ts` | 复现中途换卡场景；注入消息后截取当天 `daemon-YYYY-MM-DD.log` 中的相关日志。 |
-| `cardkit-probe.ts` | 对 Card Kit 创建、`id_convert`、元素 PUT 等 API 组合做真实探针。 |
-| `seed-debug-ctx.ts` | 查询目标群成员并写入 `debug-context.json`，用于 debug socket 注入前的上下文种子。 |
-| `postinstall.cjs` | npm 安装后尝试在真实终端启动 `lodestar-setup`；Windows/macOS/Linux 分支各自处理终端继承。 |
+- `smoke.ts` 与 `test-all.ts` 会在真实群发送消息、卡片、reaction 和文件，并自行创建 `Session`；同一群的 live daemon 必须停止以免双 session 争用。运行脚本和停止 daemon 分别需要用户在当前消息中明确授权。
+- `test-inject.ts` 依赖正在运行的 debug socket，每次注入都会先向已 seed 的群发送成员可见消息；`test-mid-turn-rotation.ts` 还会发送 `kill` 和长 turn。不要把它们当成无副作用单元测试。
+- `cardkit-probe.ts` 会发送多张探针卡并直调真实 Card Kit API；`seed-debug-ctx.ts` 会查询群成员并写 XDG debug context。执行前显式复核 chat/group，禁止依赖硬编码或 `test1` 默认值。
+- 脚本复用 `src/feishu.ts`、`src/session.ts` 与 `src/paths.ts`，不要复制生产 API、provider 选择、凭据解析或状态路径；不得把 debug context、成员信息或 token 写进仓库。
+- `postinstall.cjs` 只输出安装提示，并检查/补装 Claude Agent SDK 当前平台的 native binary；不得在 npm lifecycle 中启动交互向导。首次向导由 `cli.ts` 在真实 TTY 触发，native 最终不可用时由 agent 启动路径显式报错。
+- Smoke 覆盖声明必须与实际 provider 能力一致；不要把默认 Claude session 注释成强制 Codex，也不要用单后端通过冒充双后端验证完成。
 
-## Subdirectories
-| Directory | Purpose |
-|-----------|---------|
-| _None_ | 此目录没有非排除子目录。 |
+## 验证
 
-## For AI Agents
-
-### Working In This Directory
-- 大多数 `.ts` 脚本以 `#!/usr/bin/env bun` 运行；`postinstall.cjs` 以 Node 执行，因为它是 npm lifecycle 脚本。
-- 脚本会读取与生产 daemon 相同的 `config.toml` 和 XDG runtime state；不要在脚本里硬编码凭据或写入仓库内状态。
-- 真实飞书群测试可能发送可见消息、reaction、卡片和文件；新增脚本前确认它是否会影响群成员。
-- `test-inject.ts` 和 `test-mid-turn-rotation.ts` 依赖 `DEBUG_SOCK_FILE`，需要 daemon 已运行且 debug context 已由 `[DEBUG]...` 或 `seed-debug-ctx.ts` 建好。
-
-### Testing Requirements
-- 修改普通脚本后至少运行 `bun test`，并按脚本用途执行对应 smoke，例如 `bun scripts/smoke.ts "<group name>"`。
-- 修改 `postinstall.cjs` 后要考虑 npm 生命周期 stdio 被捕获、Windows 新窗口、Unix `/dev/tty` 三条路径。
-- `test-all.ts` 会操作真实 session，运行前确保同一群没有另一个 daemon session 并发抢占。
-
-### Common Patterns
-- 脚本优先复用 `src/feishu.ts`、`src/session.ts`、`src/paths.ts` 的生产实现，而不是重写 API 调用。
-- 面向人工观测的测试会先向群里发送 `🧪` 预告，便于手机端和日志对应。
-- 用 `process.argv` / `Bun.argv` 读取目标群和参数；默认目标常见为 `test1`，但调用方可以覆盖。
-
-## Dependencies
-
-### Internal
-- `smoke.ts`、`test-all.ts` 直接依赖 `src/feishu.ts` 和 `src/session.ts`。
-- `test-inject.ts`、`test-mid-turn-rotation.ts` 依赖 `src/paths.ts` 中的 debug socket 和日志路径。
-- `postinstall.cjs` 依赖构建产物 `dist/lodestar-setup.js`，发布前必须先 `bun run build`。
-
-### External
-- Bun：运行 TypeScript 测试脚本。
-- Node.js：运行 `postinstall.cjs` 和发布包。
-- Feishu Open Platform：群列表、消息、Card Kit、成员查询等真实 API。
-- `codex` CLI：`Session` smoke 会启动真实 `codex app-server`。
-
-<!-- MANUAL: Add manually maintained notes below this line. -->
+- 修改脚本后先运行其导入模块的单元测试；修改 npm lifecycle、native dependency、构建产物引用或跨平台入口后运行 `bun run build`。
+- 真实 smoke 不是默认验证。只有目标群、副作用、provider/source 和 live daemon 前置条件都获授权后，才执行 `bun scripts/<name>.ts ...`，完成后报告发送内容与本地状态变更。

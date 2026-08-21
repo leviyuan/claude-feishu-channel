@@ -8,7 +8,7 @@ node_modules/
 # Local IDE state
 .serena/
 
-# OMC operational state (oh-my-claudecode runtime artifacts)
+# Legacy local agent runtime artifacts
 .omc/
 
 # Local override config (if dropped in repo for testing)
