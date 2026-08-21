@@ -91,6 +91,25 @@ describe('renderTeXToPNG native CJK', () => {
     expect(renderTeXToPNG(tex)).not.toBeNull()
   })
 
+  test('cases 最长中文行会为末字保留完整字形宽度', () => {
+    const tex = [
+      'S_{\\mathrm{final}}=',
+      '\\begin{cases}',
+      'S_{\\mathrm{economic}}, & \\text{两腿 OI 门槛通过且剩余容量足够}\\\\',
+      '0, & \\text{任意一腿 OI 或剩余容量不足}\\\\',
+      '\\mathrm{MISS}, & \\text{必要数据尚未准备好}',
+      '\\end{cases}',
+    ].join('\n')
+    const svg = renderTeXToSVG(tex)
+    const png = renderTeXToPNG(tex)
+    expect(svg).not.toBeNull()
+    expect(png).not.toBeNull()
+    expect(svg!.svg).toContain('<text')
+    // 修复前该样例宽 615px，第一行末字 origin 已贴住 viewBox 右缘而被裁。
+    expect(svg!.width).toBeGreaterThan(630)
+    expect(png!.width).toBe(svg!.width)
+  })
+
   test('复杂公式与矩阵正常，MathJax merror 显式失败', () => {
     expect(renderTeXToPNG('S=\\sum_{i=1}^{n} w_i \\cdot \\frac{x_i-\\mu}{\\sigma}')).not.toBeNull()
     expect(renderTeXToPNG('\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}')).not.toBeNull()

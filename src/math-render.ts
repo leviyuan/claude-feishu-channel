@@ -28,7 +28,11 @@ const PAD_X = 12
 const PAD_Y = 8
 const MAX_IMAGE_WIDTH = 720
 const MIN_CONTENT_HEIGHT = 14
-const CACHE_VERSION = 'v3-native-cjk-paper'
+const CACHE_VERSION = 'v4-native-cjk-tail-pad'
+/** MathJax 的 CJK <text> advance 是 1000 SVG unit，但根 viewBox 会停在
+ * 最后一个字的 origin，未计入该字实际轮廓。预留略大于一个 advance，防
+ * 最长一行的末字在 nested SVG 内部被裁掉。 */
+const NATIVE_TEXT_TAIL_UNITS = 1100
 const CJK_FONT_FAMILY = process.platform === 'win32'
   ? 'Microsoft YaHei'
   : process.platform === 'darwin'
@@ -109,8 +113,22 @@ function renderTeXToSVG(texSrc: string, em = DISPLAY_EM, display = true): Formul
     const heightEx = parseNumber(openTag.match(/\bheight="([\d.]+)ex"/)?.[1], 'height')
     const viewBox = openTag.match(/\bviewBox="([^"]+)"/)?.[1]
     if (!viewBox) throw new Error('MathJax SVG missing viewBox')
+    const viewBoxParts = viewBox.trim().split(/[\s,]+/).map(Number)
+    if (
+      viewBoxParts.length !== 4 ||
+      viewBoxParts.some(part => !Number.isFinite(part)) ||
+      viewBoxParts[2] <= 0 ||
+      viewBoxParts[3] <= 0
+    ) {
+      throw new Error('MathJax SVG has invalid viewBox')
+    }
+    const [viewBoxX, viewBoxY, viewBoxWidth, viewBoxHeight] = viewBoxParts
+    const nativeTextTail = /<text\b/.test(markup) ? NATIVE_TEXT_TAIL_UNITS : 0
+    const safeViewBox = `${viewBoxX} ${viewBoxY} ${viewBoxWidth + nativeTextTail} ${viewBoxHeight}`
 
-    const naturalWidth = Math.max(1, Math.ceil(widthEx * ex))
+    const baseNaturalWidth = widthEx * ex
+    const nativeTextTailPx = nativeTextTail * (baseNaturalWidth / viewBoxWidth)
+    const naturalWidth = Math.max(1, Math.ceil(baseNaturalWidth + nativeTextTailPx))
     const naturalHeight = Math.max(1, Math.ceil(heightEx * ex))
     const maxContentWidth = MAX_IMAGE_WIDTH - PAD_X * 2
     const scale = Math.min(1, maxContentWidth / naturalWidth)
@@ -128,7 +146,7 @@ function renderTeXToSVG(texSrc: string, em = DISPLAY_EM, display = true): Formul
     const svg = [
       `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="color:${INK}">`,
       `<rect x="0" y="0" width="${width}" height="${height}" rx="6" fill="${PAPER}"/>`,
-      `<svg x="${PAD_X}" y="${PAD_Y}" width="${contentWidth}" height="${contentHeight}" viewBox="${escapeXmlAttribute(viewBox)}" preserveAspectRatio="xMidYMid meet">`,
+      `<svg x="${PAD_X}" y="${PAD_Y}" width="${contentWidth}" height="${contentHeight}" viewBox="${escapeXmlAttribute(safeViewBox)}" preserveAspectRatio="xMidYMid meet">`,
       body,
       '</svg>',
       '</svg>',
@@ -525,5 +543,14 @@ export const __test = {
   renderTeXToPNG,
   unicodeMathify,
   resetUploadStateForTests,
-  constants: { INK, PAPER, PAD_X, PAD_Y, MAX_IMAGE_WIDTH, MIN_CONTENT_HEIGHT, CJK_FONT_FAMILY },
+  constants: {
+    INK,
+    PAPER,
+    PAD_X,
+    PAD_Y,
+    MAX_IMAGE_WIDTH,
+    MIN_CONTENT_HEIGHT,
+    CJK_FONT_FAMILY,
+    NATIVE_TEXT_TAIL_UNITS,
+  },
 }
