@@ -28,6 +28,9 @@ const PAD_X = 12
 const PAD_Y = 8
 const MAX_IMAGE_WIDTH = 720
 const MIN_CONTENT_HEIGHT = 14
+/** 飞书历史 custom_width/compact_width 的移动端安全宽度是 278px。小图
+ * 保持原尺寸；更宽的图交给 fit_horizontal 按实际卡片容器响应式缩小。 */
+const MAX_FIXED_FORMULA_WIDTH = 278
 const CACHE_VERSION = 'v4-native-cjk-tail-pad'
 /** MathJax 的 CJK <text> advance 是 1000 SVG unit，但根 viewBox 会停在
  * 最后一个字的 origin，未计入该字实际轮廓。预留略大于一个 advance，防
@@ -321,8 +324,8 @@ export interface FormulaImageElement {
   tag: 'img'
   img_key: string
   alt: { tag: 'plain_text'; content: string }
-  scale_type: 'crop_center'
-  size: string
+  scale_type: 'crop_center' | 'fit_horizontal'
+  size?: string
   preview: false
 }
 
@@ -436,6 +439,7 @@ async function uploadTeX(tex: string, uploader: FormulaUploader): Promise<Upload
 }
 
 function imageBlock(uploaded: UploadedFormula, span: MathSpan, index: number): RenderedMathBlock {
+  const fitsFixedWidth = uploaded.width <= MAX_FIXED_FORMULA_WIDTH
   return {
     type: 'image',
     tex: span.tex,
@@ -447,8 +451,8 @@ function imageBlock(uploaded: UploadedFormula, span: MathSpan, index: number): R
         tag: 'plain_text',
         content: span.tex.replace(/\s+/g, ' ').slice(0, 80),
       },
-      scale_type: 'crop_center',
-      size: `${uploaded.width}px ${uploaded.height}px`,
+      scale_type: fitsFixedWidth ? 'crop_center' : 'fit_horizontal',
+      ...(fitsFixedWidth ? { size: `${uploaded.width}px ${uploaded.height}px` } : {}),
       preview: false,
     },
   }
@@ -550,6 +554,7 @@ export const __test = {
     PAD_Y,
     MAX_IMAGE_WIDTH,
     MIN_CONTENT_HEIGHT,
+    MAX_FIXED_FORMULA_WIDTH,
     CJK_FONT_FAMILY,
     NATIVE_TEXT_TAIL_UNITS,
   },

@@ -179,6 +179,28 @@ describe('renderMathInText ordered blocks', () => {
     expect(result.renderedImageCount).toBe(2)
   })
 
+  test('宽公式使用 fit_horizontal 响应式完整展示，小公式保留精确尺寸', async () => {
+    const uploader: FormulaUploader = async (_path, meta) => `img_v2_${meta.width}`
+    const small = await renderMathInText('$$x$$', { uploader })
+    const wide = await renderMathInText(
+      '$$S_{\\mathrm{final}}=\\begin{cases}' +
+      'S_{\\mathrm{economic}}, & \\text{两腿 OI 门槛通过且剩余容量足够}\\\\' +
+      '0, & \\text{任意一腿 OI 或剩余容量不足}' +
+      '\\end{cases}$$',
+      { uploader },
+    )
+    const smallImage = small.blocks.find(block => block.type === 'image')
+    const wideImage = wide.blocks.find(block => block.type === 'image')
+    expect(smallImage?.type === 'image' ? smallImage.element : null).toMatchObject({
+      scale_type: 'crop_center',
+      size: expect.any(String),
+    })
+    expect(wideImage?.type === 'image' ? wideImage.element : null).toMatchObject({
+      scale_type: 'fit_horizontal',
+    })
+    expect(wideImage?.type === 'image' ? 'size' in wideImage.element : true).toBe(false)
+  })
+
   test('复杂 inline 原位提级成图片', async () => {
     const uploader: FormulaUploader = async () => 'img_v2_frac'
     const result = await renderMathInText('前 \\(\\frac{a}{b}\\) 后', { uploader })
