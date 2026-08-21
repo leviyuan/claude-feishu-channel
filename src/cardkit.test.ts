@@ -105,6 +105,81 @@ describe('cardkit write-dead card', () => {
   })
 })
 
+describe('checked card writes', () => {
+  test('replaceElementChecked reports a Feishu PUT rejection', async () => {
+    const cardId = 'card_checked_replace'
+    cardkit.recordCardCreated(cardId, 1)
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300308, msg: 'element rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch
+
+    expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    })).toBe(false)
+    await cardkit.dispose(cardId)
+  })
+
+  test('add/delete checked variants return false on rejected mutations', async () => {
+    const addCard = 'card_checked_add'
+    cardkit.recordCardCreated(addCard, 1)
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300315, msg: 'add rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch
+    expect(await cardkit.addElementChecked(addCard, {
+      tag: 'markdown', element_id: 'math_1', content: 'x',
+    })).toBe(false)
+    await cardkit.dispose(addCard)
+
+    const deleteCard = 'card_checked_delete'
+    cardkit.recordCardCreated(deleteCard, 2)
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300313, msg: 'delete rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch
+    expect(await cardkit.deleteElementChecked(deleteCard, 'math_1')).toBe(false)
+    await cardkit.dispose(deleteCard)
+  })
+
+  test('HTTP errors and malformed success bodies never count as landed writes', async () => {
+    for (const [cardId, response] of [
+      ['card_http_502', new Response(JSON.stringify({ msg: 'gateway error' }), {
+        status: 502, headers: { 'Content-Type': 'application/json' },
+      })],
+      ['card_missing_code', new Response(JSON.stringify({ data: {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })],
+    ] as const) {
+      cardkit.recordCardCreated(cardId, 1)
+      globalThis.fetch = (async () => response.clone()) as typeof fetch
+      expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+        tag: 'markdown', element_id: 'assistant_0', content: 'x',
+      }, { notifyCardFailure: false })).toBe(false)
+      await cardkit.dispose(cardId)
+    }
+  })
+
+  test('a throwing card failure callback cannot poison the write queue', async () => {
+    const cardId = 'card_throwing_failure_callback'
+    cardkit.recordCardCreated(cardId, 1, () => { throw new Error('callback boom') })
+    let attempt = 0
+    globalThis.fetch = (async () => {
+      attempt++
+      return new Response(JSON.stringify(attempt === 1
+        ? { code: 300308, msg: 'first rejected' }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'first',
+    })).toBe(false)
+    expect(await cardkit.addElementChecked(cardId, {
+      tag: 'markdown', element_id: 'second', content: 'second',
+    })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+})
+
 describe('disposed card write guard (review #3)', () => {
   test('dispose 后 addElement/replaceElement 不产生 HTTP 调用', async () => {
     const cardId = 'card_disposed_guard'
@@ -126,5 +201,34 @@ describe('disposed card write guard (review #3)', () => {
     await cardkit.flush(cardId)
     expect(calls.some(c => c.method === 'POST' && c.path === `/cards/${cardId}/elements` && JSON.parse(c.body.elements)[0]?.element_id === 'rv1')).toBe(true)
     await cardkit.dispose(cardId)
+  })
+
+  test('dispose synchronously closes the enqueue gate before draining', async () => {
+    const cardId = 'card_dispose_race'
+    cardkit.recordCardCreated(cardId, 1)
+    let releaseFetch: () => void = () => {}
+    const fetchStarted = new Promise<void>(resolve => {
+      globalThis.fetch = (async () => {
+        resolve()
+        await new Promise<void>(release => { releaseFetch = release })
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+    })
+
+    const first = cardkit.addElementChecked(cardId, {
+      tag: 'markdown', element_id: 'first', content: 'first',
+    })
+    await fetchStarted
+    const disposing = cardkit.dispose(cardId)
+    const second = await cardkit.addElementChecked(cardId, {
+      tag: 'markdown', element_id: 'second', content: 'second',
+    })
+    expect(second).toBe(false)
+    releaseFetch()
+    expect(await first).toBe(true)
+    await disposing
+    expect(cardkit.isDisposed(cardId)).toBe(true)
   })
 })

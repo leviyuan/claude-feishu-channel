@@ -70,6 +70,11 @@ describe('sanitizeMarkdownForCardKit', () => {
     expect(sanitizeMarkdownForCardKit(src)).toBe(src)
   })
 
+  test('tilde fence 与多反引号 inline code 内的公式保持字面量', () => {
+    const src = '~~~tex\n$$x^2$$ & <tag>\n~~~\n``$$y^2$$ & <tag>``'
+    expect(sanitizeMarkdownForCardKit(src)).toBe(src)
+  })
+
   test('图片 url 含空格时保留完整(不截断到空白)', () => {
     const out = sanitizeMarkdownForCardKit('![diagram](https://example.com/my architecture.png)')
     expect(out).not.toMatch(/!\[/)

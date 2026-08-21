@@ -16,6 +16,8 @@
  *                       `Working...(Ns)` while tools/non-text work run; at
  *                       turn close it becomes the terminal status line.
  */
+import { transformMarkdownProse } from '../markdown-code'
+
 export const ELEMENTS = {
   userInput: 'user_input',
   footer: 'footer',
@@ -61,25 +63,6 @@ export const ELEMENTS = {
   tasklistPanel: 'tasklist_panel',
 } as const
 
-/** 代码块感知遍历:fence(用「同长反向引用」识别可变长度,tool.ts 的
- *  fenceBlock 会在内容含 ``` 时把 fence 扩到 4+ 反引号,固定 3 反引号正则会
- *  把内层 ``` 误当边界劈开 fence)与行内 `code` 内是字面量,原样保留;只对
- *  其外的 prose 跑 transform。 */
-function transformProseOutsideCode(text: string, transform: (prose: string) => string): string {
-  if (!text) return text
-  const code = /(`{3,})[\s\S]*?\1|`[^`\n]*`/g
-  let out = ''
-  let last = 0
-  let m: RegExpExecArray | null
-  while ((m = code.exec(text)) !== null) {
-    if (m.index > last) out += transform(text.slice(last, m.index))
-    out += m[0]
-    last = m.index + m[0].length
-  }
-  if (last < text.length) out += transform(text.slice(last))
-  return out
-}
-
 function escapeHtmlEntities(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
@@ -109,7 +92,7 @@ function downgradeExternalImagesInProse(s: string): string {
  *  彩色的场景(如 notify opts.text)用 downgradeExternalImagesForCardKit。
  *  保留 **粗体** / [文字](url) / 列表 / 代码块等合法 markdown。 */
 export function sanitizeMarkdownForCardKit(text: string): string {
-  return transformProseOutsideCode(text, s => downgradeMathBlocksInProse(downgradeExternalImagesInProse(escapeHtmlEntities(s))))
+  return transformMarkdownProse(text, s => downgradeMathBlocksInProse(downgradeExternalImagesInProse(escapeHtmlEntities(s))))
 }
 
 /** 飞书卡片 markdown 不渲染 LaTeX($$…$$ / \\[…\\] / \\(…\\) / $…$ 以及
@@ -134,5 +117,5 @@ function downgradeMathBlocksInProse(s: string): string {
  *  失败的根因是外链图片(img_key 被拒),不是 HTML 标签,故只防图片、保留
  *  <font> 等标签;代码块与行内 code 仍字面保留。 */
 export function downgradeExternalImagesForCardKit(text: string): string {
-  return transformProseOutsideCode(text, downgradeExternalImagesInProse)
+  return transformMarkdownProse(text, downgradeExternalImagesInProse)
 }

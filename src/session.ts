@@ -2594,6 +2594,8 @@ export class Session {
     // rotating 期间不 reset,这段会一直累积到 swap,窗口期的字一个不丢。
     const oldToolByUseId = turn.toolByUseId
     const oldBatches = turn.toolBatches
+    let deferredWriteFailure = false
+    let deferredWriteFailureCode: number | undefined
     turn.rotating = (async () => {
       try {
         log(`session "${this.sessionName}": mid-turn rotate triggered card=${oldCardId.slice(0, 8)}… elementCount=${cardkit.getElementCount(oldCardId)}`)
@@ -2622,7 +2624,21 @@ export class Session {
           return
         }
         // card_full body has banner(1) + footer(1) = 2 elements.
-        cardkit.recordCardCreated(newCardId, 2, (code) => this.onCardWriteFailure(code))
+        cardkit.recordCardCreated(newCardId, 2, (code) => {
+          if (turn.rotating) {
+            deferredWriteFailure = true
+            deferredWriteFailureCode = code
+            return
+          }
+          this.onCardWriteFailure(code)
+        })
+        // 先让旧卡上已经登记的 assistant raw 写入定局，再读取 deadElements、
+        // 迁移失败段和 drain mathRenderInflight。rotating 期间 finalize 会早退，
+        // 不会再新增旧卡 completed write；这一轮 drain 足以封住 swap 竞态。
+        const oldAssistantWrites = turn.assistantWriteInflight?.get(oldCardId)
+        if (oldAssistantWrites?.size) {
+          await Promise.allSettled([...oldAssistantWrites])
+        }
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
@@ -2674,19 +2690,10 @@ export class Session {
           const ri = turn.assistantSegmentCount++
           const reSegId = cards.ELEMENTS.assistant(ri)
           turn.segmentTexts.set(reSegId, fullText)
-          // 同步入队原文占位,公式渲染完成后异步 replace + 插图(与主路径同语义)。
-          void cardkit.addElement(newCardId, this.completedAssistantElement(reSegId, fullText), {
-            type: 'insert_before',
-            targetElementId: sessionTools.taskLiveAnchor(turn),
-          })
-          if (mathRender.hasMathSpans(fullText)) {
-            const rp = this.replaceSegmentWithMathImgs(turn, newCardId, reSegId, fullText)
-              .catch(e => log(`session "${this.sessionName}": math render ${reSegId} failed: ${e}`))
-            turn.mathRenderInflight ??= new Map()
-            turn.mathRenderInflight.get(newCardId) ?? (turn.mathRenderInflight.set(newCardId, new Set()), undefined)
-            turn.mathRenderInflight.get(newCardId)!.add(rp)
-            void rp.finally(() => turn.mathRenderInflight?.get(newCardId)?.delete(rp))
-          }
+          // 与主路径共用 checked 原文写入 + 原子公式替换；保留 task board
+          // 和其他双后端轮转状态，不在这里复制一套公式事务。
+          const added = await this.addCompletedAssistantSegment(turn, reSegId, fullText)
+          if (!added) deferredWriteFailure = true
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
@@ -2719,11 +2726,11 @@ export class Session {
             if (carrySegId && carryText && segId === carrySegId) continue
             if (cardkit.isDeadElement(oldCardId, segId)) continue
             if (oldRendered?.has(segId)) continue
-            await cardkit.replaceElement(oldCardId, segId, {
-              tag: 'markdown',
-              element_id: segId,
-              content: this.cleanAssistantTextForDisplay(fullText).trim() || ' ',
-            })
+            await cardkit.replaceElement(
+              oldCardId,
+              segId,
+              this.completedAssistantElement(segId, fullText),
+            )
           }
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
@@ -2738,6 +2745,11 @@ export class Session {
         log(`session "${this.sessionName}": mid-turn rotate done old=${oldCardId.slice(0, 8)}… new=${newCardId.slice(0, 8)}…`)
       } finally {
         turn.rotating = null
+        // 新卡在 swap/rebuild 窗口里的写失败不能递归换卡；释放本轮锁后
+        // 合并触发一次。若 close 已捕获 turn，则由 close 的正文保全处理。
+        if (deferredWriteFailure && this.currentTurn === turn) {
+          this.onCardWriteFailure(deferredWriteFailureCode)
+        }
       }
     })()
   }
@@ -3008,6 +3020,9 @@ export class Session {
   }
 
   private completedAssistantElement(segId: string, text: string): object {
+    if (mathRender.hasMathSpans(text)) {
+      return this.mathAssistantContainer(segId, [{ type: 'markdown', text }])
+    }
     return {
       tag: 'markdown',
       element_id: segId,
@@ -3015,76 +3030,93 @@ export class Session {
     }
   }
 
-  /** 公式渲染后的段替换 + 后续公式图插入:display 公式从段文本摘出渲染成
-   *  img 元素(精确尺寸,不撑卡宽),段 markdown 替换为摘出后的文本,公式
-   *  图按序插在自己所属段元素正后方(insert_after segId —— 不能插
-   *  taskLiveAnchor,多段轮里后续段落会把先插的图顶到段落流末尾)。
-   *  inline 公式 Unicode 转写留在文本里。
-   *
-   *  cardId 是调度时捕获的快照:渲染期间 rotation 可能切换 turn.cardId,
-   *  绝不能在读 turn.cardId —— 否则旧段渲染结果会写穿到新卡、覆盖新卡
-   *  同名段(review #1)。写入用 checked API:任一写失败即中止并不标
-   *  rendered —— close 的原文兜底重渲会恢复完整公式文本,不让公式被
-   *  悄悄吞掉(review #4)。 */
-  private async replaceSegmentWithMathImgs(turn: TurnState, cardId: string, segId: string, text: string): Promise<void> {
-    const { text: stripped, formulaImgs } = await mathRender.renderMathInText(text)
-    const okReplace = await cardkit.replaceElementChecked(cardId, segId, {
-      tag: 'markdown',
+  /** 公式段从 raw 到 rendered 始终保持同一个顶层 column_set tag；内部
+   *  children 严格按源码顺序交错 markdown/img。这样一次 checked PUT 就能
+   *  原子完成 A→公式→B→公式→C，不再把所有图片堆到整段末尾。 */
+  private mathAssistantContainer(segId: string, blocks: mathRender.RenderedMathBlock[]): object {
+    const elements = blocks.map(block => block.type === 'markdown'
+      ? {
+          tag: 'markdown',
+          content: this.cleanAssistantTextForDisplay(block.text).trim() || ' ',
+        }
+      : { ...block.element })
+    return {
+      tag: 'column_set',
       element_id: segId,
-      content: this.cleanAssistantTextForDisplay(stripped).trim() || ' ',
-    })
+      flex_mode: 'none',
+      columns: [{
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: elements.length ? elements : [{ tag: 'markdown', content: ' ' }],
+      }],
+    }
+  }
+
+  /** 把 raw column_set 原子替换成严格原位交错的 markdown/image 子元素链。
+   *  cardId 是调度时捕获的快照，不能在异步渲染后读取 turn.cardId。公式增强
+   *  失败不触发整卡轮转：raw LaTeX 已经可见，保留它并暴露日志即可。 */
+  private async replaceSegmentWithMathImgs(turn: TurnState, cardId: string, segId: string, text: string): Promise<void> {
+    const rendered = await mathRender.renderMathInText(text)
+    const okReplace = await cardkit.replaceElementChecked(
+      cardId,
+      segId,
+      this.mathAssistantContainer(segId, rendered.blocks),
+      { notifyCardFailure: false },
+    )
     if (!okReplace) {
       log(`session "${this.sessionName}": math render ${segId} write dropped (card closed/element dead) — raw text stays`)
       return
     }
-    let anchor = segId
-    for (const img of formulaImgs) {
-      const imgEl = img.element as { element_id?: string }
-      const imgId = imgEl.element_id ?? `math_${segId}_${img.index}`
-      imgEl.element_id = imgId
-      const okAdd = await cardkit.addElementChecked(cardId, img.element, {
-        type: 'insert_after', targetElementId: anchor,
-      })
-      if (!okAdd) {
-        // 部分成功 = 公式文本已被摘除但图没插上 —— 公式内容会丢。回滚:
-        // 把段 replace 回原文(close 的兜底循环会跳过我们,所以必须在这里
-        // 自己恢复),让 $$…$$ 走可见降级而不是消失(review #4)。
-        await cardkit.replaceElementChecked(cardId, segId, this.completedAssistantElement(segId, text))
-        log(`session "${this.sessionName}": math render ${segId} img add failed — rolled back to raw text`)
-        return
-      }
-      anchor = imgId // 第 N 张图插在第 N-1 张后,保持段内顺序
-    }
-    // 全部写入确认成功才标 rendered:closeTurnCard 的收尾重渲跳过本段
+
     turn.mathRendered ??= new Map()
     turn.mathRendered.get(cardId) ?? (turn.mathRendered.set(cardId, new Set()), undefined)
     turn.mathRendered.get(cardId)!.add(segId)
-    log(`session "${this.sessionName}": math rendered ${segId} (${formulaImgs.length} img)`)
+    log(`session "${this.sessionName}": math rendered ${segId} (${rendered.renderedImageCount} img, ${rendered.blocks.length} blocks)`)
   }
 
-  private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<void> {
-    // 不变式:本函数返回时元素已同步入队 —— closeTurnCard 的最终 replace、
-    // rotation 的 dead-element 判断都依赖它。公式渲染是 async 的(秒级),
-    // 不能推迟入队;先同步上原文(公式段此时是 $$…$$ 原码,sanitize 会降级
-    // 成代码块占位),渲染完成后 replace 成摘出文本 + 紧贴插入公式图。
-    // cardId 此刻同步捕获,渲染 promise 之后只写这张卡(review #1)。
-    if (mathRender.hasMathSpans(text)) {
-      const cardId = turn.cardId
-      const rp = this.replaceSegmentWithMathImgs(turn, cardId, segId, text)
-        .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
-      // 记入 per-card in-flight:closeTurnCard / rotation 各自只 drain 自己
-      // 卡上的渲染,防原文 replace 赢得竞态覆盖渲染版(review #2)。
-      turn.mathRenderInflight ??= new Map()
-      turn.mathRenderInflight.get(cardId) ?? (turn.mathRenderInflight.set(cardId, new Set()), undefined)
-      turn.mathRenderInflight.get(cardId)!.add(rp)
-      void rp.finally(() => turn.mathRenderInflight?.get(cardId)?.delete(rp))
+  private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<boolean> {
+    // 先确认原文容器真实落地，再启动公式渲染。checked 写入与公式 promise
+    // 都按 cardId 分组登记，close 会依次 drain，避免幽灵元素和 dispose 竞态。
+    const cardId = turn.cardId
+    const targetElementId = sessionTools.taskLiveAnchor(turn)
+    const write = (async (): Promise<boolean> => {
+      const added = await cardkit.addElementChecked(
+        cardId,
+        this.completedAssistantElement(segId, text),
+        { type: 'insert_before', targetElementId },
+      )
+      if (!added) {
+        log(`session "${this.sessionName}": assistant segment ${segId} raw write failed on card=${cardId}`)
+        return false
+      }
+
+      if (mathRender.hasMathSpans(text)) {
+        const rp = this.replaceSegmentWithMathImgs(turn, cardId, segId, text)
+          .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
+        turn.mathRenderInflight ??= new Map()
+        turn.mathRenderInflight.get(cardId) ?? (turn.mathRenderInflight.set(cardId, new Set()), undefined)
+        turn.mathRenderInflight.get(cardId)!.add(rp)
+        void rp.finally(() => turn.mathRenderInflight?.get(cardId)?.delete(rp))
+      }
+      return true
+    })()
+    turn.assistantWriteInflight ??= new Map()
+    turn.assistantWriteInflight.get(cardId) ?? (turn.assistantWriteInflight.set(cardId, new Set()), undefined)
+    turn.assistantWriteInflight.get(cardId)!.add(write)
+    void write.finally(() => turn.assistantWriteInflight?.get(cardId)?.delete(write))
+    return write
+  }
+
+  /** CardKit 正文写入失败时显式保全完整回复；不伪装卡片成功。 */
+  private async sendAssistantTextFallback(text: string, reason: string): Promise<void> {
+    const raw = text.trim()
+    if (!raw) return
+    const message = `⚠️ 对话卡片正文写入失败(${reason}),以下为 agent 原始回复:\n\n${raw}`
+    const sent = await feishu.sendText(this.chatId, message)
+    if (!sent) {
+      log(`session "${this.sessionName}": ASSISTANT_TEXT_PRESERVATION_FAILED (${reason}, ${raw.length} chars)`)
     }
-    const p = cardkit.addElement(
-      turn.cardId,
-      this.completedAssistantElement(segId, text),
-      { type: 'insert_before', targetElementId: sessionTools.taskLiveAnchor(turn) },
-    )
-    return p
   }
 
   /** 收尾当前 assistant 段:正文不再逐字流式输出,只在完整段收到后
@@ -3278,10 +3310,21 @@ export class Session {
     // processOutboundMarkers(). closeTurnCard only finalizes text display.
     // 如果最后一个 assistant 段没有等到 block_stop,这里先把内存缓冲的完整
     // 文本作为静态 markdown 插入卡片。
+    const fallbackSegments = new Map<string, string>()
     if (turn.currentAssistantSegmentId && turn.currentAssistantText.trim()) {
-      await this.addCompletedAssistantSegment(turn, turn.currentAssistantSegmentId, turn.currentAssistantText)
+      const segId = turn.currentAssistantSegmentId
+      const text = turn.currentAssistantText
+      const added = await this.addCompletedAssistantSegment(turn, segId, text)
+      if (!added) fallbackSegments.set(segId, text)
       turn.currentAssistantSegmentId = null
       turn.currentAssistantText = ''
+    }
+
+    // block_stop handler 是同步 fire-and-forget；先等 raw 容器 checked 写完，
+    // 才能完整看到随后登记的 mathRenderInflight，避免 close 抢先 dispose。
+    const assistantWrites = turn.assistantWriteInflight?.get(cardId)
+    if (assistantWrites?.size) {
+      await Promise.allSettled([...assistantWrites])
     }
 
     // 等本卡全部 in-flight 公式渲染落地(渲染+上传是秒级 async,且有超时
@@ -3301,8 +3344,15 @@ export class Session {
     // 隔离:本卡的段才跳过(rotation 重编号后新卡同名段不受旧卡标记影响)。
     const renderedHere = turn.mathRendered?.get(cardId)
     for (const [segId, fullText] of segmentTexts) {
+      if (cardkit.isDeadElement(cardId, segId)) {
+        fallbackSegments.set(segId, fullText)
+        continue
+      }
       if (renderedHere?.has(segId)) continue
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
+    }
+    if (turn.rotateGivenUp) {
+      for (const [segId, fullText] of segmentTexts) fallbackSegments.set(segId, fullText)
     }
 
     // State marker leads the footer (✅ for natural completion, or the
@@ -3346,6 +3396,10 @@ export class Session {
       suffix,
     }))
     await cardkit.dispose(cardId)
+
+    for (const text of fallbackSegments.values()) {
+      await this.sendAssistantTextFallback(text, 'CardKit 元素未落地')
+    }
 
     // Phone push on clean turn close so the user knows Codex is done
     // even with the chat backgrounded. Skip on interrupts (no real
