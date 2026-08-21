@@ -104,3 +104,27 @@ describe('cardkit write-dead card', () => {
     await cardkit.dispose('card_wd')
   })
 })
+
+describe('disposed card write guard (review #3)', () => {
+  test('dispose 后 addElement/replaceElement 不产生 HTTP 调用', async () => {
+    const cardId = 'card_disposed_guard'
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.dispose(cardId)
+    const before = calls.length
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'x1', content: 'hi' })
+    await cardkit.replaceElement(cardId, 'footer', { tag: 'markdown', element_id: 'footer', content: 'f' })
+    expect(calls.length).toBe(before) // 无新 HTTP
+    expect(await cardkit.addElementChecked(cardId, { tag: 'markdown', element_id: 'x2', content: 'hi' })).toBe(false)
+  })
+
+  test('recordCardCreated 复活同 id 卡(新 turn 复用 card id 场景)', async () => {
+    const cardId = 'card_revive'
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.dispose(cardId)
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'rv1', content: 'ok' })
+    await cardkit.flush(cardId)
+    expect(calls.some(c => c.method === 'POST' && c.path === `/cards/${cardId}/elements` && JSON.parse(c.body.elements)[0]?.element_id === 'rv1')).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+})

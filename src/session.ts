@@ -2644,9 +2644,9 @@ export class Session {
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
-        // 段 id 在新卡重编号,旧渲染标记清空;迁移段重新走渲染(或保持原码)。
-        // inflight 不清:旧段渲染 promise 还在写旧卡流程里,close 时仍要等。
-        turn.mathRenderedSegments = new Set()
+        // 渲染状态按卡隔离(review #2):旧卡的 rendered/inflight 条目原样
+        // 保留(下面旧卡收尾要 drain + 跳过),新卡从零开始 —— 段 id 重编号
+        // 后同名段不会被旧卡标记误伤。
         if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
         // 先在新卡重建实时任务总览区(紧贴 footer)。必须在 assistant/tool 重建
@@ -2680,11 +2680,12 @@ export class Session {
             targetElementId: sessionTools.taskLiveAnchor(turn),
           })
           if (mathRender.hasMathSpans(fullText)) {
-            const rp = this.replaceSegmentWithMathImgs(turn, reSegId, fullText)
+            const rp = this.replaceSegmentWithMathImgs(turn, newCardId, reSegId, fullText)
               .catch(e => log(`session "${this.sessionName}": math render ${reSegId} failed: ${e}`))
-            turn.mathRenderInflight ??= new Set()
-            turn.mathRenderInflight.add(rp)
-            void rp.finally(() => turn.mathRenderInflight?.delete(rp))
+            turn.mathRenderInflight ??= new Map()
+            turn.mathRenderInflight.get(newCardId) ?? (turn.mathRenderInflight.set(newCardId, new Set()), undefined)
+            turn.mathRenderInflight.get(newCardId)!.add(rp)
+            void rp.finally(() => turn.mathRenderInflight?.get(newCardId)?.delete(rp))
           }
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
@@ -2702,12 +2703,22 @@ export class Session {
         // 是因为这条链是 async,期间 cardkit 队列上还可能有 add/replace 等;
         // 让它们排在 footer 之前,视觉更连贯。
         try {
+          // 旧卡 inflight 公式渲染先 drain(渲染 promise 只写捕获的
+          // oldCardId,不会碰新卡)—— 不等的话下面原文 replace 会覆盖
+          // 还没落地的渲染版,渲染晚到再写已被 dispose 拒绝(review #2)。
+          const oldInflight = turn.mathRenderInflight?.get(oldCardId)
+          if (oldInflight?.size) {
+            await Promise.allSettled([...oldInflight])
+          }
           await cardkit.flush(oldCardId)
           // 旧卡上已完成的 assistant 段做最终替换。当前迁移中的半段尚未
-          // 插入旧卡,直接跳过,避免同一段同时出现在两张卡上。
+          // 插入旧卡,直接跳过,避免同一段同时出现在两张卡上。已渲染段
+          // 跳过 —— 原文重渲会把渲染版覆盖回 $$…$$ 降级(review #2)。
+          const oldRendered = turn.mathRendered?.get(oldCardId)
           for (const [segId, fullText] of oldSegmentTexts) {
             if (carrySegId && carryText && segId === carrySegId) continue
             if (cardkit.isDeadElement(oldCardId, segId)) continue
+            if (oldRendered?.has(segId)) continue
             await cardkit.replaceElement(oldCardId, segId, {
               tag: 'markdown',
               element_id: segId,
@@ -3008,35 +3019,46 @@ export class Session {
    *  img 元素(精确尺寸,不撑卡宽),段 markdown 替换为摘出后的文本,公式
    *  图按序插在自己所属段元素正后方(insert_after segId —— 不能插
    *  taskLiveAnchor,多段轮里后续段落会把先插的图顶到段落流末尾)。
-   *  inline 公式 Unicode 转写留在文本里。 */
-  private async replaceSegmentWithMathImgs(turn: TurnState, segId: string, text: string): Promise<void> {
+   *  inline 公式 Unicode 转写留在文本里。
+   *
+   *  cardId 是调度时捕获的快照:渲染期间 rotation 可能切换 turn.cardId,
+   *  绝不能在读 turn.cardId —— 否则旧段渲染结果会写穿到新卡、覆盖新卡
+   *  同名段(review #1)。写入用 checked API:任一写失败即中止并不标
+   *  rendered —— close 的原文兜底重渲会恢复完整公式文本,不让公式被
+   *  悄悄吞掉(review #4)。 */
+  private async replaceSegmentWithMathImgs(turn: TurnState, cardId: string, segId: string, text: string): Promise<void> {
     const { text: stripped, formulaImgs } = await mathRender.renderMathInText(text)
-    // 渲染完成时卡可能已被 closeTurnCard 收尾 dispose(turn close 不等
-    // 这个 fire-and-forget promise)—— 写入会静默死,段留在原文降级态。
-    // cardkit dispose 后队列 resolve 但不写;这里显式查 dead 卡直接放弃,
-    // 并 log 暴露(不静默)。
-    if (cardkit.isDeadElement(turn.cardId, segId)) {
-      log(`session "${this.sessionName}": math render ${segId} landed after card closed — dropped`)
-      return
-    }
-    await cardkit.replaceElement(turn.cardId, segId, {
+    const okReplace = await cardkit.replaceElementChecked(cardId, segId, {
       tag: 'markdown',
       element_id: segId,
       content: this.cleanAssistantTextForDisplay(stripped).trim() || ' ',
     })
+    if (!okReplace) {
+      log(`session "${this.sessionName}": math render ${segId} write dropped (card closed/element dead) — raw text stays`)
+      return
+    }
     let anchor = segId
     for (const img of formulaImgs) {
       const imgEl = img.element as { element_id?: string }
       const imgId = imgEl.element_id ?? `math_${segId}_${img.index}`
       imgEl.element_id = imgId
-      await cardkit.addElement(turn.cardId, img.element, {
+      const okAdd = await cardkit.addElementChecked(cardId, img.element, {
         type: 'insert_after', targetElementId: anchor,
       })
+      if (!okAdd) {
+        // 部分成功 = 公式文本已被摘除但图没插上 —— 公式内容会丢。回滚:
+        // 把段 replace 回原文(close 的兜底循环会跳过我们,所以必须在这里
+        // 自己恢复),让 $$…$$ 走可见降级而不是消失(review #4)。
+        await cardkit.replaceElementChecked(cardId, segId, this.completedAssistantElement(segId, text))
+        log(`session "${this.sessionName}": math render ${segId} img add failed — rolled back to raw text`)
+        return
+      }
       anchor = imgId // 第 N 张图插在第 N-1 张后,保持段内顺序
     }
-    // 标记本段已渲染:closeTurnCard 的收尾重渲不得用原文覆盖渲染版
-    turn.mathRenderedSegments ??= new Set()
-    turn.mathRenderedSegments.add(segId)
+    // 全部写入确认成功才标 rendered:closeTurnCard 的收尾重渲跳过本段
+    turn.mathRendered ??= new Map()
+    turn.mathRendered.get(cardId) ?? (turn.mathRendered.set(cardId, new Set()), undefined)
+    turn.mathRendered.get(cardId)!.add(segId)
     log(`session "${this.sessionName}": math rendered ${segId} (${formulaImgs.length} img)`)
   }
 
@@ -3045,14 +3067,17 @@ export class Session {
     // rotation 的 dead-element 判断都依赖它。公式渲染是 async 的(秒级),
     // 不能推迟入队;先同步上原文(公式段此时是 $$…$$ 原码,sanitize 会降级
     // 成代码块占位),渲染完成后 replace 成摘出文本 + 紧贴插入公式图。
+    // cardId 此刻同步捕获,渲染 promise 之后只写这张卡(review #1)。
     if (mathRender.hasMathSpans(text)) {
-      const rp = this.replaceSegmentWithMathImgs(turn, segId, text)
+      const cardId = turn.cardId
+      const rp = this.replaceSegmentWithMathImgs(turn, cardId, segId, text)
         .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
-      // 记入 in-flight 集合:closeTurnCard 在收尾重渲前 await 全部,
-      // 防原文 replace 赢得竞态覆盖渲染版(渲染晚到即写已 dispose 的卡)。
-      turn.mathRenderInflight ??= new Set()
-      turn.mathRenderInflight.add(rp)
-      void rp.finally(() => turn.mathRenderInflight?.delete(rp))
+      // 记入 per-card in-flight:closeTurnCard / rotation 各自只 drain 自己
+      // 卡上的渲染,防原文 replace 赢得竞态覆盖渲染版(review #2)。
+      turn.mathRenderInflight ??= new Map()
+      turn.mathRenderInflight.get(cardId) ?? (turn.mathRenderInflight.set(cardId, new Set()), undefined)
+      turn.mathRenderInflight.get(cardId)!.add(rp)
+      void rp.finally(() => turn.mathRenderInflight?.get(cardId)?.delete(rp))
     }
     const p = cardkit.addElement(
       turn.cardId,
@@ -3259,19 +3284,24 @@ export class Session {
       turn.currentAssistantText = ''
     }
 
-    // 等全部 in-flight 公式渲染落地(渲染+上传是秒级 async)。不等的话下面
-    // 的原文 replace 会先赢,把还没落地的渲染版覆盖回 $$…$$ 原码降级;渲染
-    // promise 晚到再写就打在已 dispose 的卡上静默死 —— 这正是「公式图永远
-    // 不出现、只见代码块」的病根。
-    if (turn.mathRenderInflight?.size) {
-      await Promise.allSettled([...turn.mathRenderInflight])
+    // 等本卡全部 in-flight 公式渲染落地(渲染+上传是秒级 async,且有超时
+    // 上限——math-render 上传 15s AbortController,不会无限挂)。不等的话
+    // 下面的原文 replace 会先赢,把还没落地的渲染版覆盖回 $$…$$ 原码降级;
+    // 渲染 promise 晚到再写就打在已 dispose 的卡上静默死 —— 这正是「公式
+    // 图永远不出现、只见代码块」的病根。只 drain 本卡:rotation 期间登记
+    // 的旧卡渲染由 rotation 自己 drain(review #2)。
+    const inflight = turn.mathRenderInflight?.get(cardId)
+    if (inflight?.size) {
+      await Promise.allSettled([...inflight])
     }
     // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
     // 这里只是收尾重渲兜住异常路径 —— 但公式段例外:replaceSegmentWithMathImgs
     // 已经把段替换成摘出文本 + 紧贴插入公式图,这里再用原文重渲会把渲染版
-    // 覆盖回 $$…$$ 原码降级(代码块占位),图也失去归属段。
+    // 覆盖回 $$…$$ 原码降级(代码块占位),图也失去归属段。已渲染标记按卡
+    // 隔离:本卡的段才跳过(rotation 重编号后新卡同名段不受旧卡标记影响)。
+    const renderedHere = turn.mathRendered?.get(cardId)
     for (const [segId, fullText] of segmentTexts) {
-      if (turn.mathRenderedSegments?.has(segId)) continue
+      if (renderedHere?.has(segId)) continue
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
     }
 

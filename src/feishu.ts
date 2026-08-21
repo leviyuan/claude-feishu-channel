@@ -811,10 +811,13 @@ async function uploadImageMultipart(filePath: string): Promise<string | null> {
   const form = new FormData()
   form.append('image_type', 'message')
   form.append('image', file, basename(filePath))
+  // 公式图等 async 渲染路径依赖此上传完成;无超时的挂死上传会连坐
+  // closeTurnCard 的 drain(card review #5),15s 上限后失败可见。
   const res = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: form,
+    signal: AbortSignal.timeout(15_000),
   })
   const data = await res.json() as any
   if (data?.code !== 0) {

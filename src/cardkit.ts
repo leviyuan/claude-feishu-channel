@@ -88,6 +88,19 @@ function state(cardId: string): CardState {
   return s
 }
 
+/** Card ids that were disposed (turn closed / rotated away). Mutation APIs
+ *  on a disposed card must NOT silently re-create state via state() and fire
+ *  real HTTP writes at a card whose stream is closed — that both pollutes
+ *  the wire and resurrects leaked state. Checked callers observe false /
+ *  no-op instead (review #3). */
+const disposedCards = new Set<string>()
+
+/** True if this card was disposed. Late async writers (math render promises
+ *  landing after turn close) check this before scheduling writes. */
+export function isDisposed(cardId: string): boolean {
+  return disposedCards.has(cardId)
+}
+
 /** Session calls this once right after sendCard + convertMessageToCard,
  * passing the number of elements that were in the card's initial body
  * (banner + userInputPanel + footer = 1–3 depending on turn
@@ -100,9 +113,13 @@ export function recordCardCreated(
   initialElementCount: number,
   onFailure?: (code?: number) => void,
 ): void {
+  // 新生命周期开始:同 id 重建(测试复用固定 card id / 飞书同 id 再开卡)
+  // 时清除 disposed 标记,恢复可写。
+  disposedCards.delete(cardId)
   const s = state(cardId)
   s.elementCount = initialElementCount
   s.onFailure = onFailure
+  s.writeDead = false
 }
 
 /** Read the live element count maintained by addElement/deleteElement.
@@ -295,7 +312,7 @@ export function addElement(
   onFailure?: (code?: number) => void,
 ): Promise<void> {
   const s = state(cardId)
-  if (s.writeDead) return Promise.resolve()
+  if (disposedCards.has(cardId) || s.writeDead) return Promise.resolve()
   const elementId = (element as { element_id?: string }).element_id
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
@@ -332,7 +349,7 @@ export function addElement(
 /** Replace an entire element (used to swap a tool placeholder with its result). */
 export function replaceElement(cardId: string, elementId: string, element: object): Promise<void> {
   const s = state(cardId)
-  if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (disposedCards.has(cardId) || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
@@ -348,10 +365,44 @@ export function replaceElement(cardId: string, elementId: string, element: objec
   return s.queue
 }
 
+/** Checked variants for callers that must know whether the write actually
+ *  landed (math render: only mark a segment "rendered" when every write
+ *  succeeded — a false marker would swallow the formula entirely, review #4).
+ *  Resolves false on: card disposed, card write-dead, element dead, or the
+ *  API call failing after retries. Never throws. */
+export async function replaceElementChecked(cardId: string, elementId: string, element: object): Promise<boolean> {
+  if (disposedCards.has(cardId)) return false
+  const s = state(cardId)
+  if (s.writeDead || s.deadElements.has(elementId)) return false
+  try {
+    await replaceElement(cardId, elementId, element)
+    return !s.writeDead && !s.deadElements.has(elementId)
+  } catch {
+    return false
+  }
+}
+
+export async function addElementChecked(
+  cardId: string,
+  element: object,
+  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+): Promise<boolean> {
+  if (disposedCards.has(cardId)) return false
+  const s = state(cardId)
+  if (s.writeDead) return false
+  const elementId = (element as { element_id?: string }).element_id
+  try {
+    await addElement(cardId, element, opts)
+    return !s.writeDead && !(elementId && s.deadElements.has(elementId))
+  } catch {
+    return false
+  }
+}
+
 /** Delete an element by id. */
 export function deleteElement(cardId: string, elementId: string): Promise<void> {
   const s = state(cardId)
-  if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (disposedCards.has(cardId) || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
@@ -441,6 +492,9 @@ export async function dispose(cardId: string): Promise<void> {
   if (!s) return
   await flush(cardId)
   await s.queue
-  cards.delete(cardId)
+  // 保留 state 条目(dead-element 标记在 rotation 判定里还要读),但登记
+  // disposed:此后任何 mutation(含晚到的 async 写)在入口即拒,不再经
+  // state() 重建、不再发真 HTTP(review #3)。
+  disposedCards.add(cardId)
   cancelSummary(cardId)
 }
