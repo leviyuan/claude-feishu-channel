@@ -55,12 +55,26 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 afterEach(() => { elementPatches.length = 0 })
 process.on('exit', () => { globalThis.fetch = originalFetch; rmSync(dir, { recursive: true, force: true }) })
 
-const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
-const { getTokenSource, refreshAllTokenSourceModels } = await import('./token-source')
+await import('./token-source-builtins')
+const {
+  getTokenSource,
+  refreshAllTokenSourceModels,
+  registerTokenSource,
+  resetTokenSourceRegistry,
+  tokenSourceFactories,
+} = await import('./token-source')
 const { onModelCustomPrompt, consumeModelCustomMessage } = await import('./session-model')
 
 test('补录回复原位更新卡片:通过→effort 选择面板,失败→红字面板,不单发消息', async () => {
-  buildTokenSourcesFromConfig()
+  // 不依赖进程里其他测试对 ./config 的 mock.module 覆盖；直接用显式测试
+  // 凭据构造 GLM source，避免全量 suite 加载顺序决定 enabled 状态。
+  resetTokenSourceRegistry()
+  const glmFactory = tokenSourceFactories().find(factory => factory.kind === 'glm-coding-plan')!
+  registerTokenSource(glmFactory.build({
+    base_url: 'https://open.bigmodel.cn/api/anthropic',
+    auth_token: 'test-token',
+    model: 'GLM-5.2',
+  }, null))
   await refreshAllTokenSourceModels()
   const glm = getTokenSource('glm')
   const fake: any = {
