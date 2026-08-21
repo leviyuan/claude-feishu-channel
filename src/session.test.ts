@@ -9,7 +9,7 @@ const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
-const { resetTokenSourceRegistry } = await import('./token-source')
+const { getTokenSource, resetTokenSourceRegistry } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, refreshUsageFromConnection } = await import('./usage')
 
@@ -46,11 +46,11 @@ beforeEach(() => {
 
 class FakeAgentProc extends EventEmitter {
   lastAssistantUuid = null
-  lastModel = null
-  lastEffort = null
-  lastUsage = null
-  lastTotalUsage = null
-  lastResult = {
+  lastModel: string | null = null
+  lastEffort: string | null = null
+  lastUsage: any = null
+  lastTotalUsage: any = null
+  lastResult: any = {
     cost_usd: null,
     cost_delta_usd: null,
     duration_ms: null,
@@ -228,8 +228,7 @@ describe('Session token accounting', () => {
 
 describe('Session assistant rendering', () => {
   test('buffers assistant deltas and inserts one completed markdown element without content streaming', async () => {
-    // 本测断言 bucket 档位文案;本地 config 可能是 second,且全量 suite 里
-    // mock.module('./config') 可能缺 runtime —— 先补 runtime 再钉死 bucket。
+    // 本测断言 bucket 档位文案；显式钉死模式，隔离本机配置差异。
     const cfg = config as any
     const previousRuntime = cfg.runtime
     cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'bucket' }
@@ -681,6 +680,40 @@ describe('Session provider switching', () => {
     expect(session.selectedEffort).toBe('max')
   })
 
+  test('keeps an explicit unavailable source and fails closed instead of switching accounts', () => {
+    modelSelections.set('missing-source', {
+      provider: 'claude', model: 'model-x', effort: 'high', tokenSourceId: 'removed-account',
+    })
+    const session = new Session('missing-source', 'chat_id') as any
+
+    expect(session.selectedTokenSourceId).toBe('removed-account')
+    expect(() => session.spawnAgent()).toThrow('token source "removed-account" 不可用')
+  })
+
+  test('replaces an idle process when the same source id gets new spawn credentials', async () => {
+    const source = getTokenSource('glm')!
+    const prevEnabled = source.enabled
+    const prevRevision = source.spawnRevision
+    source.enabled = true
+    source.spawnRevision = 'new-credentials'
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm')
+      session.proc = proc
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = 'glm'
+      session.procSourceRevisions.set(proc, 'old-credentials')
+
+      await session.stopIdleMismatchedProcess()
+
+      expect(proc.killCalls).toBe(1)
+      expect(session.proc).toBeNull()
+    } finally {
+      source.enabled = prevEnabled
+      source.spawnRevision = prevRevision
+    }
+  })
+
   test('rejects non-fixed Claude model outside the two fixed choices', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -708,7 +741,7 @@ describe('Session provider switching', () => {
 
     const ok = await session.start({
       announce: false,
-      onStatus: status => statuses.push(status),
+      onStatus: (status: string) => statuses.push(status),
     })
 
     expect(ok).toBe(false)
@@ -731,7 +764,7 @@ describe('Session provider switching', () => {
 
     const ok = await session.start({
       announce: false,
-      onStatus: status => statuses.push(status),
+      onStatus: (status: string) => statuses.push(status),
     })
 
     expect(ok).toBe(true)
@@ -1147,6 +1180,12 @@ describe('Session workDir project profile override', () => {
     projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
     const session = new Session('withoverride', 'oc_test_override')
     expect(session.workDir).toBe('/abs/custom/dir')
+  })
+
+  test('derives a worktree child session beside the profiled project root', () => {
+    projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
+    const session = new Session('withoverride[feature-x]', 'oc_test_worktree_override')
+    expect(session.workDir).toBe('/abs/custom/withoverride[feature-x]')
   })
 
   test('falls back to PROJECTS_ROOT/<name> without profile', () => {
@@ -1765,8 +1804,7 @@ describe('Session codex plan live panel (plan_live)', () => {
 })
 
 describe('Session live_elapsed second mode', () => {  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
-    // claude-agent-process.test 的 mock.module('./config') 会在全量 suite 里
-    // 把 config 换成缺 runtime 的 stub;这里先补上 runtime 再改 mode。
+    // 显式钉死 second 模式，隔离本机配置差异。
     const cfg = config as any
     const previousRuntime = cfg.runtime
     cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'second' }
@@ -1822,5 +1860,528 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       else cfg.runtime = previousRuntime
       await cardkit.dispose(turn.cardId)
     }
+  })
+})
+
+describe('Session lifecycle reliability', () => {
+  test('Codex init timeout is a failed start and never reports ready', async () => {
+    const session = new Session('codex-timeout', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    const statuses: string[] = []
+    session.selectedProvider = 'codex'
+    session.spawnAgent = () => proc
+    session.waitForProcInit = async () => ({ state: 'timeout' })
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(statuses.some(status => status.includes('启动超时'))).toBe(true)
+    expect(statuses.some(status => status.includes('已就绪'))).toBe(false)
+  })
+
+  test('serializes concurrent restarts so a kill completes before either replacement spawn', async () => {
+    const session = new Session('restart-race', 'chat_id') as any
+    const initial = new FakeAgentProc('claude', 'session-initial')
+    session.proc = initial
+    session.selectedProvider = 'claude'
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    let releaseInitialKill: () => void = () => {}
+    const initialKillGate = new Promise<void>(resolve => { releaseInitialKill = resolve })
+    initial.kill = async () => {
+      initial.killCalls++
+      await initialKillGate
+      initial.alive = false
+      initial.emit('exit', { code: 0, signal: null, expected: true })
+    }
+
+    const spawned: FakeAgentProc[] = []
+    const aliveAtSpawn: number[] = []
+    session.spawnAgent = () => {
+      aliveAtSpawn.push([initial, ...spawned].filter(proc => proc.alive).length)
+      const proc = new FakeAgentProc('claude', `session-${spawned.length + 1}`)
+      spawned.push(proc)
+      return proc
+    }
+
+    const first = session.restart(false, { announce: false })
+    const second = session.restart(false, { announce: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(initial.killCalls).toBe(1)
+    expect(spawned).toHaveLength(0)
+    releaseInitialKill()
+
+    expect(await Promise.all([first, second])).toEqual([true, true])
+    expect(aliveAtSpawn).toEqual([0, 0])
+    expect(spawned).toHaveLength(2)
+    expect(spawned[0].killCalls).toBe(1)
+    expect(spawned.filter(proc => proc.alive)).toEqual([spawned[1]])
+    expect(session.proc).toBe(spawned[1])
+
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('ignores late events from a replaced process generation', async () => {
+    const session = new Session('stale-events', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const currentProc = new FakeAgentProc('claude', 'current-session')
+    session.attachProc(oldProc)
+    session.attachProc(currentProc)
+    session.initCount = 0
+
+    oldProc.emit('init', { session_id: 'old-session' })
+    oldProc.emit('assistant_text', { text: 'stale output' })
+    oldProc.emit('exit', { code: 0, signal: 'SIGTERM', expected: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(session.proc).toBe(currentProc)
+    expect(session.initCount).toBe(0)
+    expect(session.orphanAssistantCurrent).toBe('')
+    expect(sentTexts.some(text => text.includes('异常退出'))).toBe(false)
+
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('opens a mid-turn card before feeding the buffered batch and drops input on card init failure', async () => {
+    const session = new Session('midturn-card-first', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.pendingMidTurnMsgs = [{
+      text: 'queued input', wireText: 'queued input', userOpenId: 'ou_user', msgId: 'om_queued',
+    }]
+    session.pendingReactionIds = new Map([['om_queued', 'reaction_waiting']])
+
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        return new Response(JSON.stringify({ code: 99, msg: 'convert failed' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      await session.drainMidTurnAndOpen()
+
+      expect(proc.sentTexts).toEqual([])
+      expect(session.currentTurn).toBeNull()
+      expect(session.status).toBe('idle')
+      expect(sentRawTexts.join('\n')).toContain('尚未送给 Claude')
+      expect(deletedReactions).toContainEqual(['om_queued', 'reaction_waiting'])
+    } finally {
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('unexpected exit terminalizes the main card, settles tasks, and alerts even for code=0 SIGTERM', async () => {
+    const session = new Session('unexpected-exit', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const turn = turnState('card_unexpected_exit')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    session.backgroundTasks = [{
+      id: 'bg-1', type: 'shell', description: 'still running', status: 'running',
+      startedAt: Date.now(), steps: [],
+    }]
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.attachProc(proc)
+
+    proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: false })
+    await session.waitForLifecycleIdle()
+
+    expect(session.proc).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.status).toBe('stopped')
+    expect(sentTexts.some(text =>
+      text.includes('异常退出') && text.includes('code=0') && text.includes('SIGTERM')
+    )).toBe(true)
+    const footerWrites = calls.filter(call =>
+      call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`
+    )
+    expect(footerWrites.some(call => JSON.parse(call.body.element).content.includes('异常退出'))).toBe(true)
+    expect(calls.some(call =>
+      call.method === 'PATCH' && call.path === `/cards/${turn.cardId}/settings`
+    )).toBe(true)
+  })
+
+  test('keeps CardKit state and sends fallback when the terminal footer transaction misses', async () => {
+    const session = new Session('terminal-miss', 'chat_id') as any
+    const turn = turnState('card_terminal_miss')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      if (method === 'PUT' && path === `/cards/${turn.cardId}/elements/footer`) {
+        calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+        return new Response(JSON.stringify({ code: 300308, msg: 'footer rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      await session.closeTurnCard()
+
+      expect(sentRawTexts.join('\n')).toContain('终态写入失败')
+      expect(sentRawTexts.join('\n')).toContain('footer=MISS')
+      // A disposed card returns false immediately. A successful repair PATCH
+      // proves closeTurnCard deliberately retained the state after the miss.
+      expect(await cardkit.patchSettingsChecked(turn.cardId, { config: { streaming_mode: false } })).toBe(true)
+    } finally {
+      globalThis.fetch = baseFetch
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('stop clears visible state but keeps an unconfirmed process blocked until its real exit', async () => {
+    const session = new Session('stop-kill-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const lifecycleSnapshots: Array<{ shouldRevive: boolean; status: string }> = []
+    session.opts.onLifecycleChange = () => {
+      lifecycleSnapshots.push({ shouldRevive: session.shouldRevive(), status: session.status })
+    }
+    proc.kill = async () => {
+      // The persisted alive marker callback must run before the first kill
+      // await, while the explicit stop intent already excludes this process.
+      expect(lifecycleSnapshots[0]).toEqual({ shouldRevive: false, status: 'stopped' })
+      throw new Error('kill timeout')
+    }
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_stop_kill_failure')
+    session.pendingMidTurnMsgs = [{ text: 'queued', wireText: 'queued', userOpenId: '', msgId: '' }]
+    session.backgroundTasks = [{
+      id: 'bg', type: 'shell', description: 'running', status: 'running', startedAt: Date.now(), steps: [],
+    }]
+
+    await expect(session.stop('测试', { announce: false })).rejects.toThrow('kill timeout')
+    expect(session.proc).toBe(proc)
+    expect(session.blockedProc).toBe(proc)
+    expect(session.shouldRevive()).toBe(false)
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.status).toBe('stopped')
+    expect(lifecycleSnapshots.length).toBeGreaterThanOrEqual(2)
+    await session.onUserMessage('must not spawn or feed')
+    expect(proc.sentTexts).toEqual([])
+    expect(sentTexts.some(text => text.includes('会话已阻断'))).toBe(true)
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+    expect(session.proc).toBeNull()
+    expect(session.blockedProc).toBeNull()
+  })
+
+  test('restart does not spawn after kill failure and still clears stale lifecycle state', async () => {
+    const session = new Session('restart-kill-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.kill = async () => { throw new Error('kill timeout') }
+    let spawnCalls = 0
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_restart_kill_failure')
+    session.pendingUserMessageCount = 1
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('claude') }
+
+    expect(await session.restart(false, { announce: false })).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.blockedProc).toBe(proc)
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.status).toBe('stopped')
+
+    expect(await session.start({ announce: false })).toBe(false)
+    expect(spawnCalls).toBe(0)
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+    expect(session.proc).toBeNull()
+  })
+
+  test('process ownership still becomes blocked when kill and terminal cleanup both fail', async () => {
+    const session = new Session('stop-double-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.kill = async () => { throw new Error('kill timeout') }
+    session.proc = proc
+    session.wireProc(proc)
+    session.resetBackgroundTasks = async () => { throw new Error('background cleanup failed') }
+
+    await expect(session.stop('测试', { announce: false })).rejects.toThrow(
+      /stop failed: kill timeout; background cleanup failed/,
+    )
+
+    expect(session.proc).toBe(proc)
+    expect(session.stoppingProc).toBeNull()
+    expect(session.blockedProc).toBe(proc)
+    expect(session.shouldRevive()).toBe(false)
+    await session.onUserMessage('must remain blocked')
+    expect(proc.sentTexts).toEqual([])
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+  })
+
+  test('restart surfaces cleanup separately and never spawns after a failed stop transaction', async () => {
+    const session = new Session('restart-double-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const statuses: string[] = []
+    let spawnCalls = 0
+    proc.kill = async () => { throw new Error('kill timeout') }
+    session.proc = proc
+    session.wireProc(proc)
+    session.resetBackgroundTasks = async () => { throw new Error('background cleanup failed') }
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('claude') }
+
+    expect(await session.restart(false, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })).toBe(false)
+
+    expect(spawnCalls).toBe(0)
+    expect(session.blockedProc).toBe(proc)
+    expect(statuses.join('\n')).toContain('kill=kill timeout')
+    expect(statuses.join('\n')).toContain('cleanup=background cleanup failed')
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+  })
+
+  test('kill command terminalizes its status card with the blocked-process failure', async () => {
+    const session = new Session('kill-command-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.kill = async () => { throw new Error('kill timeout') }
+    session.proc = proc
+    session.wireProc(proc)
+
+    await expect(session.runCommand('kill')).resolves.toBe(true)
+
+    const footerContents = calls
+      .filter(call => call.method === 'PUT' && call.path.includes('/elements/footer'))
+      .map(call => JSON.parse(call.body.element).content as string)
+    expect(footerContents.some(content =>
+      content.includes('未确认终止') && content.includes('会话已阻断') && content.includes('kill timeout')
+    )).toBe(true)
+    const terminalSettings = calls
+      .filter(call => call.method === 'PATCH' && call.path.endsWith('/settings'))
+      .map(call => JSON.parse(call.body.settings))
+    expect(terminalSettings.some(settings => settings?.config?.streaming_mode === false)).toBe(true)
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+  })
+
+  test('retains static card state when mutation reopens streaming and close also fails', async () => {
+    const session = new Session('static-card-miss', 'chat_id') as any
+    const cardId = 'card_static_miss'
+    cardkit.recordCardCreated(cardId, 1)
+    const baseFetch = globalThis.fetch
+    let replaceAttempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      if (method === 'PUT' && path.includes('/elements/')) {
+        replaceAttempts++
+        return new Response(JSON.stringify(replaceAttempts === 1
+          ? { code: 300309, msg: 'stream closed' }
+          : { code: 300308, msg: 'replace rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'PATCH' && path.endsWith('/settings')) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {}
+        const settings = JSON.parse(String(body.settings ?? '{}'))
+        const reopening = settings?.config?.streaming_mode === true
+        return new Response(JSON.stringify(reopening
+          ? { code: 0, data: {} }
+          : { code: 300308, msg: 'close rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      const landed = await session.mutateStaticCard(cardId, 'test static', async () => {
+        const replaced = await cardkit.replaceElementChecked(cardId, 'panel', {
+          tag: 'markdown', element_id: 'panel', content: 'new',
+        }, { notifyCardFailure: false })
+        if (!replaced) throw new Error('replace failed')
+      })
+      expect(landed).toBe(false)
+    } finally {
+      globalThis.fetch = baseFetch
+    }
+    // A disposed/tombstoned card would return false without an HTTP call.
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('retains static card state when the checked mutation misses even if streaming-off lands', async () => {
+    const session = new Session('static-mutation-miss', 'chat_id') as any
+    const cardId = 'card_static_mutation_miss'
+    cardkit.recordCardCreated(cardId, 1)
+
+    expect(await session.mutateStaticCard(cardId, 'test static', async () => {
+      throw new Error('mutation MISS')
+    })).toBe(false)
+
+    // A disposed card returns false immediately; true proves the failed
+    // mutation retained repairable CardKit state.
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('hard stop terminalizes an active main card before releasing lifecycle ownership', async () => {
+    const session = new Session('stop-active-card', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const turn = turnState('card_stop_active')
+    turn.userOpenId = ''
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    await session.stop('测试停止', { announce: false })
+
+    const footer = calls.find(call =>
+      call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`
+    )
+    expect(JSON.parse(footer?.body.element ?? '{}').content).toContain('🛑 测试停止')
+    expect(calls.some(call =>
+      call.method === 'PATCH' && call.path === `/cards/${turn.cardId}/settings`
+    )).toBe(true)
+  })
+
+  test('a user message owns the lifecycle mutex before a subsequently queued restart', async () => {
+    const session = new Session('message-lifecycle-mutex', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.initCount = 1
+    session.status = 'idle'
+
+    let signalOpenStarted: () => void = () => {}
+    const openStarted = new Promise<void>(resolve => { signalOpenStarted = resolve })
+    let releaseOpen: () => void = () => {}
+    const openGate = new Promise<void>(resolve => { releaseOpen = resolve })
+    session.openTurnCard = async () => {
+      signalOpenStarted()
+      await openGate
+      const turn = turnState('card_message_mutex')
+      turn.userOpenId = ''
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      return turn
+    }
+    const spawned: FakeAgentProc[] = []
+    session.spawnAgent = () => {
+      const next = new FakeAgentProc('claude', `session-next-${spawned.length}`)
+      spawned.push(next)
+      return next
+    }
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    const message = session.onUserMessage('first')
+    await openStarted
+    const restart = session.restart(false, { announce: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(proc.killCalls).toBe(0)
+
+    releaseOpen()
+    await message
+    expect(proc.sentTexts).toEqual(['first'])
+    expect(await restart).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBe(spawned[0])
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('persisted model selection cannot mutate Session state while a user message owns lifecycle', async () => {
+    const session = new Session('model-lifecycle-mutex', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.initCount = 1
+
+    let signalOpenStarted: () => void = () => {}
+    const openStarted = new Promise<void>(resolve => { signalOpenStarted = resolve })
+    let releaseOpen: () => void = () => {}
+    const openGate = new Promise<void>(resolve => { releaseOpen = resolve })
+    session.openTurnCard = async () => {
+      signalOpenStarted()
+      await openGate
+      const turn = turnState('card_model_mutex')
+      turn.userOpenId = ''
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      return turn
+    }
+
+    const message = session.onUserMessage('first')
+    await openStarted
+    const selection = session.applyModelSelection('codex', 'gpt-5.6-sol', 'xhigh', 'codex-sub')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(session.selectedProvider).toBe('claude')
+
+    releaseOpen()
+    await message
+    await selection
+    expect(session.selectedProvider).toBe('codex')
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('card action helpers report stale, invalid, and internal failures explicitly', async () => {
+    const session = new Session('action-outcomes', 'chat_id') as any
+
+    expect(await session.onPermissionDecision('missing', 'allow', 'ou_user')).toEqual({
+      ok: false,
+      message: '此权限请求已失效或已处理',
+    })
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.sendPermissionResponse = () => { throw new Error('pipe closed') }
+    session.proc = proc
+    session.pendingPermissions.set('perm-1', { toolUseId: 'tool-1' })
+    const failedPermission = await session.onPermissionDecision('perm-1', 'allow', 'ou_user')
+    expect(failedPermission.ok).toBe(false)
+    expect(failedPermission.message).toContain('pipe closed')
+    expect(session.pendingPermissions.has('perm-1')).toBe(true)
+
+    expect(await session.onAskAnswer('missing', 0, 0, 'ou_user')).toBe(false)
+    session.pendingAsks.set('ask-1', {
+      questions: [{ question: 'Pick?', options: [{ label: 'A' }] }],
+      i: 0,
+      answers: {},
+      answered: new Map(),
+      currentIdx: 0,
+    })
+    expect(await session.onAskAnswer('ask-1', 1, 0, 'ou_user')).toBe(false)
+    expect(await session.onAskAnswer('ask-1', 0, 9, 'ou_user')).toBe(false)
+    expect(await session.onAskAnswer('ask-1', 0, 0, 'ou_user')).toBe(true)
+
+    session.selectedProvider = 'codex'
+    expect((await session.onForkSelect(0, 'ou_user')).ok).toBe(false)
+    expect((await session.onBackSelect(0)).ok).toBe(false)
+    expect((await session.onResumeSelect('session-1')).ok).toBe(false)
   })
 })

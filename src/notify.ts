@@ -16,7 +16,7 @@
  *       "title":   "build",                    // optional, default = project
  *       "level":   "info" | "warn" | "error"   // optional, default "info"
  *       "images":  ["/abs/a.png", ...],        // optional, uploaded + embedded
- *       "buttons": [                           // optional, max 5
+ *       "buttons": [                           // optional, one full-width row each
  *         {"id":"approve","text":"✅ 通过","type":"primary"},
  *         {"id":"reject", "text":"❌ 拒绝","type":"danger"}
  *       ],
@@ -94,10 +94,12 @@ interface NotifyActionValue {
  *   - `processing` (push mode only): click received, push in flight
  *   - `delivered`: push acked 2xx → final success marker
  *   - `failed`: push rejected/timeout → inline failure reason
+ *   - `unknown`: external callback succeeded but durable local confirmation
+ *                failed — freeze and forbid automatic retry
  *   - `done`: pull / display-only mode — no push, freeze on the verdict
  * `operatorOpenId` is carried in the callback payload for the caller's
  * audit; the card itself shows only the choice + status. */
-export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'done'
+export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'unknown' | 'done'
 export interface NotifyResolution {
   status: NotifyResolutionStatus
   buttonId: string
@@ -153,9 +155,10 @@ export function buildNotifyCard(opts: {
   elements.push({ tag: 'markdown', content: downgradeExternalImagesForCardKit(opts.text ?? '') || '_（空消息）_' })
 
   if (opts.resolution) {
-    // Post-click status marker replaces the button row. operator open_id
-    // rides in the callback payload for the caller's audit; the card
-    // shows only choice + status + time.
+    // Post-click status marker normally replaces the button row. A definite
+    // callback failure is the one retryable terminal state, so it keeps the
+    // original buttons below the marker; processing/delivered/done/unknown
+    // remain non-interactive.
     const r = opts.resolution
     let marker: string
     if (r.status === 'processing') {
@@ -164,6 +167,8 @@ export function buildNotifyCard(opts: {
       marker = `<font color='red'>⚠️ 已选:${r.text} · 回调失败:${r.detail ?? '未知'} · ${hhmm}</font>`
     } else if (r.status === 'delivered') {
       marker = `<font color='green'>✅ 已选择:${r.text} · 反馈已送达 · ${hhmm}</font>`
+    } else if (r.status === 'unknown') {
+      marker = `<font color='red'>⚠️ 已选择:${r.text} · 外部回调已成功，但本地确认状态未知，禁止自动重试 · ${hhmm}</font>`
     } else {
       // 'done' — pull / display-only mode (no push to acknowledge).
       marker = `<font color='green'>✅ 已选择:${r.text} · ${hhmm}</font>`
@@ -174,7 +179,8 @@ export function buildNotifyCard(opts: {
     if (r.status === 'delivered' && r.reply) {
       elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(r.reply) })
     }
-  } else if (interactive) {
+  }
+  if (interactive && (!opts.resolution || opts.resolution.status === 'failed')) {
     // One full-width column whose elements stack vertically ⇒ each
     // button gets its own row, however many there are. Avoids the
     // side-by-side crush when labels are long or there are >3 options.

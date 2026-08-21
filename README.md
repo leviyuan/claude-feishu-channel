@@ -16,9 +16,9 @@ AI 不是帮手,是倍率。它放大的不是体力,是你 —— 你的直觉�
 
 ### 🧠 双后端:Claude Code + Codex
 
-夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 可在 Claude·GLM-5.2 与 Codex·GPT-5.5 之间一键切换,选择按群持久化。
+夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 会按“账号 → 动态模型 → effort”选择,结果按群持久化；可用项以当前账号和上游实时返回为准。
 
-强烈推荐 Claude Code 搭配 **GLM-5.2** —— 开放 1M token 上下文窗口,长会话不易丢前文。订阅了 GLM Coding Plan,`hi` 控制台会直接展示套餐档位、5 小时滚动窗口与月度用量;每条回复的 footer 也会带上当前 5h 窗口的已用百分比(`5h·N%`),额度消耗随时可见。
+使用 GLM Coding Plan 时,夜航星会从端点动态获取模型，并根据真实 turn 观测上下文窗口。`hi` 控制台会展示套餐档位、滚动窗口与月度用量；每条回复的 footer 也会带上当前窗口用量。
 
 **1. 装包**
 
@@ -48,7 +48,7 @@ lodestar-setup
 
 **3. 拉机器人进群**
 
-群名 = `projects_root` 下的目录名(没建会自动建)。发条消息,默认由 Claude·GLM-5.2 接管(群里发 `model` 可切到 Codex·GPT-5.5)。
+群名 = `projects_root` 下的目录名(没建会自动建)。发条消息后由当前默认 Claude source 接管；群里发 `model` 可选择其他已配置账号、模型与 effort。
 
 群里发这些**裸词**(不要斜杠,大小写不敏感)可以控 daemon:
 
@@ -56,11 +56,11 @@ lodestar-setup
 | --- | --- |
 | `hi` | 未运行时同一张卡动态启动并收束为控制台;运行中弹控制台 |
 | `stop` / `st` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
-| `kill` / `kl` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
+| `kill` / `kl` | 用状态卡展示关闭当前 agent 进程,resume id 落盘 |
 | `restart` / `rs` | 进行中:打断 + 放弃后台进程 + 恢复;空闲:列出项目最近 24h 会话(不足 10 条补更早),选一个在本群接续恢复 |
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
-| `model` / `md` | 展示固定两项面板(Codex·GPT-5.5 / Claude·GLM-5.2),一键生效,按群持久化 |
+| `model` / `md` | 展示账号→动态模型→effort 面板,按群持久化 |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
 
 **并发 worktree 群**
@@ -157,7 +157,7 @@ bin = "~/.local/bin/reclaude"   # 换 claude 包装器;路径错直接报错,不
 ---
 
 > [!TIP]
-> 想 7×24 长跑,用 `systemd --user`(Linux/macOS)或 Windows 任务计划程序拉起 `lodestar-daemon`。重启后上次活跃的 sessions 会并发自动 `--resume` 接回。
+> 想 7×24 长跑,Linux 使用 `systemd --user`,macOS 使用 `launchd`,Windows 使用任务计划程序拉起 `lodestar-daemon`。重启后上次活跃的 sessions 会并发自动恢复。
 
 ---
 

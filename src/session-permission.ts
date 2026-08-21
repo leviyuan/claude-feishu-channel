@@ -19,9 +19,29 @@ export async function onPermissionDecision(
   requestId: string,
   decision: 'allow' | 'allow_always' | 'deny',
   user: string,
-): Promise<void> {
+): Promise<{ ok: boolean; message: string }> {
   const pending = s.pendingPermissions.get(requestId)
-  if (!pending) { log(`session "${s.sessionName}": stray permission ${requestId}`); return }
+  if (!pending) {
+    log(`session "${s.sessionName}": stray permission ${requestId}`)
+    return { ok: false, message: '此权限请求已失效或已处理' }
+  }
+  const proc = s.proc
+  if (!proc) {
+    log(`session "${s.sessionName}": permission ${requestId} has no active process`)
+    return { ok: false, message: '后端进程已退出，权限决定未送达' }
+  }
+
+  const codexDecision = decision === 'deny' ? 'deny' : 'allow'
+  try {
+    proc.sendPermissionResponse(requestId, codexDecision, decision === 'allow_always'
+      ? { updatedPermissions: pending.permissionSuggestions }
+      : undefined)
+  } catch (error) {
+    log(`session "${s.sessionName}": permission response ${requestId} failed: ${error}`)
+    return { ok: false, message: `权限决定发送失败: ${error instanceof Error ? error.message : error}` }
+  }
+  // The protocol response is the commit point. Only now consume the pending
+  // request and repaint the main CardKit card.
   s.pendingPermissions.delete(requestId)
 
   // Update the tool element in the main turn card in place — the
@@ -49,14 +69,13 @@ export async function onPermissionDecision(
     }
   }
 
-  const codexDecision = decision === 'deny' ? 'deny' : 'allow'
   log(`session "${s.sessionName}": permission decision request=${requestId} tool_use_id=${pending.toolUseId} decision=${decision}`)
-  s.proc?.sendPermissionResponse(requestId, codexDecision, decision === 'allow_always'
-    ? { updatedPermissions: pending.permissionSuggestions }
-    : undefined)
-
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
+  }
+  return {
+    ok: true,
+    message: decision === 'deny' ? '已拒绝' : decision === 'allow_always' ? '已始终允许' : '已允许',
   }
 }
 

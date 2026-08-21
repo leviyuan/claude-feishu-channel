@@ -45,6 +45,7 @@ export function resetFeishuMock(): void {
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
+  resolveProjectDir: (name: string) => projectProfiles.get(name)?.cwd?.trim() || `/tmp/lodestar-projects/${name}`,
   getSessionResume: () => null,
   getSessionModelSelection: (sessionName: string) => modelSelections.get(sessionName) ?? null,
   getTenantToken: async () => 'tenant-token',
@@ -83,6 +84,7 @@ mock.module('./feishu', () => ({
     boundResumes.push([sessionName, sessionId, provider])
   },
   bindSessionModel: () => {},
+  isOpenAIChatGPTAuthenticated: () => true,
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
   // 临时群 / fork / back / rs 恢复相关 stub(测试不验证这些路径,no-op / 空返回)

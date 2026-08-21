@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const dir = mkdtempSync(join(tmpdir(), 'lodestar-cwo-'))
-process.env.LODESTAR_DATA_DIR = dir
+const originalDataDir = process.env.LODESTAR_DATA_DIR
 
 const {
   observeContextWindow,
@@ -19,8 +19,16 @@ function cacheFile(): string {
   return `${dir.replace(/\/+$/, '')}/context-window-cache.json`
 }
 
+beforeAll(() => {
+  process.env.LODESTAR_DATA_DIR = dir
+})
 beforeEach(() => resetContextWindowCache())
 afterEach(() => { if (existsSync(cacheFile())) rmSync(cacheFile()) })
+afterAll(() => {
+  if (originalDataDir === undefined) delete process.env.LODESTAR_DATA_DIR
+  else process.env.LODESTAR_DATA_DIR = originalDataDir
+  rmSync(dir, { recursive: true, force: true })
+})
 
 describe('context-window-observe(纯观测,零探测)', () => {
   test('未观测 → 默认加 [1m]', () => {
@@ -78,5 +86,3 @@ describe('context-window-observe(纯观测,零探测)', () => {
     expect(observedContextWindow('glm', 'X')).toBeUndefined()
   })
 })
-
-process.on('exit', () => rmSync(dir, { recursive: true, force: true }))

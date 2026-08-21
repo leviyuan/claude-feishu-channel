@@ -374,12 +374,12 @@ async function finishAgyTask(s: Session, task: AgyTaskState, code: number | null
     const forwardResultId = rememberAgyForwardPrompt(s, task, stderr, notice)
 
     await cardkit.flush(task.cardId)
-    await cardkit.replaceElement(
+    const statsLanded = await cardkit.replaceElementChecked(
       task.cardId,
       cards.ELEMENTS.agyStats,
       cards.agyStatsElement(agyStats(s, task, status, endedAt, { code, signal })),
     )
-    await cardkit.replaceElement(
+    const resultLanded = await cardkit.replaceElementChecked(
       task.cardId,
       cards.ELEMENTS.agyResult,
       cards.agyResultElement({
@@ -390,21 +390,30 @@ async function finishAgyTask(s: Session, task: AgyTaskState, code: number | null
         cardTruncated,
       }),
     )
-    await cardkit.replaceElement(
+    const forwardLanded = await cardkit.replaceElementChecked(
       task.cardId,
       cards.ELEMENTS.agyForward,
       cards.agyForwardElement(forwardResultId, s.backendLabel()),
     )
-    await cardkit.replaceElement(
+    const repoLanded = await cardkit.replaceElementChecked(
       task.cardId,
       cards.ELEMENTS.agyRepo,
       cards.agyRepoElement({ before: task.beforeGit, after: afterGit }),
     )
     cardkit.cancelSummary(task.cardId)
-    await cardkit.patchSettings(task.cardId, cards.streamingOffSettings({
+    const settingsLanded = await cardkit.patchSettingsChecked(task.cardId, cards.streamingOffSettings({
       durationSec: agyElapsedSec(task, endedAt),
       suffix: status,
     }))
+    if (!statsLanded || !resultLanded || !forwardLanded || !repoLanded || !settingsLanded) {
+      throw new Error([
+        `stats=${statsLanded ? 'ok' : 'MISS'}`,
+        `result=${resultLanded ? 'ok' : 'MISS'}`,
+        `forward=${forwardLanded ? 'ok' : 'MISS'}`,
+        `repo=${repoLanded ? 'ok' : 'MISS'}`,
+        `settings=${settingsLanded ? 'ok' : 'MISS'}`,
+      ].join(', '))
+    }
     await cardkit.dispose(task.cardId)
   } catch (e) {
     status = `❌ agy 收尾失败: ${messageOf(e)}`

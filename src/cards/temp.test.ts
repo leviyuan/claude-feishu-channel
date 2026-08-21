@@ -3,6 +3,7 @@ import {
   writeBodyFromToolInput,
   turnListCard,
   resumeListCard,
+  selectionResultCard,
   writeLogCard,
 } from './temp'
 
@@ -57,6 +58,14 @@ test('resumeListCard:按钮带 sessionId', () => {
   }) as any
   const btn = card.body.elements.find((e: any) => e.tag === 'column_set')!.columns[1].elements[0]
   expect(btn.behaviors[0].value).toEqual({ kind: 'temp_resume_select', sessionId: 'abc12345-aaaa-bbbb-cccc-dddddddddddd' })
+})
+
+test('selectionResultCard:终态卡不再包含 callback 按钮', () => {
+  const card = selectionResultCard({ title: '⏪ 会话回滚', message: '已回滚', ok: true }) as any
+  expect(card.config.update_multi).toBe(true)
+  expect(card.header.template).toBe('green')
+  expect(JSON.stringify(card)).toContain('已回滚')
+  expect(JSON.stringify(card)).not.toContain('callback')
 })
 
 test('writeLogCard:entries 拼成代码块,空则占位', () => {

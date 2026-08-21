@@ -1,27 +1,15 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-// config mock:glm source 读 config.claude.env(spawnEnv);token_sources 给空。
-mock.module('./config', () => ({
-  config: {
-    claude: { env: {}, models: {} },
-    codex: { env: {} },
-    token_sources: {},
-  },
-}))
-
-// fetchGlmModels mock:上游列表滞后场景(只列到 GLM-5.2,无 5.3)。
+// 通过 fetch 边界伪造上游列表滞后场景(只列到 GLM-5.2,无 5.3)。
+// 不使用 mock.module:它是进程级的，会把不完整的 config /
+// token-source-models 导出污染随机顺序中后续的测试文件。
 let modelsResponse: any[] = []
-mock.module('./token-source-models', () => ({
-  CLAUDE_EFFORTS: ['max', 'xhigh', 'high', 'medium', 'low'],
-  fetchGlmModels: async () => modelsResponse,
-}))
-
-// 窗口观测:用真模块(进程级 mock.module 会污染其他测试文件的真模块导入),
-// 测试里直连 LODESTAR_DATA_DIR 指向 tmp,数据经 observeContextWindow 注入。
-process.env.LODESTAR_DATA_DIR = mkdtempSync(join(tmpdir(), 'lodestar-glm-obs-'))
+const originalFetch = globalThis.fetch
+const originalDataDir = process.env.LODESTAR_DATA_DIR
+const testDataDir = mkdtempSync(join(tmpdir(), 'lodestar-glm-obs-'))
 const {
   observeContextWindow,
   resetContextWindowCache,
@@ -29,16 +17,49 @@ const {
 
 const { resetTokenSourceRegistry, tokenSourceFactories } = await import('./token-source')
 await import('./token-source-glm')
+await import('./token-source-deepseek')
 
 const glmFactory = tokenSourceFactories().find(f => f.kind === 'glm-coding-plan')!
+const deepseekFactory = tokenSourceFactories().find(f => f.kind === 'deepseek')!
+
+beforeAll(() => {
+  process.env.LODESTAR_DATA_DIR = testDataDir
+})
 
 beforeEach(() => {
   resetTokenSourceRegistry()
   resetContextWindowCache()
+  rmSync(join(testDataDir, 'context-window-cache.json'), { force: true })
   modelsResponse = [
     { model: 'GLM-5.2', display: 'GLM-5.2' },
     { model: 'GLM-4.7', display: 'GLM-4.7' },
   ]
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input))
+    if (!url.pathname.endsWith('/v1/models')) {
+      throw new Error(`unexpected test request: ${url}`)
+    }
+    return new Response(JSON.stringify({
+      data: modelsResponse.map(model => ({
+        id: model.model,
+        display_name: model.display,
+      })),
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as unknown as typeof fetch
+})
+
+afterEach(() => {
+  globalThis.fetch = originalFetch
+  resetContextWindowCache()
+  rmSync(join(testDataDir, 'context-window-cache.json'), { force: true })
+})
+
+afterAll(() => {
+  if (originalDataDir === undefined) delete process.env.LODESTAR_DATA_DIR
+  else process.env.LODESTAR_DATA_DIR = originalDataDir
+  rmSync(testDataDir, { recursive: true, force: true })
 })
 
 function buildGlm(cfg: Record<string, any> = {}) {
@@ -81,6 +102,37 @@ describe('glm models config 补充', () => {
     const m = ts.models.find(m => m.model === 'GLM-5.3')!
     expect(m.efforts).toEqual(['max', 'xhigh', 'high', 'medium', 'low'])
     expect(m.defaultEffort).toBe('max')
+  })
+})
+
+describe('anthropic-compatible source env isolation', () => {
+  const contaminated = {
+    KEEP_ME: 'yes',
+    ANTHROPIC_API_KEY: 'old-api-key',
+    ANTHROPIC_AUTH_TOKEN: 'old-auth-token',
+    ANTHROPIC_BASE_URL: 'https://old.invalid',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'old-opus',
+  }
+
+  test('GLM keeps only its own auth and routing fields', () => {
+    const env = buildGlm().spawnEnv(contaminated)
+    expect(env.KEEP_ME).toBe('yes')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('test-token')
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined()
+  })
+
+  test('DeepSeek keeps only its own API key and routing fields', () => {
+    const source = deepseekFactory.build({
+      base_url: 'https://api.deepseek.com/anthropic', api_key: 'deepseek-key',
+    })
+    const env = source.spawnEnv(contaminated)
+    expect(env.KEEP_ME).toBe('yes')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic')
+    expect(env.ANTHROPIC_API_KEY).toBe('deepseek-key')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined()
   })
 })
 

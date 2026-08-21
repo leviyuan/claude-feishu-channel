@@ -82,6 +82,10 @@ export function scrubAnthropicEnv(base: Env): Env {
 
 export interface TokenSource {
   id: string
+  /** Stable fingerprint of fields that affect spawned process routing/env.
+   * Registry rebuilds with the same effective config keep the same value;
+   * credential/base-url/slot changes force an idle process replacement. */
+  spawnRevision?: string
   /** 固定种类(声明式:string —— 加 source 不扩枚举) */
   kind: string
   /** 绑定哪个 agent 进程(协议强制:claude 走 Anthropic,codex 走 OpenAI/app-server) */
@@ -152,6 +156,7 @@ export function tokenSourceFactories(): TokenSourceFactoryDef[] {
 
 const registry = new Map<string, TokenSource>()
 let defaultId: string | null = null
+let registryGeneration = 0
 
 export function registerTokenSource(s: TokenSource, opts?: { default?: boolean }): void {
   registry.set(s.id, s)
@@ -188,15 +193,26 @@ export function setDefaultTokenSource(id: string): void {
 export function resetTokenSourceRegistry(): void {
   registry.clear()
   defaultId = null
+  registryGeneration++
 }
 
 /** 全量刷新所有 token source 的 models(boot 启动 / setup rebuild 后调)。
  *  rebuild(resetTokenSourceRegistry)丢弃旧实例、重建空实例,必须重新 refresh,
  *  否则非当前操作的 source 的 models 永远空(deepseek-setup 后 glm/codex 变空)。
  *  allSettled:单个失败不阻断其余;失败如实留空,绝不假数据。 */
-export async function refreshAllTokenSourceModels(): Promise<void> {
-  await Promise.allSettled(listTokenSources().map(async ts => {
+let refreshAllInFlight: { generation: number; promise: Promise<void> } | null = null
+
+export function refreshAllTokenSourceModels(): Promise<void> {
+  const generation = registryGeneration
+  if (refreshAllInFlight?.generation === generation) return refreshAllInFlight.promise
+  const promise = Promise.allSettled(listTokenSources().map(async ts => {
     await ts.refreshModels()
     log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
   }))
+    .then(() => {})
+    .finally(() => {
+      if (refreshAllInFlight?.promise === promise) refreshAllInFlight = null
+    })
+  refreshAllInFlight = { generation, promise }
+  return promise
 }

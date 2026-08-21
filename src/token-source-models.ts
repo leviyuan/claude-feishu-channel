@@ -43,7 +43,7 @@ export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
       if (!m || m.hidden || !m.id) continue
       const efforts = (Array.isArray(m.supportedReasoningEfforts) ? m.supportedReasoningEfforts : [])
         .map((e: any) => codexEffort(e?.reasoningEffort))
-        .filter((e): e is AgentReasoningEffort => e !== null)
+        .filter((e: AgentReasoningEffort | null): e is AgentReasoningEffort => e !== null)
       if (!efforts.length) continue
       const defaultEffort = codexEffort(m.defaultReasoningEffort) ?? efforts[0]
       out.push({

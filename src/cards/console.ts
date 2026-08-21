@@ -377,7 +377,7 @@ export function consoleCurrentModelContent(opts: ConsoleOpts): string {
 
 export function consoleCurrentModelElement(
   opts: ConsoleOpts,
-  elementId = ELEMENTS.consoleCurrentModel,
+  elementId: string = ELEMENTS.consoleCurrentModel,
 ): object {
   return {
     tag: 'markdown',
@@ -643,7 +643,7 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
 }
 
 /** 补录等待态取消后的收尾卡:一行静态文本,无可交互元素。 */
-export function modelCancelledCard(sessionName: string): object {
+export function modelCancelledCard(sessionName: string, state: 'cancelled' | 'stale' = 'cancelled'): object {
   return modelCard(sessionName, {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.modelPanel,
@@ -651,7 +651,9 @@ export function modelCancelledCard(sessionName: string): object {
     expanded: true,
     elements: [{
       tag: 'markdown',
-      content: '_已取消补录 — 列表未改动_',
+      content: state === 'stale'
+        ? '_此补录面板已失效 — 当前等待中的补录未受影响_'
+        : '_已取消补录 — 列表未改动_',
     }],
   }, 'grey')
 }
@@ -659,7 +661,7 @@ export function modelCancelledCard(sessionName: string): object {
 /** 补录应答态提示卡:告知用户直接在群里回复模型名(同 AskUserQuestion 语义)。
  *  取消按钮只在这里 —— 唯一会拦群消息的等待态;普通选择面板不拦任何消息,
  *  扔着不管即可,不需要取消。 */
-export function modelCustomPromptCard(sessionName: string, sourceDisplay: string): object {
+export function modelCustomPromptCard(sessionName: string, sourceDisplay: string, panelId: string): object {
   return modelCard(sessionName, {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.modelPanel,
@@ -678,7 +680,7 @@ export function modelCustomPromptCard(sessionName: string, sourceDisplay: string
         text: { tag: 'plain_text', content: '取消' },
         type: 'default',
         width: 'default',
-        behaviors: [{ type: 'callback', value: { kind: 'model_panel_cancel' } }],
+        behaviors: [{ type: 'callback', value: { kind: 'model_panel_cancel', panel_id: panelId } }],
       },
     ],
   }, 'blue')

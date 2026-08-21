@@ -6,7 +6,8 @@
  * 下面 import 一行,不改本文件、不改枚举、不改 sources 数组。
  */
 
-import { config } from './config'
+import { createHash } from 'node:crypto'
+import { config, type TokenSourceConfig } from './config'
 import {
   registerTokenSource,
   resetTokenSourceRegistry,
@@ -32,7 +33,9 @@ export function buildTokenSourcesFromConfig(): number {
     const cfg = def.configSectionId ? ((config.token_sources ?? {})[def.configSectionId] ?? {}) : {}
     // config.toml 没配时,若本机 settings.json 命中本 source 的 detect host,自动启用(凭据从 settings.json 取)
     const detected = def.detect?.fromSettingsEnv(settingsEnv) ?? null
-    return def.build(cfg, detected)
+    const source = def.build(cfg, detected)
+    source.spawnRevision = tokenSourceSpawnRevision(def.kind, cfg, detected)
+    return source
   })
   // native 兜底:有显式 claude-side source(glm/deepseek/...)启用则让位;否则 native 启用(真 Claude)。
   const native = sources.find(s => s.kind === 'claude-native')
@@ -41,7 +44,32 @@ export function buildTokenSourcesFromConfig(): number {
     native.enabled = !hasClaudeSource
   }
   for (const s of sources) registerTokenSource(s)
-  const firstEnabled = sources.find(s => s.enabled)
-  if (firstEnabled) setDefaultTokenSource(firstEnabled.id)
+  const configuredDefault = sources.find(s => s.enabled && config.token_sources?.[s.id]?.default === true)
+  const defaultSource = configuredDefault ?? sources.find(s => s.enabled)
+  if (defaultSource) setDefaultTokenSource(defaultSource.id)
   return sources.length
+}
+
+export function tokenSourceSpawnRevision(
+  kind: string,
+  cfg: TokenSourceConfig,
+  detected: Partial<TokenSourceConfig> | null,
+): string {
+  // Display/catalog/usage changes do not alter child routing. Everything
+  // below can affect credentials, endpoint, executable, model aliases or
+  // provider selection and therefore belongs to the process identity.
+  const pick = (value: Partial<TokenSourceConfig> | null): Record<string, unknown> => ({
+    agent: value?.agent,
+    auth: value?.auth,
+    base_url: value?.base_url,
+    auth_token: value?.auth_token,
+    api_key: value?.api_key,
+    bin: value?.bin,
+    model: value?.model,
+    effort: value?.effort,
+    slots: value?.slots,
+  })
+  return createHash('sha256')
+    .update(JSON.stringify({ kind, configured: pick(cfg), detected: pick(detected) }))
+    .digest('hex')
 }

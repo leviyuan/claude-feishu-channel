@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { type ChildProcessByStdio } from 'node:child_process'
+import { spawn } from 'cross-spawn'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
@@ -35,12 +36,13 @@ export function resolveAgyBin(): string {
 
 export function buildAgySpawnPath(): string {
   if (process.platform === 'win32') return process.env.PATH ?? ''
-  return [
+  return [...new Set([
     join(homedir(), '.local', 'bin'),
     join(homedir(), '.local', 'npm-global', 'bin'),
     join(homedir(), '.bun', 'bin'),
+    ...(process.env.PATH ?? '').split(delimiter),
     '/usr/local/bin', '/usr/bin', '/bin',
-  ].join(delimiter)
+  ].filter(Boolean))].join(delimiter)
 }
 
 export function agyPrintArgs(prompt: string): string[] {
@@ -62,12 +64,12 @@ export function spawnAgyPrint(prompt: string, cwd: string): { proc: AgyProcess; 
   const proc = spawn(bin, args, {
     cwd,
     stdio: ['ignore', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
+    shell: false,
     env: {
       ...(process.env as Record<string, string>),
       PATH: buildAgySpawnPath(),
     },
-  }) as AgyProcess
+  }) as unknown as AgyProcess
   return { proc, bin, args }
 }
 
@@ -122,7 +124,7 @@ async function runGit(cwd: string, args: string[]): Promise<GitCommandResult> {
     const proc = spawn('git', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
+      shell: false,
       env: {
         ...(process.env as Record<string, string>),
         PATH: buildAgySpawnPath(),

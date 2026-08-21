@@ -22,6 +22,7 @@ const WATCHDOG_UNIT = 'cc-feishu-rollback-watchdog'
  * 多次调用无害(看门狗已停 / 不存在时 systemctl 返回非零,被吞)。
  */
 export function clearRollbackWatchdog(): void {
+  if (process.env.NODE_ENV === 'test') return
   exec(
     `systemctl --user stop ${WATCHDOG_UNIT}.timer ${WATCHDOG_UNIT}.service 2>/dev/null`,
     () => { /* no-op:看门狗不存在/已停都正常 */ },

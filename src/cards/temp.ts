@@ -54,6 +54,12 @@ export interface WriteLogCardOpts {
   entries: WriteLogEntry[]
 }
 
+export interface SelectionResultCardOpts {
+  title: string
+  message: string
+  ok: boolean
+}
+
 const WRITE_BODY_MAX = 800
 
 export function turnListCard(opts: TurnListCardOpts): object {
@@ -181,6 +187,26 @@ export function writeLogCard(opts: WriteLogCardOpts): object {
   }
 }
 
+/** Terminal replacement for one-shot menu/fork/back/resume selection cards.
+ * It intentionally contains no callback elements, so a completed source card
+ * cannot become actionable again after the short in-memory dedupe TTL. */
+export function selectionResultCard(opts: SelectionResultCardOpts): object {
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: opts.title },
+      template: opts.ok ? 'green' : 'red',
+    },
+    body: {
+      elements: [{
+        tag: 'markdown',
+        content: `${opts.ok ? '✅' : '❌'} ${escapeMarkdown(opts.message)}`,
+      }],
+    },
+  }
+}
+
 function fmtTime(ts: number): string {
   const d = new Date(ts)
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -189,6 +215,10 @@ function fmtTime(ts: number): string {
 
 function inlineCode(s: string): string {
   return '`' + s.replace(/`/g, '\\`').replace(/\n/g, ' ') + '`'
+}
+
+function escapeMarkdown(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 function noticeMarkdown(notice: TempListNotice): string {

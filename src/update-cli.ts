@@ -60,8 +60,9 @@ async function main(): Promise<void> {
   if (existsSync(PID_FILE)) {
     console.log()
     console.log(`${C.yellow}检测到 daemon 仍在跑老版本进程, 用新版本需要重启:${C.reset}`)
-    console.log(`  ${C.dim}# systemd / Windows 后台托管的:${C.reset}`)
-    console.log(`  ${C.cyan}systemctl --user restart lodestar${C.reset}      ${C.dim}# Linux/macOS${C.reset}`)
+    console.log(`  ${C.dim}# Linux systemd --user 托管的:${C.reset}`)
+    console.log(`  ${C.cyan}systemctl --user restart lodestar${C.reset}      ${C.dim}# Linux${C.reset}`)
+    console.log(`  ${C.dim}# macOS launchd / Windows 任务计划:用对应服务管理器重启。${C.reset}`)
     console.log(`  ${C.dim}# 或手动重启:${C.reset}`)
     console.log(`  ${C.cyan}lodestar-stop && lodestar-daemon${C.reset}`)
   }

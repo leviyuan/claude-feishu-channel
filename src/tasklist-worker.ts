@@ -1,7 +1,7 @@
-import { spawn, execFileSync } from 'node:child_process'
+import { execFileSync, type ChildProcess } from 'node:child_process'
+import { spawn } from 'cross-spawn'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { buildAgySpawnPath, resolveAgyBin, agyPrintArgs } from './agy-task'
 import { resolveCodexBin } from './codex-process'
@@ -9,6 +9,7 @@ import { getTokenSource } from './token-source'
 import * as feishu from './feishu'
 import { log } from './log'
 import * as tasklist from './tasklist'
+import { withProjectWorktreeLock } from './worktree'
 import {
   AI_AUTO_BRANCH,
   AI_REVIEW_BRANCH,
@@ -39,6 +40,7 @@ const TASKLIST_WORKER_BOOT_DELAY_MS = 15_000
 const SECTION_ENSURE_INTERVAL_MS = 30 * 60 * 1000
 const PROCESS_OUTPUT_TAIL_LIMIT = 20_000
 const COMMENT_OUTPUT_LIMIT = 15_000
+const MAX_ACTIVE_PROJECT_SCANS = 2
 const PLAN_TIMEOUT_MS = 60 * 60 * 1000
 const EXEC_TIMEOUT_MS = 180 * 60 * 1000
 const KILL_AFTER_MS = 5000
@@ -59,33 +61,144 @@ function codexModelArgs(): string[] {
 
 let timer: ReturnType<typeof setInterval> | null = null
 let bootTimer: ReturnType<typeof setTimeout> | null = null
+let startupPromise: Promise<void> | null = null
 let running = false
+let stopping = false
+/** One long-running automation per project. A process in project A must not
+ * hold the global five-minute scanner open and starve every other binding. */
+const activeProjectScans = new Map<string, Promise<void>>()
+interface AutomationRunHandleBase {
+  runId: string
+  projectName: string
+  pid?: number
+  pgid?: number
+}
+interface SpawnedAutomationRunHandle extends AutomationRunHandleBase {
+  source: 'spawned'
+  proc: ChildProcess
+  leaderFinished: boolean
+}
+interface RecoveredAutomationRunHandle extends AutomationRunHandleBase {
+  source: 'recovered'
+  proc: null
+  leaderFinished: true
+}
+type AutomationRunHandle = SpawnedAutomationRunHandle | RecoveredAutomationRunHandle
+const activeAutomationRuns = new Map<string, AutomationRunHandle>()
+let nextProjectScanIndex = 0
 
-export function startTasklistWorker(): void {
-  if (timer || bootTimer) return
+export interface TasklistWorkerStartOptions {
+  bootDelayMs?: number
+  /** Injectable only to exercise the pre-boot synchronous adoption boundary. */
+  adoptPersistedRuns?: () => void
+  /** Injectable for the bounded shutdown regression test. Production uses the
+   * durable tasklist tombstone reconciler. */
+  reconcileDeletions?: () => Promise<void>
+}
+
+export function startTasklistWorker(opts: TasklistWorkerStartOptions = {}): void {
+  if (timer || bootTimer || startupPromise) return
+  stopping = false
+  // This must remain synchronous and precede the 15s boot delay: SIGTERM may
+  // arrive during that window, and stopTasklistWorker must already know every
+  // recovered PGID before it clears bootTimer.
+  const adoptPersistedRuns = opts.adoptPersistedRuns ?? registerPersistedAutomationRuns
+  adoptPersistedRuns()
   bootTimer = setTimeout(() => {
     bootTimer = null
-    void runTasklistWorkerOnce()
-    timer = setInterval(() => { void runTasklistWorkerOnce() }, TASKLIST_WORKER_INTERVAL_MS)
-  }, TASKLIST_WORKER_BOOT_DELAY_MS)
+    startupPromise = initializeTasklistWorker(opts.reconcileDeletions ?? tasklist.reconcileTasklistDeletions)
+      .catch(e => log(`tasklist-worker: startup failed: ${messageOf(e)}`))
+      .finally(() => { startupPromise = null })
+  }, opts.bootDelayMs ?? TASKLIST_WORKER_BOOT_DELAY_MS)
   log(`tasklist-worker: scheduled every ${TASKLIST_WORKER_INTERVAL_MS / 1000}s`)
 }
 
+async function initializeTasklistWorker(reconcileDeletions: () => Promise<void>): Promise<void> {
+  try {
+    await reconcileDeletions()
+  } catch (e) {
+    // Tombstones remain durable and are excluded from normal scans. Surface
+    // the failure, but one broken remote deletion must not starve other projects.
+    log(`tasklist-worker: deletion reconcile failed: ${messageOf(e)}`)
+  }
+  if (stopping) return
+  await runTasklistWorkerOnce()
+  if (!stopping) timer = setInterval(() => { void runTasklistWorkerOnce() }, TASKLIST_WORKER_INTERVAL_MS)
+}
+
 export async function runTasklistWorkerOnce(): Promise<void> {
+  if (stopping) return
   if (running) {
     log('tasklist-worker: previous scan still running, skip')
     return
   }
   running = true
   try {
-    for (const binding of tasklist.listTasklistBindings()) {
-      await processTasklist(binding.projectName)
+    const bindings = tasklist.listTasklistBindings().filter(binding => !binding.deleting)
+    if (bindings.length === 0) return
+    const start = nextProjectScanIndex % bindings.length
+    for (const { value: binding, index } of roundRobinEntries(bindings, start)) {
+      const projectName = binding.projectName
+      if (activeProjectScans.has(projectName)) continue
+      if (activeProjectScans.size >= MAX_ACTIVE_PROJECT_SCANS) break
+      const scan = processTasklist(projectName)
+        .catch(e => log(`tasklist-worker: ${projectName} scan crashed: ${messageOf(e)}`))
+        .finally(() => { activeProjectScans.delete(projectName) })
+      activeProjectScans.set(projectName, scan)
+      nextProjectScanIndex = (index + 1) % bindings.length
     }
   } catch (e) {
     log(`tasklist-worker: scan failed: ${messageOf(e)}`)
   } finally {
     running = false
   }
+}
+
+export function roundRobinEntries<T>(values: T[], start: number): Array<{ value: T; index: number }> {
+  if (values.length === 0) return []
+  const normalized = ((start % values.length) + values.length) % values.length
+  return values.map((_, offset) => {
+    const index = (normalized + offset) % values.length
+    return { value: values[index], index }
+  })
+}
+
+export function tasklistWorkerActivityIsIdle(
+  activeRunCount: number,
+  activeScanCount: number,
+  startupActive: boolean,
+): boolean {
+  return activeRunCount === 0 && activeScanCount === 0 && !startupActive
+}
+
+/** Stop scheduling and terminate only the exact automation process groups
+ * created by this worker. Used by daemon staged shutdown so grandchildren do
+ * not keep modifying repositories after the parent has exited. */
+export async function stopTasklistWorker(timeoutMs = KILL_AFTER_MS): Promise<void> {
+  stopping = true
+  if (bootTimer) { clearTimeout(bootTimer); bootTimer = null }
+  if (timer) { clearInterval(timer); timer = null }
+  const drain = async (signal: NodeJS.Signals): Promise<boolean> => {
+    const signaled = new Set<AutomationRunHandle>()
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      pruneSettledAutomationRuns()
+      for (const run of activeAutomationRuns.values()) {
+        if (signaled.has(run)) continue
+        signaled.add(run)
+        signalAutomationRun(run, signal)
+      }
+      if (tasklistWorkerActivityIsIdle(activeAutomationRuns.size, activeProjectScans.size, !!startupPromise)) return true
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    pruneSettledAutomationRuns()
+    return tasklistWorkerActivityIsIdle(activeAutomationRuns.size, activeProjectScans.size, !!startupPromise)
+  }
+  if (await drain('SIGTERM')) return
+  if (await drain('SIGKILL')) return
+  throw new Error(
+    `${activeAutomationRuns.size} tasklist process group(s), ${activeProjectScans.size} project scan(s), startup=${startupPromise ? 'running' : 'idle'} did not settle during shutdown`,
+  )
 }
 
 /** binding 是否已存齐 lodestar 自己的 5 个 section guid(design + aiTodo/aiDoing/aiReview/done)。
@@ -96,7 +209,7 @@ function hasLodestarSections(binding: TasklistBinding): boolean {
 }
 
 async function processTasklist(projectName: string): Promise<void> {
-  const projectDir = join(feishu.PROJECTS_ROOT, projectName)
+  const projectDir = feishu.resolveProjectDir(projectName)
   try {
     if (!existsSync(projectDir)) throw new Error(`project directory does not exist: ${projectDir}`)
     // ensureTasklistSections 改成低频自愈:section guid 稳态不变,没必要每个 tick 都
@@ -104,6 +217,10 @@ async function processTasklist(projectName: string): Promise<void> {
     // 存齐 lodestar 5 个 section guid(旧数据 / 新 enable)时才 ensure 一次。
     const cachedBinding = tasklist.getTasklistBinding(projectName)
     if (!cachedBinding) throw new Error(`tasklist is not enabled for ${projectName}`)
+    if (cachedBinding.deleting) {
+      log(`tasklist-worker: skip ${projectName}; tasklist deletion is pending`)
+      return
+    }
     let binding = cachedBinding
     const lastEnsureMs = cachedBinding.worker?.lastSectionEnsureAt
       ? Date.parse(cachedBinding.worker.lastSectionEnsureAt) : 0
@@ -117,6 +234,10 @@ async function processTasklist(projectName: string): Promise<void> {
     }
     await markStaleRunningProcesses(projectName, binding)
     binding = tasklist.getTasklistBinding(projectName) ?? binding
+    if (hasRecoveredAutomationRunForProject(projectName)) {
+      log(`tasklist-worker: skip ${projectName}; recovered automation run is still alive`)
+      return
+    }
     const buckets = await scanTaskSections(binding)
     rememberScan(projectName, buckets)
 
@@ -205,8 +326,21 @@ async function markStaleRunningProcesses(projectName: string, binding: TasklistB
   const runningProcesses = Object.values(binding.processes ?? {})
     .filter(record => record.status === 'running')
   for (const record of runningProcesses) {
-    if (isRecordedProcessAlive(record)) continue
-    const error = `recorded ${record.kind} process is no longer running (pid ${record.pid ?? 'unknown'})`
+    if (isRecordedProcessAlive(record)) {
+      registerRecoveredAutomationRun(record)
+      continue
+    }
+    let cleanupError = ''
+    const tracked = activeAutomationRuns.get(record.runId)
+    if (tracked?.source === 'recovered' && tracked.pgid && unixProcessGroupExists(tracked.pgid)) {
+      try {
+        await terminateUnixProcessGroup(tracked.pgid)
+      } catch (e) {
+        cleanupError = `; recovered process-group cleanup failed: ${messageOf(e)}`
+      }
+    }
+    if (!tracked?.pgid || !unixProcessGroupExists(tracked.pgid)) activeAutomationRuns.delete(record.runId)
+    const error = `recorded ${record.kind} process is no longer running (pid ${record.pid ?? 'unknown'})${cleanupError}`
     log(`tasklist-worker: mark stale process failed project=${projectName} run=${record.runId}: ${error}`)
     markProcessFailed(projectName, record, error)
     if (record.taskGuid) {
@@ -217,6 +351,62 @@ async function markStaleRunningProcesses(projectName: string, binding: TasklistB
       }
     }
   }
+}
+
+/** Adopt every validated durable run before startup performs remote awaits. */
+function registerPersistedAutomationRuns(): void {
+  if (process.platform === 'win32') {
+    const running = tasklist.listTasklistBindings()
+      .flatMap(binding => Object.values(binding.processes ?? {}))
+      .filter(record => record.status === 'running').length
+    if (running > 0) {
+      log(`tasklist-worker: ${running} recovered Windows run(s) cannot be adopted after restart without a Job Object; taskkill /T remains available only for leaders spawned by this daemon`)
+    }
+    return
+  }
+  for (const binding of tasklist.listTasklistBindings()) {
+    for (const record of Object.values(binding.processes ?? {})) {
+      if (record.status === 'running' && isRecordedProcessAlive(record)) registerRecoveredAutomationRun(record)
+    }
+  }
+}
+
+/** Register one persisted live Unix run exactly once. PID/cmdline ownership is
+ * checked first, then the persisted PGID must match the kernel's current PGID
+ * for that PID before shutdown is allowed to signal the group. */
+export function registerRecoveredAutomationRun(record: AutomationProcessRecord): boolean {
+  if (process.platform === 'win32' || record.status !== 'running') return false
+  if (activeAutomationRuns.has(record.runId)) return false
+  if (!isRecordedProcessAlive(record)) return false
+  if (!record.pid || !record.pgid || record.pgid <= 0) {
+    log(`tasklist-worker: cannot adopt recovered run=${record.runId}; missing pid/pgid`)
+    return false
+  }
+  const actualPgid = processGroupIdForPid(record.pid)
+  if (actualPgid !== record.pgid) {
+    log(`tasklist-worker: cannot adopt recovered run=${record.runId}; persisted pgid=${record.pgid} actual=${actualPgid ?? 'MISS'}`)
+    return false
+  }
+  activeAutomationRuns.set(record.runId, {
+    runId: record.runId,
+    projectName: record.projectName,
+    source: 'recovered',
+    proc: null,
+    pid: record.pid,
+    pgid: record.pgid,
+    leaderFinished: true,
+  })
+  log(`tasklist-worker: adopted recovered run=${record.runId} pid=${record.pid} pgid=${record.pgid}`)
+  return true
+}
+
+export function isAutomationRunTracked(runId: string): boolean {
+  return activeAutomationRuns.has(runId)
+}
+
+export function hasRecoveredAutomationRunForProject(projectName: string): boolean {
+  return [...activeAutomationRuns.values()]
+    .some(run => run.source === 'recovered' && run.projectName === projectName)
 }
 
 function isRecordedProcessAlive(record: AutomationProcessRecord): boolean {
@@ -243,6 +433,24 @@ function processCmdline(pid: number): string | null {
   } catch {
     return null
   }
+}
+
+function processGroupIdForPid(pid: number): number | null {
+  try {
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const afterComm = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)
+      const pgid = Number.parseInt(afterComm[2] ?? '', 10)
+      return Number.isInteger(pgid) && pgid > 0 ? pgid : null
+    }
+    if (process.platform !== 'win32') {
+      const pgid = Number.parseInt(execFileSync('ps', ['-p', String(pid), '-o', 'pgid='], {
+        encoding: 'utf8', timeout: 2000,
+      }).trim(), 10)
+      return Number.isInteger(pgid) && pgid > 0 ? pgid : null
+    }
+  } catch {}
+  return null
 }
 
 async function processDesignTask(
@@ -321,9 +529,29 @@ async function processExecutingTask(
   if (state.codexExecution?.status === 'running') return true
   if (state.codexExecution?.status === 'failed') return true
   if (state.codexExecution?.status === 'exited') {
-    return hasLocalReviewRequest(state)
-      ? await reviewExecutedTask(projectName, projectDir, binding, task.guid)
-      : true
+    if (!hasLocalReviewRequest(state)) {
+      // Recover the narrow crash window after the artifact tag was created
+      // but before reviewRef reached the durable task state. The tagged
+      // commit's first parent is the exact execution base.
+      const artifactTag = taskArtifactTag(task.guid)
+      try {
+        const baseHead = git(projectDir, ['rev-parse', `${artifactTag}^`]).trim()
+        if (!baseHead) throw new Error(`cannot resolve parent of ${artifactTag}`)
+        safeUpdate(projectName, b => {
+          const current = tasklist.taskStateFor(b, task.guid)
+          current.executionBranch = AI_AUTO_BRANCH
+          current.executionTag = artifactTag
+          current.reviewBranch = AI_REVIEW_BRANCH
+          current.reviewRef = localReviewRef(baseHead, artifactTag)
+        })
+      } catch (e) {
+        const error = `Codex 执行进程已退出，但无法恢复本地审查请求：${messageOf(e)}`
+        markRunOnTask(projectName, task.guid, 'codexExecution', state.codexExecution.runId, undefined, 'failed', error)
+        await commentAndStoreError(projectName, task.guid, error)
+        return true
+      }
+    }
+    return await reviewExecutedTask(projectName, projectDir, binding, task.guid)
   }
 
   const run = await runCodexExecution(projectName, projectDir, binding, task.guid)
@@ -368,7 +596,18 @@ async function processCompletedReviewTask(
     if (!isManualMergeSignal(task)) continue
     const state = getTaskState(projectName, task.guid)
     if (state.codexMerge?.status === 'running') return true
-    if (state.codexMerge?.status === 'exited') continue
+    if (state.codexMerge?.status === 'exited') {
+      if (!hasLocalReviewRequest(state)) {
+        const error = 'Codex 合并进程已退出，但本地状态缺少审查请求。'
+        markRunOnTask(projectName, task.guid, 'codexMerge', state.codexMerge.runId, undefined, 'failed', error)
+        await commentAndStoreError(projectName, task.guid, error)
+        return true
+      }
+      // A daemon crash may land after the Git merge process exits but before
+      // the task is moved to done. Reconcile from Git truth instead of treating
+      // `exited` as an absorbing state forever.
+      return await finalizeMergedReviewTask(projectName, projectDir, binding, task.guid, reviewRequestText(state))
+    }
     if (state.codexMerge?.status === 'failed') return true
     if (!hasLocalReviewRequest(state)) {
       await commentAndStoreError(projectName, task.guid, '审核完成后无法合并：本地状态里没有本地审查请求。')
@@ -381,21 +620,36 @@ async function processCompletedReviewTask(
       await commentAndStoreError(projectName, task.guid, 'Codex 合并进程未明确输出 `LODESTAR_MERGE_STATUS: MERGED`，任务保留在审核分组。')
       return true
     }
-    const merged = isReviewHeadMerged(projectDir, reviewRequest)
-    if (!merged.ok) {
-      await commentAndStoreError(projectName, task.guid, `Codex 合并进程输出 MERGED，但本地 Git 未确认合并：${merged.error}`)
-      return true
-    }
-    const doneGuid = binding.sections?.done
-    if (!doneGuid) throw new Error('missing 已完成 section guid')
-    await feishu.moveTaskToSection(task.guid, binding.guid, doneGuid)
-    safeUpdate(projectName, b => {
-      const state = tasklist.taskStateFor(b, task.guid)
-      state.sectionKey = 'done'
-    })
-    return true
+    return await finalizeMergedReviewTask(projectName, projectDir, binding, task.guid, reviewRequest)
   }
   return false
+}
+
+async function finalizeMergedReviewTask(
+  projectName: string,
+  projectDir: string,
+  binding: TasklistBinding,
+  taskGuid: string,
+  reviewRequest: string,
+): Promise<boolean> {
+  const merged = isReviewHeadMerged(projectDir, reviewRequest)
+  if (merged.ok === false) {
+    const state = getTaskState(projectName, taskGuid)
+    const error = `Codex 合并进程已退出，但本地 Git 未确认合并：${merged.error}`
+    if (state.codexMerge) {
+      markRunOnTask(projectName, taskGuid, 'codexMerge', state.codexMerge.runId, undefined, 'failed', error)
+    }
+    await commentAndStoreError(projectName, taskGuid, error)
+    return true
+  }
+  const doneGuid = binding.sections?.done
+  if (!doneGuid) throw new Error('missing 已完成 section guid')
+  await feishu.moveTaskToSection(taskGuid, binding.guid, doneGuid)
+  safeUpdate(projectName, b => {
+    const state = tasklist.taskStateFor(b, taskGuid)
+    state.sectionKey = 'done'
+  })
+  return true
 }
 
 export function isManualMergeSignal(task: feishu.TaskSummary): boolean {
@@ -528,7 +782,15 @@ async function runCodexExecution(
 ): Promise<AutomationProcessRecord> {
   const artifactTag = taskArtifactTag(taskGuid)
   assertTaskArtifactTagAvailable(projectDir, artifactTag)
-  const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_AUTO_BRANCH)
+  // Freeze the review base before the agent starts. Reading main HEAD after a
+  // multi-hour execution makes the displayed diff depend on unrelated commits
+  // that landed while the task was running.
+  const baseBranch = git(projectDir, ['branch', '--show-current']).trim()
+  if (!baseBranch) throw new Error('cannot determine base branch from project directory')
+  const baseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
+  const worktreePath = await withProjectWorktreeLock(projectDir, async () => {
+    return prepareAutomationWorktree(projectDir, projectName, AI_AUTO_BRANCH, baseHead)
+  })
   const structured = await loadStructuredTask(binding, 'aiDoing', taskGuid)
   const prompt = [
     '你是 Lodestar 自动执行 Agent。',
@@ -569,9 +831,6 @@ async function runCodexExecution(
       return markProcessFailed(projectName, result, 'Codex execution produced no repository changes')
     }
     const task = await feishu.getTask(taskGuid)
-    const baseBranch = git(projectDir, ['branch', '--show-current']).trim()
-    if (!baseBranch) throw new Error('cannot determine base branch from project directory')
-    const baseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
     const commitMsg = commitTitle(task?.summary || taskGuid)
     git(worktreePath, ['add', '-A'])
     git(worktreePath, ['commit', '-m', commitMsg])
@@ -619,7 +878,9 @@ async function runAgyReview(
   taskGuid: string,
   reviewRequest: string,
 ): Promise<AutomationProcessRecord> {
-  const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_REVIEW_BRANCH)
+  const worktreePath = await withProjectWorktreeLock(projectDir, async () => {
+    return prepareAutomationWorktree(projectDir, projectName, AI_REVIEW_BRANCH)
+  })
   const structured = await loadStructuredTask(binding, 'aiReview', taskGuid)
   const diffSpec = reviewDiffSpec(reviewRequest)
   const headRef = reviewHeadRef(reviewRequest)
@@ -697,6 +958,16 @@ async function runCodexMerge(
 
 type RunRefKey = 'codexPlan' | 'agyPlan' | 'agyPick' | 'codexExecution' | 'agyReview' | 'codexMerge'
 
+/** Windows limitation kept explicit without removing existing automation
+ * capability: taskkill /T handles a live leader tree, but only a Job Object
+ * could prove cleanup after the leader has already exited and descendants have
+ * detached from its stdio. Persist this warning on every Windows run. */
+export function automationTreeSupportWarning(platform = process.platform): string | null {
+  return platform === 'win32'
+    ? 'Windows process-tree cleanup is best-effort: taskkill /T covers a live leader, but post-exit descendant verification requires a Job Object supervisor'
+    : null
+}
+
 async function runAgentProcess(opts: {
   projectName: string
   tasklistGuid: string
@@ -708,6 +979,7 @@ async function runAgentProcess(opts: {
   refKey?: RunRefKey
   fingerprint?: string
 }): Promise<AutomationProcessRecord> {
+  if (stopping) throw new Error(`tasklist worker is stopping; refusing to spawn ${opts.kind}`)
   const runId = `${opts.kind}-${Date.now()}-${randomUUID().slice(0, 8)}`
   const startedAt = new Date().toISOString()
   let record: AutomationProcessRecord = {
@@ -721,13 +993,33 @@ async function runAgentProcess(opts: {
     status: 'running',
     startedAt,
   }
+  const treeCleanupWarning = automationTreeSupportWarning()
+  if (treeCleanupWarning) {
+    record.treeCleanupWarning = treeCleanupWarning
+    log(`tasklist-worker: run=${runId}: ${treeCleanupWarning}`)
+  }
   const proc = spawn(opts.command[0], opts.command.slice(1), {
     cwd: opts.cwd,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...(process.env as Record<string, string>), PATH: buildAgySpawnPath() },
-    shell: process.platform === 'win32',
+    shell: false,
+    detached: process.platform !== 'win32',
   })
-  record = { ...record, pid: proc.pid || undefined }
+  record = {
+    ...record,
+    pid: proc.pid || undefined,
+    pgid: process.platform !== 'win32' ? (proc.pid || undefined) : undefined,
+  }
+  const runHandle: SpawnedAutomationRunHandle = {
+    runId,
+    projectName: opts.projectName,
+    source: 'spawned',
+    proc,
+    pid: record.pid,
+    pgid: record.pgid,
+    leaderFinished: false,
+  }
+  activeAutomationRuns.set(runId, runHandle)
   storeProcessRecord(opts.projectName, record)
   if (opts.taskGuid && opts.refKey) {
     markRunOnTask(opts.projectName, opts.taskGuid, opts.refKey, runId, opts.fingerprint, 'running')
@@ -741,10 +1033,13 @@ async function runAgentProcess(opts: {
   proc.stdout.on('data', chunk => { stdout = tail(stdout + stdoutDecoder.write(chunk), PROCESS_OUTPUT_TAIL_LIMIT) })
   proc.stderr.on('data', chunk => { stderr = tail(stderr + stderrDecoder.write(chunk), PROCESS_OUTPUT_TAIL_LIMIT) })
 
-  const finished = await waitForProcess(proc, opts.timeoutMs)
+  const finished = await waitForProcess(runHandle, opts.timeoutMs)
+  runHandle.leaderFinished = true
+  const treeError = await settleAutomationRunTree(runHandle)
+  if (!runHandle.pgid || !unixProcessGroupExists(runHandle.pgid)) activeAutomationRuns.delete(runHandle.runId)
   stdout = tail(stdout + stdoutDecoder.end(), PROCESS_OUTPUT_TAIL_LIMIT)
   stderr = tail(stderr + stderrDecoder.end(), PROCESS_OUTPUT_TAIL_LIMIT)
-  const status: AutomationProcessRecord['status'] = finished.error || finished.timedOut || finished.exitCode !== 0
+  const status: AutomationProcessRecord['status'] = finished.error || finished.timedOut || finished.exitCode !== 0 || treeError
     ? 'failed'
     : 'exited'
   const finalRecord: AutomationProcessRecord = {
@@ -755,7 +1050,9 @@ async function runAgentProcess(opts: {
     signal: finished.signal,
     stdoutTail: stdout.trimEnd(),
     stderrTail: stderr.trimEnd(),
-    error: finished.error ?? (finished.timedOut ? `${opts.kind} timed out after ${opts.timeoutMs / 1000}s` : undefined),
+    error: finished.error
+      ?? (finished.timedOut ? `${opts.kind} timed out after ${opts.timeoutMs / 1000}s` : undefined)
+      ?? treeError,
   }
   storeProcessRecord(opts.projectName, finalRecord)
   if (opts.taskGuid && opts.refKey) {
@@ -765,17 +1062,20 @@ async function runAgentProcess(opts: {
 }
 
 function waitForProcess(
-  proc: ReturnType<typeof spawn>,
+  run: SpawnedAutomationRunHandle,
   timeoutMs: number,
 ): Promise<{ exitCode: number | null; signal: string | null; timedOut?: boolean; error?: string }> {
+  const proc = run.proc
   return new Promise(resolve => {
     let settled = false
+    let timedOut = false
     let killTimer: ReturnType<typeof setTimeout> | null = null
     const timeout = setTimeout(() => {
       if (settled) return
-      proc.kill('SIGTERM')
+      timedOut = true
+      signalAutomationRun(run, 'SIGTERM')
       killTimer = setTimeout(() => {
-        if (!settled) proc.kill('SIGKILL')
+        if (!settled) signalAutomationRun(run, 'SIGKILL')
       }, KILL_AFTER_MS)
     }, timeoutMs)
     proc.on('error', err => {
@@ -788,7 +1088,6 @@ function waitForProcess(
     proc.on('close', (code, signal) => {
       if (settled) return
       settled = true
-      const timedOut = signal === 'SIGTERM' || signal === 'SIGKILL'
       clearTimeout(timeout)
       if (killTimer) clearTimeout(killTimer)
       resolve({ exitCode: code, signal, timedOut })
@@ -796,12 +1095,91 @@ function waitForProcess(
   })
 }
 
+function signalAutomationRun(run: AutomationRunHandle, signal: NodeJS.Signals): void {
+  const proc = run.proc
+  try {
+    if (process.platform === 'win32' && run.pid) {
+      execFileSync('taskkill', [
+        '/PID', String(run.pid), '/T',
+        ...(signal === 'SIGKILL' ? ['/F'] : []),
+      ], { stdio: 'ignore', timeout: KILL_AFTER_MS })
+    } else if (run.pgid) {
+      // `detached:true` gives this exact child its own process group. Negative
+      // PID targets that verified group, including tools/tests it spawned.
+      process.kill(-run.pgid, signal)
+    } else if (proc) {
+      proc.kill(signal)
+    } else {
+      log(`tasklist-worker: cannot send ${signal} to recovered run=${run.runId}; no verified pgid`)
+    }
+  } catch (e: any) {
+    if (e?.code !== 'ESRCH') log(`tasklist-worker: ${signal} failed for run=${run.runId} pid=${run.pid ?? 'unknown'} pgid=${run.pgid ?? 'unknown'}: ${messageOf(e)}`)
+  }
+}
+
+/** Exact Unix process-group liveness probe. EPERM means the group exists but
+ * is not signalable by this user; callers must treat that as alive/failure. */
+export function unixProcessGroupExists(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 0) return false
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (e: any) {
+    if (e?.code === 'ESRCH') return false
+    if (e?.code === 'EPERM') return true
+    throw e
+  }
+}
+
+async function waitForUnixProcessGroupExit(pgid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!unixProcessGroupExists(pgid)) return true
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  return !unixProcessGroupExists(pgid)
+}
+
+/** Terminate one previously-created detached group and prove it no longer
+ * exists. Exported for the process-tree regression test. */
+export async function terminateUnixProcessGroup(pgid: number, timeoutMs = KILL_AFTER_MS): Promise<void> {
+  if (process.platform === 'win32') {
+    throw new Error('cannot verify a Windows process tree without a Job Object supervisor')
+  }
+  if (!unixProcessGroupExists(pgid)) return
+  try { process.kill(-pgid, 'SIGTERM') }
+  catch (e: any) { if (e?.code !== 'ESRCH') throw e }
+  if (await waitForUnixProcessGroupExit(pgid, timeoutMs)) return
+  try { process.kill(-pgid, 'SIGKILL') }
+  catch (e: any) { if (e?.code !== 'ESRCH') throw e }
+  if (await waitForUnixProcessGroupExit(pgid, timeoutMs)) return
+  throw new Error(`process group ${pgid} still exists after SIGTERM and SIGKILL`)
+}
+
+async function settleAutomationRunTree(run: AutomationRunHandle): Promise<string | undefined> {
+  if (!run.pgid || !unixProcessGroupExists(run.pgid)) return undefined
+  const prefix = `automation leader exited while process group ${run.pgid} still had descendants`
+  try {
+    await terminateUnixProcessGroup(run.pgid)
+    return `${prefix}; descendants were terminated`
+  } catch (e) {
+    return `${prefix}; cleanup failed: ${messageOf(e)}`
+  }
+}
+
+function pruneSettledAutomationRuns(): void {
+  for (const [runId, run] of activeAutomationRuns) {
+    if (run.source === 'spawned' && !run.leaderFinished) continue
+    if (!run.pgid || !unixProcessGroupExists(run.pgid)) activeAutomationRuns.delete(runId)
+  }
+}
+
 async function loadStructuredTask(binding: TasklistBinding, sectionKey: TasklistSectionKey, taskGuid: string): Promise<unknown> {
   const task = await feishu.getTask(taskGuid)
   const comments = await feishu.listTaskComments(taskGuid)
   const ownCommentIds = ownRecordedCommentIds(getTaskState(binding.projectName, taskGuid))
   return {
-    project: { name: binding.projectName, root: feishu.PROJECTS_ROOT },
+    project: { name: binding.projectName, root: feishu.resolveProjectDir(binding.projectName) },
     tasklist: {
       guid: binding.guid,
       name: binding.name,
@@ -945,14 +1323,14 @@ function ownRecordedCommentIds(state: TaskAutomationState): Set<string> {
   return new Set(ids)
 }
 
-function parseSelectedTaskGuid(output: string, allowed: string[]): string | null {
+export function parseSelectedTaskGuid(output: string, allowed: string[]): string | null {
   try {
     const json = JSON.parse(output.trim())
     if (typeof json.task_guid === 'string' && allowed.includes(json.task_guid)) return json.task_guid
   } catch {}
-  for (const guid of allowed) {
-    if (output.includes(guid)) return guid
-  }
+  // Selection drives a full-permission implementation run. Echoing a GUID in
+  // prose (or multiple candidates) is not an authoritative choice; fail
+  // visibly and let the next scan retry instead of guessing by substring.
   return null
 }
 

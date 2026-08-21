@@ -75,3 +75,23 @@ describe('runtime live_elapsed', () => {
     expect(result.stderr).toContain('realtime')
   })
 })
+
+describe('TOML scalar parsing', () => {
+  test('keeps # inside quoted credentials while stripping a real comment', () => {
+    const result = loadFreshConfig(`
+      [feishu]
+      app_secret = "sec#ret" # operator note
+    `)
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).feishu.app_secret).toBe('sec#ret')
+  })
+
+  test('rejects a notify port with trailing junk', () => {
+    const result = loadFreshConfig(`
+      [notify]
+      port = "9876junk"
+    `)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[notify].port must be an integer')
+  })
+})

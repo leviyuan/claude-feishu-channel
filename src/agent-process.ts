@@ -82,6 +82,8 @@ export interface AgentProcess extends EventEmitter {
   sendToolResult(toolUseId: string, content: string, isError?: boolean): void
   sendHookResponse(requestId: string, output?: object): void
   isAlive(): boolean
+  /** Resolve only after the backend's real lifecycle has ended. Reject when
+   *  TERM/KILL (Codex) or SDK close/abort (Claude) cannot confirm exit. */
   kill(timeoutMs?: number): Promise<void>
 
   listModels(): Promise<CodexModel[]>

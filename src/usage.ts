@@ -53,23 +53,40 @@ export class AppServerOnce {
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private buf = ''
   private nextId = 1
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; method: string }>()
+  private alive = true
+  private exitPromise: Promise<void>
+  private resolveExit!: () => void
+  private pending = new Map<number, {
+    resolve: (v: any) => void
+    reject: (e: Error) => void
+    method: string
+    timer: ReturnType<typeof setTimeout>
+  }>()
 
   constructor() {
     this.proc = spawn(resolveCodexBin(), ['app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
     }) as ChildProcessByStdio<Writable, Readable, Readable>
+    this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
     this.proc.stderr.on('data', (chunk: Buffer) => {
       const s = chunk.toString().trim()
       if (s) log(`usage[codex stderr]: ${s}`)
     })
-    this.proc.on('exit', (code, signal) => {
+    const finish = (error: Error) => {
+      if (!this.alive) return
+      this.alive = false
       for (const [id, p] of this.pending) {
-        p.reject(new Error(`codex app-server exited before ${p.method} response id=${id} code=${code} signal=${signal}`))
+        clearTimeout(p.timer)
+        p.reject(new Error(`${error.message}; pending ${p.method} id=${id}`))
       }
       this.pending.clear()
+      this.resolveExit()
+    }
+    this.proc.on('error', error => finish(new Error(`codex app-server spawn failed: ${error.message}`)))
+    this.proc.on('exit', (code, signal) => {
+      finish(new Error(`codex app-server exited code=${code} signal=${signal}`))
     })
   }
 
@@ -86,21 +103,55 @@ export class AppServerOnce {
       const pending = this.pending.get(msg.id)
       if (!pending) continue
       this.pending.delete(msg.id)
+      clearTimeout(pending.timer)
       if (msg.error) pending.reject(new Error(JSON.stringify(msg.error)))
       else pending.resolve(msg.result)
     }
   }
 
-  request(method: string, params: any): Promise<any> {
+  request(method: string, params: any, timeoutMs = API_TIMEOUT_MS): Promise<any> {
     const id = this.nextId++
-    this.proc.stdin.write(JSON.stringify({ id, method, params }) + '\n')
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method })
+      if (!this.alive) {
+        reject(new Error(`codex app-server is not alive; cannot request ${method}`))
+        return
+      }
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return
+        reject(new Error(`codex app-server ${method} timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+      this.pending.set(id, { resolve, reject, method, timer })
+      try {
+        this.proc.stdin.write(JSON.stringify({ id, method, params }) + '\n', error => {
+          if (!error) return
+          const pending = this.pending.get(id)
+          if (!pending) return
+          this.pending.delete(id)
+          clearTimeout(pending.timer)
+          pending.reject(new Error(`codex app-server write failed for ${method}: ${error.message}`))
+        })
+      } catch (error) {
+        this.pending.delete(id)
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 
-  async close(): Promise<void> {
-    try { this.proc.kill('SIGTERM') } catch {}
+  async close(timeoutMs = 2000): Promise<void> {
+    if (!this.alive) return
+    if (!this.proc.kill('SIGTERM')) throw new Error('codex app-server rejected SIGTERM')
+    const exited = await Promise.race([
+      this.exitPromise.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), timeoutMs)),
+    ])
+    if (exited) return
+    if (!this.proc.kill('SIGKILL')) throw new Error('codex app-server rejected SIGKILL')
+    const killed = await Promise.race([
+      this.exitPromise.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), timeoutMs)),
+    ])
+    if (!killed) throw new Error(`codex app-server did not exit after SIGKILL (${timeoutMs}ms)`)
   }
 }
 

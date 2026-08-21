@@ -128,19 +128,21 @@ export async function onModelCustomPrompt(
   if (ts.agent !== 'claude' || !ts.verifyModel) {
     return { ok: false, message: `${ts.display} 不支持手动补录模型` }
   }
-  s.modelCustomPrompt = { sourceId: ts.id, panelId: panelIdRaw.trim(), cardMessageId }
+  const panelId = panelIdRaw.trim()
+  if (!panelId) return { ok: false, message: '补录面板缺少 panel_id，请重新发送 model' }
+  s.modelCustomPrompt = { sourceId: ts.id, panelId, cardMessageId }
   return {
     ok: true,
     message: '等待模型名',
-    card: cards.modelCustomPromptCard(s.sessionName, ts.display),
+    card: cards.modelCustomPromptCard(s.sessionName, ts.display, panelId),
   }
 }
 
 /** 补录应答态消费一条群消息(daemon 在裸词命令之后、开新 turn 之前调)。
  *  返回 true = 消息被当模型名消费,false = 不是补录态,消息走正常流程。
  *  结果一律原位更新补录卡(等待态存的 messageId):通过 → effort 选择卡
- *  (与点列表模型完全同路径);失败/已存在 → 卡上红字。不单发群消息 ——
- *  回执单发会和正常消息流混淆,产生"下一条是否还是模型名"的歧义。 */
+ *  (与点列表模型完全同路径);失败/已存在 → 卡上红字。正常落地不单发群消息;
+ *  只有原位更新失败时才发 raw fallback，避免结果静默丢失。 */
 export async function consumeModelCustomMessage(
   s: Session,
   text: string,
@@ -153,17 +155,61 @@ export async function consumeModelCustomMessage(
   const ts = getTokenSource(pending.sourceId)
   // 更新补录卡的 panel(失败提示/成功转 effort);id_convert 失败如实 log,
   // 状态机照常走(卡片更新是呈现,不是数据路径)。
-  const updateCard = async (panel: object) => {
-    if (!pending.cardMessageId) return
+  const updateCard = async (panel: object): Promise<boolean> => {
+    if (!pending.cardMessageId) return false
+    let cardId = ''
+    let replaced = false
+    let closed = false
     try {
-      const cardId = await cardkit.convertMessageToCard(pending.cardMessageId)
-      await cardkit.replaceElement(cardId, cards.ELEMENTS.modelPanel, panel)
+      cardId = await cardkit.convertMessageToCard(pending.cardMessageId)
+      // Static model cards are converted only for this one-shot mutation.
+      // Register a short lifecycle so a test/client that reuses a card id does
+      // not inherit an older disposed tombstone, and so finally can always
+      // release the bookkeeping deterministically.
+      cardkit.recordCardCreated(cardId, 1)
+      replaced = await cardkit.replaceElementChecked(
+        cardId,
+        cards.ELEMENTS.modelPanel,
+        panel,
+        { notifyCardFailure: false },
+      )
+      if (!replaced) throw new Error('model panel replace rejected')
+      closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })
+      if (!closed) throw new Error('model panel streaming-off rejected')
     } catch (e: any) {
       log(`model-custom: card update MISS (${e?.message ?? e})`)
+    } finally {
+      if (cardId) {
+        // A failed replace can happen after CardKit reopened an expired static
+        // card. Always make one checked close attempt, but only tombstone the
+        // local state after streaming-off is confirmed.
+        if (!closed) {
+          try { closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }) }
+          catch (e: any) { log(`model-custom: streaming-off retry MISS (${e?.message ?? e})`) }
+        }
+        if (replaced && closed) {
+          try { await cardkit.dispose(cardId) }
+          catch (e: any) { log(`model-custom: card dispose MISS (${e?.message ?? e})`) }
+        } else {
+          log(`model-custom: retain card state after checked MISS mutation=${replaced} streamingOff=${closed} card=${cardId.slice(0, 12)}`)
+        }
+      }
     }
+    return replaced && closed
   }
-  const failCard = (reason: string) => updateCard(cards.modelCustomResultPanelElement(false, model, reason))
-  if (!ts || !ts.enabled) {
+  const updateCardOrFallback = async (panel: object, result: string): Promise<boolean> => {
+    const landed = await updateCard(panel)
+    if (landed) return true
+    const fallback = `⚠️ 模型补录结果未能写回原卡。${result}\n请重新发送 model 打开面板。`
+    const sent = await feishu.sendTextRaw(s.chatId, fallback)
+    if (!sent) log(`model-custom: visible fallback send MISS (${result})`)
+    return false
+  }
+  const failCard = (reason: string) => updateCardOrFallback(
+    cards.modelCustomResultPanelElement(false, model, reason),
+    `❌ ${model ? `模型 ${model}` : '模型名'} 未加入：${reason}。`,
+  )
+  if (!ts || !ts.enabled || !ts.verifyModel) {
     await failCard('账号不可用')
     return true
   }
@@ -172,7 +218,10 @@ export async function consumeModelCustomMessage(
     return true
   }
   if (ts.models.some(m => m.model.toLowerCase() === model.toLowerCase())) {
-    await updateCard(cards.modelCustomResultCard(s.sessionName, false, model, '已在列表中'))
+    await updateCardOrFallback(
+      cards.modelCustomResultPanelElement(false, model, '已在列表中'),
+      `ℹ️ 模型 ${model} 已在列表中，未重复加入。`,
+    )
     return true
   }
   const verdict = await ts.verifyModel(model)
@@ -200,14 +249,22 @@ export async function consumeModelCustomMessage(
   }
   const target = fresh.models.some(m => m.model === model) ? fresh : ts
   const models = modelChoicesFor(s, target)
+  const selected = models.find(m => m.model === model)
+  if (!selected) {
+    await failCard('模型已验证，但刷新后的模型列表未返回该项')
+    return true
+  }
   s.modelPanels.set(pending.panelId, { models })
-  await updateCard(cards.modelEffortSelectionPanelElement({
-    sessionName: s.sessionName,
-    panelId: pending.panelId,
-    currentModel: s.currentModelLabel(),
-    currentEffort: s.currentEffortLabel(),
-    model: models.find(m => m.model === model)!,
-  }))
+  await updateCardOrFallback(
+    cards.modelEffortSelectionPanelElement({
+      sessionName: s.sessionName,
+      panelId: pending.panelId,
+      currentModel: s.currentModelLabel(),
+      currentEffort: s.currentEffortLabel(),
+      model: selected,
+    }),
+    `✅ 模型 ${model} 已补录成功。`,
+  )
   return true
 }
 
@@ -221,19 +278,23 @@ function readSourceModelsConfig(sourceId: string): string[] {
  *  不设取消 —— 它们不拦群消息,扔着不管无代价。幂等:无等待态也收尾卡。 */
 export async function onModelPanelCancel(
   s: Session,
+  panelIdRaw = '',
 ): Promise<ModelActionResult> {
+  const panelId = panelIdRaw.trim()
+  const pending = s.modelCustomPrompt
+  if (!panelId || !pending || pending.panelId !== panelId) {
+    return {
+      ok: false,
+      message: '此补录面板已失效',
+      card: cards.modelCancelledCard(s.sessionName, 'stale'),
+    }
+  }
   s.modelCustomPrompt = null
   return {
     ok: true,
     message: '已取消',
     card: cards.modelCancelledCard(s.sessionName),
   }
-}
-
-/** 读 config 里某 source 的 models 键现值(合并写入用,addTokenSource 是覆盖语义)。 */
-function readSourceModelsConfig(sourceId: string): string[] {
-  const raw = config.token_sources[sourceId]?.models
-  return (raw ?? '').split(',').map(x => x.trim()).filter(Boolean)
 }
 
 /** 取消按钮(旧副本删除:见上方带补录态清理的版本)。 */
@@ -374,7 +435,10 @@ export async function onModelEffortSelect(
         : model
       await withTimeout(s.proc.setModelSettings(processModel, effort), 20_000, 'thread/settings/update')
     }
-    await s.applyModelSelection(provider, model, effort, choice.sourceId)
+    // The Session wrapper owns the lifecycle mutex for the whole card action
+    // (validation + hot settings update + persisted selection). Calling the
+    // unlocked core here avoids re-entering that same mutex.
+    await s.applyModelSelectionUnlocked(provider, model, effort, choice.sourceId)
     const scope = modelSelectionScope(s, provider)
     s.modelPanels.delete(panelId)
     return {

@@ -11,10 +11,11 @@
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, writeFileSync, type Dirent } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { EventEmitter } from 'node:events'
+import { StringDecoder } from 'node:string_decoder'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
 import { log } from './log'
@@ -61,16 +62,20 @@ function whichCodex(): string | null {
 
 function buildSpawnPath(): string {
   if (process.platform === 'win32') return process.env.PATH ?? ''
-  return [
+  return [...new Set([
     join(homedir(), '.local', 'npm-global', 'bin'),
     join(homedir(), '.local', 'bin'),
     join(homedir(), '.bun', 'bin'),
+    ...(process.env.PATH ?? '').split(delimiter),
     '/usr/local/bin', '/usr/bin', '/bin',
-  ].join(delimiter)
+  ].filter(Boolean))].join(delimiter)
 }
 
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')
 const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
+// app-server control requests return an acknowledgement, not the whole model
+// turn. Bound them so a live PID with a dead transport cannot leak promises.
+const CODEX_REQUEST_TIMEOUT_MS = 30_000
 
 export interface SpawnOpts {
   workDir: string
@@ -221,6 +226,7 @@ type PendingRequest = {
   resolve: (v: any) => void
   reject: (e: Error) => void
   method: string
+  timeout: ReturnType<typeof setTimeout>
 }
 
 type ServerRequestState = {
@@ -240,12 +246,16 @@ export class CodexProcess extends EventEmitter {
   private serverRequests = new Map<string | number, ServerRequestState>()
   private alive = true
   private expectedExit = false
+  private readonly exitPromise: Promise<void>
+  private resolveExit!: () => void
   private opts: SpawnOpts
   private readyPromise: Promise<void> | null = null
   private catalogInitPromise: Promise<void> | null = null
   private currentTurnId: string | null = null
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
+  private rolloutLineRemainder = ''
+  private rolloutDecoder = new StringDecoder('utf8')
   private emittedImageGenerationIds = new Set<string>()
   // ── Codex 多 agent(ultra 并行编排)状态机 ──────────────────────────
   // agentThreadId → 展示名(agentPath 末段,spawn 那刻从 subAgentActivity /
@@ -279,6 +289,7 @@ export class CodexProcess extends EventEmitter {
     // for Session logging, but a direct utility script should not
     // crash before it can surface the app-server failure.
     this.on('error', () => {})
+    this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
     this.tokenSourceId = opts.tokenSourceId ?? null
     const codexBin = resolveCodexBin()
@@ -299,17 +310,31 @@ export class CodexProcess extends EventEmitter {
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
     this.proc.stderr.on('data', (chunk: Buffer) => this.onStderr(chunk))
+    this.proc.stdin.on('error', err => {
+      const error = err instanceof Error ? err : new Error(String(err))
+      log(`codex-process: stdin failed: ${error.message}`)
+      this.rejectPendingRequests((id, pending) => new Error(
+        `codex app-server stdin failed before ${pending.method} response (id=${id}): ${error.message}`,
+        { cause: error },
+      ))
+      if (!this.expectedExit) this.emit('error', error)
+    })
     this.proc.on('exit', (code, signal) => {
       this.alive = false
-      for (const [id, pending] of this.pending) {
-        pending.reject(new Error(`codex app-server exited before ${pending.method} response (id=${id})`))
-      }
-      this.pending.clear()
+      this.resolveExit()
+      this.rejectPendingRequests((id, pending) => (
+        new Error(`codex app-server exited before ${pending.method} response (id=${id})`)
+      ))
+      this.serverRequests.clear()
       log(`codex-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
       this.emit('exit', { code, signal, expected: this.expectedExit })
     })
     this.proc.on('error', err => {
       log(`codex-process: spawn error: ${err}`)
+      this.rejectPendingRequests((id, pending) => new Error(
+        `codex app-server process failed before ${pending.method} response (id=${id}): ${err.message}`,
+        { cause: err },
+      ))
       this.emit('error', err)
     })
   }
@@ -359,6 +384,7 @@ export class CodexProcess extends EventEmitter {
         return
       }
       this.pending.delete(msg.id)
+      clearTimeout(pending.timeout)
       if (msg.error) {
         pending.reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)))
       } else {
@@ -593,7 +619,7 @@ export class CodexProcess extends EventEmitter {
       return
     }
     if (this.feedCollabItem(item, 'completed', params)) return
-    const mapped = mapCompletedItem(item, this.sessionId ?? undefined)
+    const mapped = mapCompletedItem(item, this.opts.workDir, this.sessionId ?? undefined)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
       return
@@ -684,14 +710,15 @@ export class CodexProcess extends EventEmitter {
     const threadId = typeof params?.threadId === 'string' ? params.threadId : ''
     const mapped = phase === 'started'
       ? mapStartedItem(item, this.opts.workDir)
-      : mapCompletedItem(item, this.sessionId ?? undefined)
+      : mapCompletedItem(item, this.opts.workDir, this.sessionId ?? undefined)
     if (!mapped) return // reasoning/agentMessage 等非工具 item:不出 step
+    const output = 'output' in mapped && typeof mapped.output === 'string' ? mapped.output : undefined
     this.emit('subagent_step', {
       thread_id: threadId,
       item_id: item.id,
       tool: mapped.name,
       phase,
-      brief: subagentStepBrief(mapped.name, mapped.input, mapped.output),
+      brief: subagentStepBrief(mapped.name, mapped.input, output),
     })
   }
 
@@ -874,6 +901,8 @@ export class CodexProcess extends EventEmitter {
   private primeRolloutImageGenerationScan(): void {
     this.rolloutFilePath = null
     this.rolloutReadOffset = 0
+    this.rolloutLineRemainder = ''
+    this.rolloutDecoder = new StringDecoder('utf8')
     this.emittedImageGenerationIds.clear()
     if (!this.sessionId) return
     const filePath = findCodexRolloutFile(this.sessionId)
@@ -901,14 +930,30 @@ export class CodexProcess extends EventEmitter {
     try {
       const size = statSync(filePath).size
       if (size <= this.rolloutReadOffset) return
-      buf = readFileSync(filePath).subarray(this.rolloutReadOffset, size)
-      this.rolloutReadOffset = size
+      const length = size - this.rolloutReadOffset
+      buf = Buffer.allocUnsafe(length)
+      const fd = openSync(filePath, 'r')
+      let read = 0
+      try {
+        while (read < length) {
+          const n = readSync(fd, buf, read, length - read, this.rolloutReadOffset + read)
+          if (n === 0) break
+          read += n
+        }
+      } finally {
+        closeSync(fd)
+      }
+      buf = buf.subarray(0, read)
+      this.rolloutReadOffset += read
     } catch (e) {
       log(`codex-process: image generation rollout read failed ${filePath}: ${e instanceof Error ? e.message : e}`)
       return
     }
 
-    for (const line of buf.toString('utf8').split(/\r?\n/)) {
+    const text = this.rolloutLineRemainder + this.rolloutDecoder.write(buf)
+    const lines = text.split(/\r?\n/)
+    this.rolloutLineRemainder = text.endsWith('\n') ? '' : (lines.pop() ?? '')
+    for (const line of lines) {
       if (!line.trim()) continue
       let record: any
       try {
@@ -1032,24 +1077,55 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  private write(obj: object): void {
+  private write(obj: object, onError?: (error: Error) => void): boolean {
+    const fail = (reason: unknown): false => {
+      const error = reason instanceof Error ? reason : new Error(String(reason))
+      log(`codex-process: stdin write failed: ${error.message}`)
+      onError?.(error)
+      return false
+    }
     if (!this.alive) {
-      log(`codex-process: write to dead process: ${JSON.stringify(obj).slice(0, 200)}`)
-      return
+      return fail(new Error(`write to dead process: ${JSON.stringify(obj).slice(0, 200)}`))
+    }
+    if (this.proc.stdin.destroyed || this.proc.stdin.writableEnded || !this.proc.stdin.writable) {
+      return fail(new Error('stdin is not writable'))
     }
     try {
-      this.proc.stdin.write(JSON.stringify(obj) + '\n')
+      this.proc.stdin.write(JSON.stringify(obj) + '\n', error => {
+        if (error) fail(error)
+      })
+      return true
     } catch (e) {
-      log(`codex-process: stdin write failed: ${e}`)
+      return fail(e)
     }
   }
 
-  private request(method: string, params: any): Promise<any> {
+  private request(method: string, params: any, timeoutMs = CODEX_REQUEST_TIMEOUT_MS): Promise<any> {
     const id = ++this.requestCounter
-    this.write({ id, method, params })
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method })
+      const timeout = setTimeout(() => {
+        const pending = this.pending.get(id)
+        if (!pending) return
+        this.pending.delete(id)
+        pending.reject(new Error(`codex app-server ${method} request timed out after ${timeoutMs}ms (id=${id})`))
+      }, Math.max(0, timeoutMs))
+      const pending: PendingRequest = { resolve, reject, method, timeout }
+      this.pending.set(id, pending)
+      this.write({ id, method, params }, error => {
+        if (this.pending.get(id) !== pending) return
+        this.pending.delete(id)
+        clearTimeout(timeout)
+        reject(new Error(`codex app-server ${method} request write failed (id=${id}): ${error.message}`, { cause: error }))
+      })
     })
+  }
+
+  private rejectPendingRequests(errorFor: (id: string | number, pending: PendingRequest) => Error): void {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timeout)
+      pending.reject(errorFor(id, pending))
+    }
+    this.pending.clear()
   }
 
   private respond(id: string | number, result: any): void {
@@ -1336,15 +1412,41 @@ export class CodexProcess extends EventEmitter {
     if (!this.alive) return
     this.expectedExit = true
     log(`codex-process: SIGTERM (timeout=${timeoutMs}ms)`)
-    try { this.proc.kill('SIGTERM') } catch {}
-    const start = Date.now()
-    while (this.alive && Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, 100))
+    const signalErrors: string[] = []
+    this.sendSignal('SIGTERM', signalErrors)
+    if (await this.waitForExit(timeoutMs)) return
+
+    log(`codex-process: SIGKILL (process still alive after ${timeoutMs}ms)`)
+    this.sendSignal('SIGKILL', signalErrors)
+    if (await this.waitForExit(timeoutMs)) return
+
+    const details = signalErrors.length ? `; ${signalErrors.join('; ')}` : ''
+    const error = new Error(`codex app-server did not exit after SIGTERM and SIGKILL (${timeoutMs}ms each)${details}`)
+    log(`codex-process: kill failed: ${error.message}`)
+    throw error
+  }
+
+  private sendSignal(signal: NodeJS.Signals, errors: string[]): void {
+    try {
+      if (!this.proc.kill(signal) && this.alive) errors.push(`${signal} was not delivered`)
+    } catch (e) {
+      errors.push(`${signal} failed: ${e instanceof Error ? e.message : String(e)}`)
     }
-    if (this.alive) {
-      log('codex-process: SIGKILL (graceful timeout)')
-      try { this.proc.kill('SIGKILL') } catch {}
-    }
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (!this.alive) return true
+    return new Promise(resolve => {
+      let settled = false
+      const finish = (exited: boolean) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        resolve(exited)
+      }
+      const timeout = setTimeout(() => finish(!this.alive), Math.max(0, timeoutMs))
+      void this.exitPromise.then(() => finish(true))
+    })
   }
 }
 
@@ -1377,7 +1479,7 @@ function findCodexRolloutFile(sessionId: string): string | null {
   const stack = [CODEX_SESSIONS_DIR]
   while (stack.length) {
     const dir = stack.pop()!
-    let entries: ReturnType<typeof readdirSync>
+    let entries: Dirent<string>[]
     try {
       entries = readdirSync(dir, { withFileTypes: true })
     } catch (e) {
@@ -1516,29 +1618,38 @@ function mimeSubtypeToExtension(subtype: string): string | null {
   return null
 }
 
-function mapCompletedItem(item: any, threadId?: string): { output: string; isError: boolean } | null {
+function mapCompletedItem(
+  item: any,
+  workDir: string,
+  threadId?: string,
+): { name: string; input: any; output: string; isError: boolean } | null {
+  const started = mapStartedItem(item, workDir)
+  if (!started) return null
   switch (item.type) {
     case 'commandExecution':
       return {
+        ...started,
         output: item.aggregatedOutput ?? '',
         isError: item.exitCode != null && item.exitCode !== 0,
       }
     case 'fileChange':
-      return { output: JSON.stringify(item.changes ?? [], null, 2), isError: item.status === 'failed' }
+      return { ...started, output: JSON.stringify(item.changes ?? [], null, 2), isError: item.status === 'failed' }
     case 'mcpToolCall':
       return {
+        ...started,
         output: item.error ? JSON.stringify(item.error, null, 2) : JSON.stringify(item.result ?? null, null, 2),
         isError: !!item.error,
       }
     case 'dynamicToolCall':
       return {
+        ...started,
         output: JSON.stringify(item.contentItems ?? [], null, 2),
         isError: item.success === false,
       }
     case 'webSearch':
-      return { output: JSON.stringify(item.action ?? {}, null, 2), isError: false }
+      return { ...started, output: JSON.stringify(item.action ?? {}, null, 2), isError: false }
     case 'imageGeneration':
-      return { output: imageGenerationOutput(item, threadId), isError: item.status === 'failed' }
+      return { ...started, output: imageGenerationOutput(item, threadId), isError: item.status === 'failed' }
   }
   return null
 }

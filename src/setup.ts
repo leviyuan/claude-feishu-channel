@@ -24,12 +24,13 @@
  */
 
 import { execSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
 import { delimiter, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { CONFIG_DIR, CONFIG_FILE } from './paths'
+import { writeStateFileAtomic } from './state-store'
 
 const C = {
   reset: '\x1b[0m',
@@ -204,7 +205,7 @@ async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string } | { e
     if (slots) Object.assign(glmEnv, slots)
     settings.env = { ...prevEnv, ...glmEnv }
 
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 })
+    writeStateFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + '\n')
     return { path: settingsPath }
   } catch (e: any) {
     return { error: e?.message ?? String(e) }
@@ -235,6 +236,7 @@ async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: 
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      signal: AbortSignal.timeout(15_000),
     })
     const data = await res.json() as { code?: number; msg?: string; tenant_access_token?: string }
     if (data.tenant_access_token) return { ok: true }
@@ -483,7 +485,7 @@ export async function runSetup(): Promise<void> {
   // 现有配置); Codex 登录态由 codex CLI 管。config.toml 只保存 Feishu 和
   // Lodestar runtime; 高级用户可手写 [codex.env] / [claude.env] 注入子进程
   // 环境 (escape hatch, 通常不需要)。
-  writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
+  writeStateFileAtomic(CONFIG_FILE, toml.join('\n'))
 
   console.log(`\n${C.green}${C.bold}✓ 配置已写入${C.reset}`)
   console.log(`  ${C.cyan}${CONFIG_FILE}${C.reset}`)
@@ -503,12 +505,12 @@ export async function runSetup(): Promise<void> {
     console.log(`  ① 把机器人拉进任意飞书群`)
     console.log(`  ② 群名 = ${C.cyan}${projectsRoot}${sep}<群名>${C.reset} 下的目录名 (新群第一条消息会自动建)`)
     console.log(`  ③ 在群里发任意一条消息, 默认由 Claude 接管`)
-    console.log(`     ${C.dim}(群里发 model 可切到 Codex·GPT-5.5)${C.reset}`)
+    console.log(`     ${C.dim}(群里发 model 可选择已配置账号、动态模型和 effort)${C.reset}`)
     console.log()
     console.log(`日志 (按日滚动, 保留近 7 天):`)
     console.log(`  ${C.cyan}${logPath}${C.reset}`)
     console.log()
-    console.log(`${C.dim}若长期跑后台, 参考 README "7×24 守护" 一节配 systemd / Windows 后台托管。${C.reset}`)
+    console.log(`${C.dim}若长期跑后台, Linux 配 systemd --user,macOS 配 launchd,Windows 配任务计划程序。${C.reset}`)
   } else {
     console.log(`${C.yellow}启动失败: ${r.error}${C.reset}`)
     console.log(`手动运行: ${C.cyan}lodestar-daemon${C.reset}`)

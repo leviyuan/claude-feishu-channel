@@ -74,14 +74,14 @@ export async function onAskAnswer(
   questionIdx: number,
   optionIdx: number,
   user: string,
-): Promise<void> {
+): Promise<boolean> {
   const pending = s.pendingAsks.get(toolUseId)
-  if (!pending) { log(`session "${s.sessionName}": stray ask answer for ${toolUseId}`); return }
+  if (!pending) { log(`session "${s.sessionName}": stray ask answer for ${toolUseId}`); return false }
   if (questionIdx !== pending.currentIdx) {
     log(`session "${s.sessionName}": stale ask click q=${questionIdx} current=${pending.currentIdx}`)
-    return
+    return false
   }
-  advanceAsk(s, toolUseId, { optionIdx, user })
+  return advanceAsk(s, toolUseId, { optionIdx, user })
 }
 
 /** Custom-text branch. Same staleness rule as onAskAnswer; empty
@@ -106,8 +106,7 @@ export async function onAskCustomAnswer(
     log(`session "${s.sessionName}": stale ask custom q=${questionIdx} current=${pending.currentIdx}`)
     return false
   }
-  advanceAsk(s, toolUseId, { customText: trimmed, user })
-  return true
+  return advanceAsk(s, toolUseId, { customText: trimmed, user })
 }
 
 /** Record an answer for the current question, advance the state
@@ -118,23 +117,23 @@ export function advanceAsk(
   s: Session,
   toolUseId: string,
   answer: { optionIdx?: number; customText?: string; user: string },
-): void {
+): boolean {
   const pending = s.pendingAsks.get(toolUseId)
-  if (!pending || pending.currentIdx === undefined) return
+  if (!pending || pending.currentIdx === undefined) return false
   const cur = pending.currentIdx
   const q = pending.questions[cur]
-  if (!q) { log(`session "${s.sessionName}": advanceAsk currentIdx=${cur} out of range`); return }
+  if (!q) { log(`session "${s.sessionName}": advanceAsk currentIdx=${cur} out of range`); return false }
   // Resolve the literal answer value — custom text wins if both set.
   let value: string
   if (answer.customText !== undefined) {
     value = answer.customText
   } else if (answer.optionIdx !== undefined) {
     const opt = q.options?.[answer.optionIdx]
-    if (!opt) { log(`session "${s.sessionName}": advanceAsk option ${answer.optionIdx} out of range`); return }
+    if (!opt) { log(`session "${s.sessionName}": advanceAsk option ${answer.optionIdx} out of range`); return false }
     value = opt.label
   } else {
     log(`session "${s.sessionName}": advanceAsk with neither customText nor optionIdx`)
-    return
+    return false
   }
   pending.answers[q.question] = value
   pending.answered.set(cur, {
@@ -169,6 +168,7 @@ export function advanceAsk(
     if (pending.requestId) finalizeAsk(s, toolUseId)
     else log(`session "${s.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
   }
+  return true
 }
 
 /** Settle a fully-answered AskUserQuestion: emit the SDK allow

@@ -21,6 +21,11 @@ import { join } from 'node:path'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
+export interface TempSelectionResult {
+  ok: boolean
+  message: string
+}
+
 /** 当前群对应的项目名(剥 *ts 临时后缀 / [slug] worktree 后缀)。 */
 function projectName(s: Session): string {
   return feishu.tempProjectName(s.sessionName) ?? s.worktreeProjectName() ?? s.sessionName
@@ -150,54 +155,67 @@ export async function runByeCommand(s: Session): Promise<void> {
 
 // ── fork / back / resume 选择处理(卡片按钮回调) ──────────────────────
 
-export async function onForkSelect(s: Session, anchorIdx: number, userOpenId: string): Promise<void> {
-  if (s.selectedProvider !== 'claude') { await feishu.sendText(s.chatId, '❌ fork 暂只支持 Claude 后端(Codex 无 resumeSessionAt 能力)。群里发 model 切到 Claude。'); return }
-  if (!userOpenId) { await feishu.sendText(s.chatId, '❌ 找不到发起人,无法建临时群。'); return }
-  if (!s.opts.onCreateTempSession) { await feishu.sendText(s.chatId, '❌ 临时群能力未就绪。'); return }
+export async function onForkSelect(s: Session, anchorIdx: number, userOpenId: string): Promise<TempSelectionResult> {
+  if (s.selectedProvider !== 'claude') return { ok: false, message: 'fork 暂只支持 Claude 后端，请先在 model 面板切换' }
+  if (!userOpenId) return { ok: false, message: '找不到发起人，无法建临时群' }
+  if (!s.opts.onCreateTempSession) return { ok: false, message: '临时群能力未就绪' }
   const anchors = feishu.getTurnAnchors(s.sessionName)
-  if (anchorIdx < 0 || anchorIdx >= anchors.length) { await feishu.sendText(s.chatId, '❌ 无效的分叉点。'); return }
+  if (anchorIdx < 0 || anchorIdx >= anchors.length) return { ok: false, message: '无效的分叉点，此选择卡可能已过期' }
   // idx==0 = 会话起点(全新,不 resume);idx>=1 = 回到 anchors[idx-1] 之前(用其 uuid)
   const isOrigin = anchorIdx === 0
   const resumeSessionId = isOrigin ? undefined : s.lastSessionId ?? undefined
   const resumeSessionAt = isOrigin ? undefined : resumeAt(anchors, anchorIdx)
-  if (!isOrigin && !resumeSessionId) { await feishu.sendText(s.chatId, '❌ 当前会话还没有 session id,无法分叉。'); return }
+  if (!isOrigin && !resumeSessionId) return { ok: false, message: '当前会话还没有 session id，无法分叉' }
   const chatName = feishu.tempChatName(projectName(s))
   log(`session-temp: fork ${s.sessionName}@${anchorIdx} → ${chatName} (at=${resumeSessionAt?.slice(0, 8) ?? 'origin'})`)
-  await feishu.sendText(s.chatId, `🔱 分叉到 ${chatName}…`)
-  const r = await s.opts.onCreateTempSession({ chatName, userOpenId, resumeSessionId, resumeSessionAt })
-  if (!r?.ok) await feishu.sendText(s.chatId, `❌ 分叉失败: ${r?.error ?? '未知'}`)
+  try {
+    await feishu.sendText(s.chatId, `🔱 分叉到 ${chatName}…`)
+    const r = await s.opts.onCreateTempSession({ chatName, userOpenId, resumeSessionId, resumeSessionAt })
+    if (!r?.ok) return { ok: false, message: `分叉失败: ${r?.error ?? '未知'}` }
+  } catch (error) {
+    return { ok: false, message: `分叉失败: ${error instanceof Error ? error.message : error}` }
+  }
   // 不继承锚点:新临时群派生新 sid,旧 uuid 跨 sid 复用易错;新会话自己重新累积。
+  return { ok: true, message: `已分叉到 ${chatName}` }
 }
 
-export async function onBackSelect(s: Session, anchorIdx: number): Promise<void> {
-  if (s.selectedProvider !== 'claude') { await feishu.sendText(s.chatId, '❌ back 暂只支持 Claude 后端(Codex 无 resumeSessionAt 能力)。群里发 model 切到 Claude。'); return }
+export async function onBackSelect(s: Session, anchorIdx: number): Promise<TempSelectionResult> {
+  if (s.selectedProvider !== 'claude') return { ok: false, message: 'back 暂只支持 Claude 后端，请先在 model 面板切换' }
   const anchors = feishu.getTurnAnchors(s.sessionName)
-  if (anchorIdx < 0 || anchorIdx >= anchors.length) { await feishu.sendText(s.chatId, '❌ 无效的回滚点。'); return }
+  if (anchorIdx < 0 || anchorIdx >= anchors.length) return { ok: false, message: '无效的回滚点，此选择卡可能已过期' }
   const isOrigin = anchorIdx === 0
   const resumeSessionId = isOrigin ? undefined : s.lastSessionId ?? undefined
   const resumeSessionAt = isOrigin ? undefined : resumeAt(anchors, anchorIdx)
   // 先发 Write 记录卡(回滚段 = anchors[anchorIdx..end] 的 writes,被回滚掉的操作)
   const writes = anchors.slice(anchorIdx).flatMap(a => a.writes)
-  await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: projectName(s), entries: writes })).catch(() => {})
-  log(`session-temp: back ${s.sessionName}@${anchorIdx} (at=${resumeSessionAt?.slice(0, 8) ?? 'origin'}, writes=${writes.length})`)
-  const ok = await s.rollbackTo(resumeSessionId, resumeSessionAt)
-  if (ok) {
+  try {
+    await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: projectName(s), entries: writes })).catch(() => {})
+    log(`session-temp: back ${s.sessionName}@${anchorIdx} (at=${resumeSessionAt?.slice(0, 8) ?? 'origin'}, writes=${writes.length})`)
+    const ok = await s.rollbackTo(resumeSessionId, resumeSessionAt)
+    if (!ok) return { ok: false, message: '回滚失败，锚点未改动，请检查日志后重试' }
     // 成功后再截断(reset 语义:回滚点之后作废)。失败则不动锚点 —— 用户可重试,不丢历史。
     feishu.truncateTurnAnchors(s.sessionName, anchorIdx)
-  } else {
-    await feishu.sendText(s.chatId, '❌ 回滚失败,锚点未改动,请检查日志后重试。')
+    return { ok: true, message: isOrigin ? '已回滚到会话起点' : `已回滚到锚点 ${anchorIdx}` }
+  } catch (error) {
+    return { ok: false, message: `回滚失败: ${error instanceof Error ? error.message : error}` }
   }
 }
 
-export async function onResumeSelect(s: Session, sessionId: string): Promise<void> {
+export async function onResumeSelect(s: Session, sessionId: string): Promise<TempSelectionResult> {
   // sessionId 来自 transcript 文件名(同 cwd 的 claude 会话),直接 resume。
   if (s.selectedProvider !== 'claude') {
-    await feishu.sendText(s.chatId, '❌ 历史会话恢复只支持 Claude 后端(transcript 是 Claude 的)。群里发 model 切到 Claude 再 rs。')
-    return
+    return { ok: false, message: '历史会话恢复只支持 Claude 后端，请先在 model 面板切换' }
   }
-  await feishu.sendText(s.chatId, `🔁 在本群恢复会话 ${sessionId.slice(0, 8)}…`)
-  log(`session-temp: resume ${s.sessionName} ← claude session ${sessionId.slice(0, 8)}`)
-  const ok = await s.rollbackTo(sessionId, undefined)
-  if (ok) feishu.clearTurnAnchors(s.sessionName)
-  else await feishu.sendText(s.chatId, '❌ 恢复失败,请检查日志。')
+  const normalizedSessionId = sessionId.trim()
+  if (!normalizedSessionId) return { ok: false, message: '无效的历史会话，此选择卡可能已过期' }
+  try {
+    await feishu.sendText(s.chatId, `🔁 在本群恢复会话 ${normalizedSessionId.slice(0, 8)}…`)
+    log(`session-temp: resume ${s.sessionName} ← claude session ${normalizedSessionId.slice(0, 8)}`)
+    const ok = await s.rollbackTo(normalizedSessionId, undefined)
+    if (!ok) return { ok: false, message: '恢复失败，请检查日志后重试' }
+    feishu.clearTurnAnchors(s.sessionName)
+    return { ok: true, message: `已恢复会话 ${normalizedSessionId.slice(0, 8)}…` }
+  } catch (error) {
+    return { ok: false, message: `恢复失败: ${error instanceof Error ? error.message : error}` }
+  }
 }

@@ -6,20 +6,16 @@
  * (不重启 daemon)。让用户飞书里增删 token source,不依赖 SSH 改 config.toml。
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { reloadTokenSources, type TokenSourceConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
 import { refreshAllTokenSourceModels } from './token-source'
+import { writeStateFileAtomic } from './state-store'
 
 /** TOML 基本字符串转义(与 setup.ts escapeTomlString / config.ts parseToml 反转义对称) */
 function esc(v: string): string {
   return v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-}
-
-/** regex 特殊字符转义(用于 id 拼 regex,removeTokenSource 用) */
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function cfgToToml(id: string, cfg: TokenSourceConfig): string {
@@ -64,7 +60,8 @@ export function addTokenSource(id: string, cfg: TokenSourceConfig): void {
   const prev: Record<string, string> = {}
   const kept: string[] = []
   for (const line of lines) {
-    if (line.startsWith('[')) inSection = line === header
+    const section = line.match(/^\s*(\[[^\]]+\])\s*(?:#.*)?$/)?.[1]
+    if (section) inSection = section === header
     if (inSection) {
       const m = line.match(/^\s*([A-Za-z_]+)\s*=\s*"([^"]*)"/)
       if (m) prev[m[1]] = m[2]
@@ -73,23 +70,41 @@ export function addTokenSource(id: string, cfg: TokenSourceConfig): void {
     }
   }
   // 字段级合并:旧键打底,新 cfg 非空值覆盖(重跑 setup 只换凭据,不洗 models/slots/usage)。
-  const combined: Record<string, string | undefined> = { ...prev }
-  const incoming: Record<string, string | undefined> = { ...cfg }
+  type ConfigScalar = string | boolean | undefined
+  const combined: Record<string, ConfigScalar> = { ...prev }
+  const incoming: Record<string, ConfigScalar> = { ...cfg }
   for (const k of Object.keys(incoming)) if (incoming[k]) combined[k] = incoming[k]
   const merged = combined as TokenSourceConfig
   // 去掉 kept 尾部空行再拼新节,保持节间一个空行的布局。
   while (kept.length && kept[kept.length - 1] === '') kept.pop()
-  writeFileSync(CONFIG_FILE, kept.join('\n') + '\n\n' + cfgToToml(id, merged) + '\n')
+  writeStateFileAtomic(CONFIG_FILE, kept.join('\n') + '\n\n' + cfgToToml(id, merged) + '\n')
   reloadAndRebuild()
 }
 
 /** 删除一个 token source:从 config.toml 移除 [token_source.<id>] 节。返回是否真删了。 */
 export function removeTokenSource(id: string): boolean {
   const existing = readFileSync(CONFIG_FILE, 'utf8')
-  const re = new RegExp(`\\n?\\[token_source\\.${escapeRegex(id)}\\][^\\[]*`, 'g')
-  const next = existing.replace(re, '').replace(/\n{3,}/g, '\n\n')
-  if (next === existing) return false
-  writeFileSync(CONFIG_FILE, next)
+  const { text: next, removed } = removeTokenSourceSectionText(existing, id)
+  if (!removed) return false
+  writeStateFileAtomic(CONFIG_FILE, next)
   reloadAndRebuild()
   return true
+}
+
+export function removeTokenSourceSectionText(existing: string, id: string): { text: string; removed: boolean } {
+  const header = `[token_source.${id}]`
+  const kept: string[] = []
+  let inSection = false
+  let found = false
+  for (const line of existing.split('\n')) {
+    const section = line.match(/^\s*(\[[^\]]+\])\s*(?:#.*)?$/)?.[1]
+    if (section) {
+      inSection = section === header
+      if (inSection) found = true
+    }
+    if (!inSection) kept.push(line)
+  }
+  if (!found) return { text: existing, removed: false }
+  const next = kept.join('\n').replace(/\n{3,}/g, '\n\n')
+  return { text: next, removed: true }
 }

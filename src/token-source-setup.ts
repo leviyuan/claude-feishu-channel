@@ -33,7 +33,7 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
   } else if (ts.kind === 'codex-subscription') {
     await feishu.sendText(
       s.chatId,
-      `${ts.display} 需要 ChatGPT 登录:在服务器执行 \`codex login\`,完成后重启 daemon(\`systemctl --user restart feishu-daemon\`)或重发 \`model\` 刷新。`,
+      `${ts.display} 需要 ChatGPT 登录:在服务器执行 \`codex login\`,完成后按当前服务管理方式重启 daemon,或重发 \`model\` 刷新。`,
     )
   } else if (ts.kind === 'claude-native') {
     // native 凭本机 Claude 配置自动启用/禁用,无独立「启用」操作(它就是默认通路)。

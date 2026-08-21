@@ -229,7 +229,7 @@ export async function discoverTasklistDefaultSectionGuid(tasklistGuid: string): 
     if (res.code && res.code !== 0) throwFeishuApiError('feishu task.create', res)
     const task = res.data?.task
     taskGuid = task?.guid ?? ''
-    if (!taskGuid) throw new Error('feishu task.create returned no guid during default section discovery')
+    if (!task || !taskGuid) throw new Error('feishu task.create returned no guid during default section discovery')
     const sectionGuid = task.tasklists
       ?.find(item => item.tasklist_guid === tasklistGuid)
       ?.section_guid
@@ -350,4 +350,3 @@ async function callFeishuApi<T>(api: string, fn: () => Promise<T>): Promise<T> {
 function throwFeishuApiError(api: string, raw: unknown): never {
   throw new Error(formatFeishuApiError(api, raw))
 }
-

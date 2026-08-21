@@ -12,6 +12,7 @@ import {
   isDispatching,
   loadCallbacks,
   markResolved,
+  recordCallbackSuccess,
   prune,
   register,
   setDispatching,
@@ -79,6 +80,30 @@ describe('notify-callbacks store', () => {
     expect(get('nf_test1')?.resolvedBy?.openId).toBe('ou_user1')
   })
 
+  test('markResolved exposes persistence failure and rolls back the resolved flag', () => {
+    register(sampleReg())
+    // A regular file cannot be used as a parent directory, forcing the atomic
+    // writer to fail without relying on platform-specific chmod semantics.
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+
+    expect(() => markResolved('nf_test1', 'approve', 'ou_user1')).toThrow()
+    expect(get('nf_test1')?.resolvedAt).toBeUndefined()
+    expect(get('nf_test1')?.resolvedBy).toBeUndefined()
+  })
+
+  test('successful external callback becomes non-retryable unknown when tombstone persistence fails', () => {
+    register(sampleReg())
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+
+    const outcome = recordCallbackSuccess('nf_test1', 'approve', 'ou_user1')
+
+    expect(outcome.state).toBe('unknown')
+    expect(get('nf_test1')?.resolvedAt).toBeUndefined()
+    expect(get('nf_test1')?.unknownAt).toBeGreaterThan(0)
+    expect(get('nf_test1')?.unknownBy).toEqual({ buttonId: 'approve', openId: 'ou_user1' })
+    expect(get('nf_test1')?.unknownReason).toContain('tombstone persistence')
+  })
+
   test('prune(now) drops entries older than 7 days, keeps fresh', () => {
     const now = 1_700_000_000_000
     register(sampleReg({ notifyId: 'nf_old', createdAt: now - 8 * 24 * 3600_000 }))
@@ -124,6 +149,7 @@ describe('buildNotifyResult (pull payload)', () => {
     register(sampleReg({ notifyId: 'nf_pending' }))
     const r = buildNotifyResult(get('nf_pending')!) as any
     expect(r.resolved).toBe(false)
+    expect(r.unknown).toBe(false)
     expect(r.notify_id).toBe('nf_pending')
     expect(r.project).toBe('feishu')
     expect(r.message_id).toBe('om_msg')
@@ -139,6 +165,19 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
     expect(typeof r.resolved_at).toBe('number')
     expect(r.resolved_by).toBe('ou_op')
+  })
+
+  test('unknown ⇒ non-retryable ambiguous outcome with operator and reason', () => {
+    register(sampleReg({ notifyId: 'nf_unknown' }))
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    expect(recordCallbackSuccess('nf_unknown', 'approve', 'ou_op').state).toBe('unknown')
+
+    const r = buildNotifyResult(get('nf_unknown')!) as any
+    expect(r.resolved).toBe(false)
+    expect(r.unknown).toBe(true)
+    expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
+    expect(r.unknown_by).toBe('ou_op')
+    expect(r.unknown_reason).toContain('tombstone persistence')
   })
 })
 

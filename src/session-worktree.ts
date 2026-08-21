@@ -1,5 +1,3 @@
-import { join } from 'node:path'
-
 import type { Session } from './session'
 import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cards from './cards'
@@ -13,7 +11,15 @@ export function worktreeProjectName(s: Session): string {
 }
 
 export function worktreeProjectDir(s: Session): string {
-  return join(feishu.PROJECTS_ROOT, worktreeProjectName(s))
+  return feishu.resolveProjectDir(worktreeProjectName(s))
+}
+
+export function worktreeSessionDir(s: Session): string {
+  const projectName = worktreeProjectName(s)
+  const projectDir = feishu.resolveProjectDir(projectName)
+  if (projectName === s.sessionName) return projectDir
+  const slug = s.sessionName.slice(projectName.length + 1, -1)
+  return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 
 export function spawnDeveloperInstructions(s: Session): string {
@@ -71,38 +77,55 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
 
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
-  let ensured: worktree.EnsureWorktreeResult
   try {
-    ensured = worktree.ensureProjectWorktree(projectDir, projectName, slug)
+    await worktree.withProjectWorktreeLock(projectDir, async () => {
+      let ensured: worktree.EnsureWorktreeResult
+      try {
+        ensured = worktree.ensureProjectWorktree(projectDir, projectName, slug)
+      } catch (e) {
+        await feishu.sendText(s.chatId, `❌ wt 失败: ${messageOf(e)}`)
+        return
+      }
+
+      try {
+        const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
+        const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
+        const parentMsg = await feishu.sendCard(s.chatId, cards.worktreeNoticeCard({
+          slug,
+          branch: ensured.branch,
+          status: action,
+        }))
+        if (!parentMsg) await feishu.sendTextRaw(s.chatId, `❌ wt 卡片失败: ${slug}`)
+        const childMsg = await feishu.sendCard(chat.chatId, cards.worktreeNoticeCard({
+          slug,
+          branch: ensured.branch,
+          status: '就绪',
+          body: '开始吧。',
+        }))
+        if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}`)
+      } catch (e) {
+        await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
+      }
+    })
   } catch (e) {
     await feishu.sendText(s.chatId, `❌ wt 失败: ${messageOf(e)}`)
-    return
-  }
-
-  try {
-    const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
-    const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
-    const parentMsg = await feishu.sendCard(s.chatId, cards.worktreeNoticeCard({
-      slug,
-      branch: ensured.branch,
-      status: action,
-    }))
-    if (!parentMsg) await feishu.sendTextRaw(s.chatId, `❌ wt 卡片失败: ${slug}`)
-    const childMsg = await feishu.sendCard(chat.chatId, cards.worktreeNoticeCard({
-      slug,
-      branch: ensured.branch,
-      status: '就绪',
-      body: '开始吧。',
-    }))
-    if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}`)
-  } catch (e) {
-    await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
   }
 }
 
 async function buildWorktreeListCard(s: Session, notice?: { type: 'success' | 'error' | 'info'; content: string }): Promise<object> {
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
+  return await worktree.withProjectWorktreeLock(projectDir, async () => {
+    return await buildWorktreeListCardUnlocked(s, projectName, projectDir, notice)
+  })
+}
+
+async function buildWorktreeListCardUnlocked(
+  s: Session,
+  projectName: string,
+  projectDir: string,
+  notice?: { type: 'success' | 'error' | 'info'; content: string },
+): Promise<object> {
   const entries = worktree.listProjectWorktrees(projectDir, projectName)
   const hiddenMergedUnmountedCount = entries.filter(
     entry => entry.state === 'merged' && !entry.mounted,
@@ -183,24 +206,28 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
   }
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
+  let outcome: { ok: boolean; message: string; type: 'success' | 'error' | 'info' }
   try {
-    const chatName = worktree.worktreeChatName(projectName, slug)
-    if (s.hasRunningPeerSession(chatName)) {
-      const message = `❌ 解散 ${slug} 失败: Codex 正在运行，请先在 ${chatName} 群里 stop 或 kill。`
-      return worktreeActionResult(s, false, message, 'error')
-    }
-    worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
-    const disbanded = await feishu.disbandChatForSession(chatName)
-    const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
-    const message = [
-      `✅ ${slug} 已解散`,
-      removed.removedWorktree ? 'dir removed' : 'dir missing',
-      disbanded.disbanded ? 'group removed' : 'group missing',
-      removed.branch,
-    ].join('\n')
-    return worktreeActionResult(s, true, message, 'success')
+    outcome = await worktree.withProjectWorktreeLock(projectDir, async () => {
+      const chatName = worktree.worktreeChatName(projectName, slug)
+      if (s.hasRunningPeerSession(chatName)) {
+        const message = `❌ 解散 ${slug} 失败: Codex 正在运行，请先在 ${chatName} 群里 stop 或 kill。`
+        return { ok: false, message, type: 'error' as const }
+      }
+      worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
+      const disbanded = await feishu.disbandChatForSession(chatName)
+      const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
+      const message = [
+        `✅ ${slug} 已解散`,
+        removed.removedWorktree ? 'dir removed' : 'dir missing',
+        disbanded.disbanded ? 'group removed' : 'group missing',
+        removed.branch,
+      ].join('\n')
+      return { ok: true, message, type: 'success' as const }
+    })
   } catch (e) {
     const message = `❌ 解散 ${slug} 失败: ${messageOf(e)}`
-    return worktreeActionResult(s, false, message, 'error')
+    outcome = { ok: false, message, type: 'error' }
   }
+  return worktreeActionResult(s, outcome.ok, outcome.message, outcome.type)
 }

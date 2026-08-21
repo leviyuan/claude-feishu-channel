@@ -1,16 +1,7 @@
 import { homedir, tmpdir } from 'node:os'
 import { mkdtempSync, writeFileSync, unlinkSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
-
-mock.module('./config', () => ({
-  config: {
-    claude: {
-      env: {},
-      models: {},
-    },
-  },
-}))
+import { beforeEach, describe, expect, test } from 'bun:test'
 
 const {
   buildClaudeSpawnPath,
@@ -38,6 +29,7 @@ describe('Claude model profiles', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       pathEnv: '',
+      configuredBin: null,
       exists: () => false,
     })
 
@@ -50,6 +42,7 @@ describe('Claude model profiles', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       pathEnv: binDir,
+      configuredBin: null,
       exists: path => path === shim,
     })
 
@@ -65,6 +58,7 @@ describe('Claude model profiles', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       pathEnv: binDir,
+      configuredBin: null,
       exists: path => path === exe || path === shim,
     })
 
@@ -76,8 +70,7 @@ describe('Claude model profiles', () => {
     expect(executable.description).toBe('sdk-default')
   })
 
-  test('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
-    if (process.platform === 'win32') return
+  test.skipIf(process.platform === 'win32')('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
     const originalPath = process.env.PATH
     try {
       process.env.PATH = ['/opt/custom/bin', '/usr/bin'].join(delimiter)
@@ -93,8 +86,14 @@ describe('Claude model profiles', () => {
   })
 
   test('maps claude profiles to SDK model alias', () => {
-    expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
-    expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
+    const previousModels = config.claude.models
+    config.claude.models = {}
+    try {
+      expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
+      expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
+    } finally {
+      config.claude.models = previousModels
+    }
   })
 })
 
@@ -148,6 +147,7 @@ describe('Claude configured executable ([claude] bin)', () => {
     // [claude].bin 指向不存在的路径 → resolveClaudeExecutableConfig 同步抛出;
     // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
     // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
+    const previousBin = config.claude.bin
     ;(config.claude as any).bin = '/nope/reclaude'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
@@ -167,7 +167,8 @@ describe('Claude configured executable ([claude] bin)', () => {
       expect(exits).toHaveLength(1)
       expect(exits[0].code).toBe(1)
     } finally {
-      delete (config.claude as any).bin
+      if (previousBin === undefined) delete (config.claude as any).bin
+      else config.claude.bin = previousBin
     }
   })
 
@@ -176,6 +177,7 @@ describe('Claude configured executable ([claude] bin)', () => {
     // 旧实现此时调 listModels/setModelSettings 会抛模糊的
     // "Cannot read properties of undefined (reading 'supportedModels')";
     // 守卫后改成可定位的清晰错误(2026-07-04 review follow-up)。
+    const previousBin = config.claude.bin
     ;(config.claude as any).bin = '/nope/reclaude'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
@@ -184,7 +186,8 @@ describe('Claude configured executable ([claude] bin)', () => {
       await expect(proc.listModels()).rejects.toThrow('SDK query not initialized')
       await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('SDK query not initialized')
     } finally {
-      delete (config.claude as any).bin
+      if (previousBin === undefined) delete (config.claude as any).bin
+      else config.claude.bin = previousBin
     }
   })
 })
@@ -194,6 +197,98 @@ describe('Claude permission mode', () => {
     // bypassPermissions 会 shadow canUseTool(SDK CLAUDE_SDK_CAN_USE_TOOL_SHADOWED),
     // AskUserQuestion 被秒批空答案;改 default 后 canUseTool 才能拦下渲染卡片。
     expect(CLAUDE_PERMISSION_MODE).toBe('default')
+  })
+})
+
+describe('Claude shutdown reliability', () => {
+  test('drops queued user inputs when the process is killed', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.input.push({ type: 'user', message: { role: 'user', content: [] } })
+
+    await proc.kill()
+
+    await expect(proc.input.next()).resolves.toEqual({ value: undefined, done: true })
+  })
+
+  test('resolves pending SDK permissions with a legal deny on exit', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const ac = new AbortController()
+    const permission = proc.canUseTool(
+      'AskUserQuestion',
+      { question: 'Continue?', options: ['Yes', 'No'] },
+      { signal: ac.signal, toolUseID: 'dialog-stop-1' },
+    )
+
+    proc.finishExit(0, null)
+
+    await expect(permission).resolves.toEqual({ behavior: 'deny', message: 'claude process exited' })
+    expect(proc.pendingPermissions.size).toBe(0)
+  })
+
+  test('uses SDK close and abort, then waits for the read loop exit', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const exits: any[] = []
+    let closeCalls = 0
+    proc.started = true
+    proc.query = {
+      close: () => {
+        closeCalls++
+        queueMicrotask(() => proc.finishExit(null, null))
+      },
+    }
+    proc.on('exit', (event: any) => exits.push(event))
+
+    await expect(proc.kill(20)).resolves.toBeUndefined()
+
+    expect(closeCalls).toBe(1)
+    expect(proc.abortController.signal.aborted).toBe(true)
+    expect(exits).toEqual([{ code: null, signal: null, expected: true }])
+  })
+
+  test('does not fabricate SIGKILL success when SDK close/abort never exits', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const exits: any[] = []
+    proc.started = true
+    proc.query = { close: () => {} }
+    proc.on('exit', (event: any) => exits.push(event))
+
+    await expect(proc.kill(5)).rejects.toThrow('did not exit within 5ms')
+
+    expect(proc.abortController.signal.aborted).toBe(true)
+    expect(proc.alive).toBe(true)
+    expect(exits).toEqual([])
+  })
+
+  test('surfaces SDK close errors even when abort completes shutdown', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.started = true
+    proc.query = {
+      close: () => {
+        queueMicrotask(() => proc.finishExit(null, null))
+        throw new Error('close exploded')
+      },
+    }
+
+    await expect(proc.kill(20)).rejects.toThrow('SDK close failed: close exploded')
+    expect(proc.alive).toBe(false)
+  })
+})
+
+describe('Claude background task protocol validation', () => {
+  test('does not turn an unknown terminal status into completed', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const settled: any[] = []
+    proc.on('bg_task_settled', (event: any) => settled.push(event))
+
+    proc.handleMessage({
+      type: 'system', subtype: 'task_notification', task_id: 'task-1', status: 'future_status',
+    })
+    expect(settled).toEqual([])
+
+    proc.handleMessage({
+      type: 'system', subtype: 'task_notification', task_id: 'task-1', status: 'completed',
+    })
+    expect(settled).toEqual([{ task_id: 'task-1', status: 'completed', tool_use_id: undefined, summary: undefined, usage: undefined }])
   })
 })
 
@@ -757,7 +852,7 @@ describe('Claude token accounting', () => {
     // 全局锁定:任一 session 探测到真实窗口后, 同路由的其它 session 立即用作
     // 分母, 不各自首轮回落 200K。context window 是路由属性, 与 session 无关。
     const proc1 = new ClaudeAgentProcess({
-      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'glm',
     }) as any
     proc1.handleMessage({
       type: 'result', subtype: 'success', uuid: 'r-global-1', session_id: 's1',
@@ -769,7 +864,7 @@ describe('Claude token accounting', () => {
 
     // 全新 session/实例, 同路由; 即便 SDK 首轮报 200K 也立即取全局锁定的 1M
     const proc2 = new ClaudeAgentProcess({
-      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'glm',
     }) as any
     proc2.handleMessage({
       type: 'result', subtype: 'success', uuid: 'r-global-2', session_id: 's2',
@@ -790,6 +885,17 @@ describe('Claude token accounting', () => {
       modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
     })
     expect(proc3.lastContextWindow).toBe(200_000) // default 路由独立, 200K
+
+    const proc4 = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'deepseek',
+    }) as any
+    proc4.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'r-global-4', session_id: 's4',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
+    })
+    expect(proc4.lastContextWindow).toBe(200_000) // 同 model slug、不同 source 不串扰
   })
 
   test('context window stays null when SDK does not report one', () => {

@@ -4,10 +4,19 @@ import { dirname, join, resolve } from 'node:path'
 export const AI_AUTO_BRANCH = 'AI-AUTO'
 export const AI_REVIEW_BRANCH = 'AI-REVIEW'
 
-export function prepareAutomationWorktree(projectDir: string, projectName: string, branch: string): string {
+export function prepareAutomationWorktree(
+  projectDir: string,
+  projectName: string,
+  branch: string,
+  expectedBaseHead?: string,
+): string {
   assertGitRepo(projectDir)
   const targetPath = join(dirname(projectDir), `${projectName}[${branch}]`)
-  const baseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
+  const actualBaseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
+  if (expectedBaseHead && actualBaseHead !== expectedBaseHead) {
+    throw new Error(`project HEAD changed before worktree prepare: expected ${expectedBaseHead}, got ${actualBaseHead}`)
+  }
+  const baseHead = expectedBaseHead ?? actualBaseHead
   const mounted = parseWorktreeList(projectDir).get(branch) ?? null
   if (!hasBranch(projectDir, branch)) git(projectDir, ['branch', branch, 'HEAD'])
   if (mounted) {

@@ -25,10 +25,10 @@
  * (same tier as `debug.sock` and the bot's stdin).
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { log } from './log'
 import { NOTIFY_CALLBACKS_FILE } from './paths'
+import { writeJsonStateAtomic } from './state-store'
 
 /** Caller-declared button shape (after validation). `type` mirrors the
  * Feishu schema-2.0 button `type` field; omitted serializes as the
@@ -68,6 +68,12 @@ export interface NotifyRegistration {
    * same card near-simultaneously. */
   resolvedAt?: number
   resolvedBy?: { buttonId: string; openId: string }
+  /** External callback succeeded, but the durable resolved tombstone could
+   * not be confirmed. Never retry this state automatically: the external
+   * side effect may already have happened. */
+  unknownAt?: number
+  unknownBy?: { buttonId: string; openId: string }
+  unknownReason?: string
 }
 
 /** Drop registrations older than this on load. 7 days matches the
@@ -82,6 +88,8 @@ const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 const CALLBACK_TIMEOUT_MS = 2500
 
 const map = new Map<string, NotifyRegistration>()
+let lastRuntimePruneAt = Date.now()
+const RUNTIME_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 /** In-flight push dispatches (transient, in-memory only — deliberately
  * NOT persisted). Guards double-click during the live two-phase update:
@@ -102,12 +110,12 @@ let storeFile = NOTIFY_CALLBACKS_FILE
 
 function saveCallbacks(): void {
   try {
-    mkdirSync(dirname(storeFile), { recursive: true })
     const obj: Record<string, NotifyRegistration> = {}
     for (const [k, v] of map) obj[k] = v
-    writeFileSync(storeFile, JSON.stringify(obj, null, 2))
+    writeJsonStateAtomic(storeFile, obj)
   } catch (e) {
     log(`notify-callbacks: save failed (${storeFile}): ${e}`)
+    throw e
   }
 }
 
@@ -139,6 +147,13 @@ export function loadCallbacks(): void {
 }
 
 export function register(reg: NotifyRegistration): void {
+  // The daemon is expected to run for weeks; prune-on-boot alone lets a
+  // long-lived process grow this map and its state file without bound.
+  const now = Date.now()
+  if (now - lastRuntimePruneAt >= RUNTIME_PRUNE_INTERVAL_MS) {
+    prune(now)
+    lastRuntimePruneAt = now
+  }
   map.set(reg.notifyId, reg)
   saveCallbacks()
 }
@@ -149,10 +164,82 @@ export function get(notifyId: string): NotifyRegistration | undefined {
 
 export function markResolved(notifyId: string, buttonId: string, openId: string): void {
   const rec = map.get(notifyId)
-  if (!rec) return
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  const previous = {
+    resolvedAt: rec.resolvedAt,
+    resolvedBy: rec.resolvedBy,
+    unknownAt: rec.unknownAt,
+    unknownBy: rec.unknownBy,
+    unknownReason: rec.unknownReason,
+  }
   rec.resolvedAt = Date.now()
   rec.resolvedBy = { buttonId, openId }
+  delete rec.unknownAt
+  delete rec.unknownBy
+  delete rec.unknownReason
+  try {
+    saveCallbacks()
+  } catch (e) {
+    if (previous.resolvedAt === undefined) delete rec.resolvedAt
+    else rec.resolvedAt = previous.resolvedAt
+    if (previous.resolvedBy === undefined) delete rec.resolvedBy
+    else rec.resolvedBy = previous.resolvedBy
+    if (previous.unknownAt === undefined) delete rec.unknownAt
+    else rec.unknownAt = previous.unknownAt
+    if (previous.unknownBy === undefined) delete rec.unknownBy
+    else rec.unknownBy = previous.unknownBy
+    if (previous.unknownReason === undefined) delete rec.unknownReason
+    else rec.unknownReason = previous.unknownReason
+    throw e
+  }
+}
+
+export function markUnknown(
+  notifyId: string,
+  buttonId: string,
+  openId: string,
+  reason: string,
+): void {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  delete rec.resolvedAt
+  delete rec.resolvedBy
+  rec.unknownAt = Date.now()
+  rec.unknownBy = { buttonId, openId }
+  rec.unknownReason = reason
+  // Keep the in-memory unknown guard even if this write throws. The caller
+  // will also freeze the visible card so an ambiguous external success is not
+  // exposed as a retryable button after a local persistence failure.
   saveCallbacks()
+}
+
+export type NotifyCallbackSuccessRecord =
+  | { state: 'complete' }
+  | { state: 'unknown'; detail: string }
+
+/** Record a successful external callback without ever turning an ambiguous
+ * local persistence failure into a retryable outcome. */
+export function recordCallbackSuccess(
+  notifyId: string,
+  buttonId: string,
+  openId: string,
+): NotifyCallbackSuccessRecord {
+  try {
+    markResolved(notifyId, buttonId, openId)
+    return { state: 'complete' }
+  } catch (resolvedError) {
+    const resolvedDetail = resolvedError instanceof Error ? resolvedError.message : String(resolvedError)
+    let detail = `resolved tombstone persistence failed: ${resolvedDetail}`
+    try {
+      markUnknown(notifyId, buttonId, openId, detail)
+    } catch (unknownError) {
+      const unknownDetail = unknownError instanceof Error ? unknownError.message : String(unknownError)
+      detail += `; unknown tombstone persistence also failed: ${unknownDetail}`
+      const rec = map.get(notifyId)
+      if (rec) rec.unknownReason = detail
+    }
+    return { state: 'unknown', detail }
+  }
 }
 
 /** Defensive cleanup hook (not currently on a timer — prune-on-load is
@@ -263,10 +350,12 @@ export async function dispatchCallback(
  * user's real `notify-callbacks.json`. Production paths never call this;
  * they use {@link loadCallbacks} / {@link register} against
  * {@link NOTIFY_CALLBACKS_FILE}. */
-export function __setStoreFileForTest(file: string): void {
+export function __setStoreFileForTest(file: string, clearMemory = true): void {
   storeFile = file
-  map.clear()
-  dispatching.clear()  // simulate a full process restart
+  if (clearMemory) {
+    map.clear()
+    dispatching.clear()  // simulate a full process restart
+  }
 }
 
 /** Build the pull-result payload for `GET /notify/result/<id>`. Pure
@@ -277,13 +366,15 @@ export function __setStoreFileForTest(file: string): void {
  * verdict without running a callback server. */
 export function buildNotifyResult(reg: NotifyRegistration): object {
   const resolved = !!reg.resolvedAt
-  const buttonId = reg.resolvedBy?.buttonId
+  const unknown = !!reg.unknownAt
+  const buttonId = reg.resolvedBy?.buttonId ?? reg.unknownBy?.buttonId
   const button = buttonId ? reg.buttons.find((b) => b.id === buttonId) : undefined
   return {
     notify_id: reg.notifyId,
     project: reg.project,
     message_id: reg.messageId,
     resolved,
+    unknown,
     ...(resolved
       ? {
           button: button
@@ -291,6 +382,16 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
             : { id: buttonId },
           resolved_at: reg.resolvedAt,
           resolved_by: reg.resolvedBy?.openId ?? null,
+        }
+      : {}),
+    ...(unknown
+      ? {
+          button: button
+            ? { id: button.id, text: button.text, type: button.type }
+            : { id: buttonId },
+          unknown_at: reg.unknownAt,
+          unknown_by: reg.unknownBy?.openId ?? null,
+          unknown_reason: reg.unknownReason,
         }
       : {}),
   }

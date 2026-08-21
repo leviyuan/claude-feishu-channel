@@ -1,6 +1,7 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
 import { log } from './log'
+import { messageOf } from './session-util'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
 
@@ -196,13 +197,32 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = wasRunning ? `🛑 停止 ${backend}` : '⚪ session 当前未运行'
         const statusCard = await s.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
-        await s.stop('已终止', {
-          announce: !statusCard,
-          onStatus: status => {
-            s.setStatusCard(statusCard, status)
-          },
-        })
-        await s.closeStatusCard(statusCard, wasRunning ? `✅ ${backend} 已终止` : `⚪ ${backend} 未运行`)
+        let stopError: unknown = null
+        let finalStatus = wasRunning ? `✅ ${backend} 已终止` : `⚪ ${backend} 未运行`
+        try {
+          await s.stop('已终止', {
+            announce: !statusCard,
+            onStatus: status => {
+              s.setStatusCard(statusCard, status)
+            },
+          })
+        } catch (e) {
+          stopError = e
+          finalStatus = s.isRunning()
+            ? `❌ ${backend} 未确认终止: ${messageOf(e)}；会话已阻断，请重试 kill/restart 或等待旧进程退出`
+            : `❌ ${backend} 停止收尾失败: ${messageOf(e)}`
+        } finally {
+          try {
+            await s.closeStatusCard(statusCard, finalStatus)
+          } catch (e) {
+            log(`session "${s.sessionName}": kill status card close failed: ${messageOf(e)}`)
+            await feishu.sendTextRaw(s.chatId, `${finalStatus}\n⚠️ kill 状态卡片终态写入失败: ${messageOf(e)}`)
+          }
+        }
+        // openStatusCard already provides the visible failure when present. If
+        // card creation failed, stop() had no chance to announce after throwing,
+        // so preserve error transparency with a raw text receipt.
+        if (stopError && !statusCard) await feishu.sendTextRaw(s.chatId, finalStatus)
       }
       return true
     case 'restart':

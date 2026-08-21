@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { DATA_DIR, TASKLIST_MAP_FILE } from './paths'
+import { existsSync, readFileSync } from 'node:fs'
+import { TASKLIST_MAP_FILE } from './paths'
 import * as feishu from './feishu'
 import { log } from './log'
+import { writeJsonStateAtomic } from './state-store'
 
 export type TasklistSectionKey = 'design' | 'aiTodo' | 'aiDoing' | 'aiReview' | 'done'
 
@@ -79,6 +80,7 @@ export interface AutomationProcessRecord {
   stdoutTail?: string
   stderrTail?: string
   error?: string
+  treeCleanupWarning?: string
 }
 
 export interface TasklistWorkerState {
@@ -89,6 +91,13 @@ export interface TasklistWorkerState {
    *  没必要每个 worker tick 都 listTasklistSections + getTasklistSection 校验一遍 ——
    *  worker 用这个字段做时间窗,默认 30min 才自愈一次(见 tasklist-worker.ts)。 */
   lastSectionEnsureAt?: string
+}
+
+export interface TasklistDeletionState {
+  requestedAt: string
+  lastAttemptAt?: string
+  attempts: number
+  lastError?: string
 }
 
 export interface TasklistBinding {
@@ -102,9 +111,14 @@ export interface TasklistBinding {
   tasks?: Record<string, TaskAutomationState>
   processes?: Record<string, AutomationProcessRecord>
   worker?: TasklistWorkerState
+  /** Durable delete intent. The worker reconciles these tombstones before it
+   * starts normal scans, so a crash after the remote DELETE cannot resurrect
+   * an apparently healthy local binding. */
+  deleting?: TasklistDeletionState
 }
 
 const bindings = new Map<string, TasklistBinding>()
+const lifecycleTails = new Map<string, Promise<void>>()
 
 loadTasklistMap()
 
@@ -113,7 +127,8 @@ export function tasklistNameForProject(projectName: string): string {
 }
 
 export function getTasklistBinding(projectName: string): TasklistBinding | null {
-  return bindings.get(projectName) ?? null
+  const binding = bindings.get(projectName)
+  return binding ? cloneBinding(binding) : null
 }
 
 export function listTasklistBindings(): TasklistBinding[] {
@@ -123,15 +138,77 @@ export function listTasklistBindings(): TasklistBinding[] {
 export function updateTasklistBinding(projectName: string, update: (binding: TasklistBinding) => void): TasklistBinding {
   const binding = bindings.get(projectName)
   if (!binding) throw new Error(`tasklist is not enabled for ${projectName}`)
-  update(binding)
-  normalizeBinding(projectName, binding)
-  saveTasklistMap()
-  return cloneBinding(binding)
+  const nextBinding = cloneBinding(binding)
+  update(nextBinding)
+  normalizeBinding(projectName, nextBinding)
+  commitBinding(projectName, nextBinding)
+  return cloneBinding(nextBinding)
+}
+
+/** Serialize remote create/delete lifecycles per project. Different projects
+ * remain concurrent; repeated card clicks for one project cannot create two
+ * tasklists or interleave enable with deletion. Exported for focused tests. */
+export async function withTasklistLifecycleLock<T>(projectName: string, run: () => Promise<T>): Promise<T> {
+  const previous = lifecycleTails.get(projectName) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const tail = previous.catch(() => {}).then(() => gate)
+  lifecycleTails.set(projectName, tail)
+  await previous.catch(() => {})
+  try {
+    return await run()
+  } finally {
+    release()
+    if (lifecycleTails.get(projectName) === tail) lifecycleTails.delete(projectName)
+  }
+}
+
+export function markTasklistDeleting(binding: TasklistBinding, now = new Date().toISOString()): void {
+  binding.deleting ??= { requestedAt: now, attempts: 0 }
+}
+
+/** Feishu Task v2's exact "resource not found" code. A durable deletion may
+ * legitimately see this after the remote DELETE committed but the daemon
+ * crashed before removing its local tombstone. No other error is swallowed. */
+export function isTasklistAlreadyDeletedError(error: unknown): boolean {
+  if (error && typeof error === 'object' && (error as { code?: unknown }).code === 1470404) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /\bcode=1470404\b/.test(message)
+}
+
+export async function deleteTasklistRemoteIdempotently(
+  guid: string,
+  deleteRemote: (guid: string) => Promise<void> = feishu.deleteTasklistByGuid,
+): Promise<'deleted' | 'already_deleted'> {
+  try {
+    await deleteRemote(guid)
+    return 'deleted'
+  } catch (e) {
+    if (isTasklistAlreadyDeletedError(e)) return 'already_deleted'
+    throw e
+  }
+}
+
+export function mergeEnsuredTasklistSections(
+  binding: TasklistBinding,
+  expectedGuid: string,
+  sections: TasklistSectionMap,
+): void {
+  if (binding.guid !== expectedGuid) {
+    throw new Error(`tasklist binding changed while ensuring sections: current=${binding.guid} expected=${expectedGuid}`)
+  }
+  if (binding.deleting) throw new Error(`tasklist deletion is pending for ${binding.projectName}`)
+  binding.sections = { ...sections }
 }
 
 export async function enableTasklist(projectName: string, chatId: string): Promise<TasklistBinding> {
+  return await withTasklistLifecycleLock(projectName, () => enableTasklistUnlocked(projectName, chatId))
+}
+
+async function enableTasklistUnlocked(projectName: string, chatId: string): Promise<TasklistBinding> {
   const existing = getTasklistBinding(projectName)
-  if (existing) return ensureTasklistSections(projectName)
+  if (existing?.deleting) throw new Error(`tasklist deletion is pending for ${projectName}`)
+  if (existing) return ensureTasklistSectionsUnlocked(projectName)
 
   const name = tasklistNameForProject(projectName)
   if (name.length > 100) throw new Error(`tasklist name is too long (${name.length}/100): ${name}`)
@@ -151,16 +228,19 @@ export async function enableTasklist(projectName: string, chatId: string): Promi
     processes: {},
     worker: {},
   }
-  bindings.set(projectName, binding)
-  saveTasklistMap()
-  await ensureTasklistSections(projectName)
-  saveTasklistMap()
-  return cloneBinding(binding)
+  commitBinding(projectName, binding)
+  await ensureTasklistSectionsUnlocked(projectName)
+  return getTasklistBinding(projectName)!
 }
 
 export async function ensureTasklistSections(projectName: string): Promise<TasklistBinding> {
+  return await withTasklistLifecycleLock(projectName, () => ensureTasklistSectionsUnlocked(projectName))
+}
+
+async function ensureTasklistSectionsUnlocked(projectName: string): Promise<TasklistBinding> {
   const binding = getTasklistBinding(projectName)
   if (!binding) throw new Error(`tasklist is not enabled for ${projectName}`)
+  if (binding.deleting) throw new Error(`tasklist deletion is pending for ${projectName}`)
   let existing = await feishu.listTasklistSections(binding.guid)
   existing = await removeEmptyLegacyDesignSections(existing)
   const byName = new Map(existing.map(section => [section.name, section.guid]))
@@ -172,9 +252,12 @@ export async function ensureTasklistSections(projectName: string): Promise<Taskl
     sections[spec.key] = guid
     insertAfter = guid
   }
-  binding.sections = sections
-  saveTasklistMap()
-  return cloneBinding(binding)
+  // Merge only the remotely-derived section field into the latest durable
+  // binding. `binding` is a pre-await snapshot; committing it wholesale would
+  // erase process/task updates that landed while Feishu calls were in flight.
+  return updateTasklistBinding(projectName, latest => {
+    mergeEnsuredTasklistSections(latest, binding.guid, sections)
+  })
 }
 
 async function ensureDefaultDesignSection(tasklistGuid: string, storedGuid?: string): Promise<string> {
@@ -226,15 +309,74 @@ async function removeEmptyLegacyDesignSections(
 }
 
 export async function deleteTasklist(projectName: string, expectedGuid: string): Promise<TasklistBinding> {
+  return await withTasklistLifecycleLock(projectName, () => deleteTasklistUnlocked(projectName, expectedGuid))
+}
+
+async function deleteTasklistUnlocked(projectName: string, expectedGuid: string): Promise<TasklistBinding> {
   const binding = getTasklistBinding(projectName)
   if (!binding) throw new Error('tasklist is not enabled')
   if (binding.guid !== expectedGuid) {
     throw new Error(`tasklist binding changed: current=${binding.guid} requested=${expectedGuid}`)
   }
-  await feishu.deleteTasklistByGuid(binding.guid)
-  bindings.delete(projectName)
-  saveTasklistMap()
-  return cloneBinding(binding)
+  if (!binding.deleting) {
+    updateTasklistBinding(projectName, next => markTasklistDeleting(next))
+  }
+  return await finishTasklistDeletion(projectName, expectedGuid)
+}
+
+async function finishTasklistDeletion(projectName: string, expectedGuid: string): Promise<TasklistBinding> {
+  const attempting = updateTasklistBinding(projectName, binding => {
+    if (binding.guid !== expectedGuid) {
+      throw new Error(`tasklist binding changed during deletion: current=${binding.guid} expected=${expectedGuid}`)
+    }
+    markTasklistDeleting(binding)
+    binding.deleting!.attempts++
+    binding.deleting!.lastAttemptAt = new Date().toISOString()
+    binding.deleting!.lastError = undefined
+  })
+  try {
+    const remoteResult = await deleteTasklistRemoteIdempotently(expectedGuid)
+    if (remoteResult === 'already_deleted') {
+      log(`tasklist: ${projectName} remote list ${expectedGuid} is already deleted (code=1470404); finishing tombstone`)
+    }
+    const latest = bindings.get(projectName)
+    if (!latest || latest.guid !== expectedGuid || !latest.deleting) {
+      throw new Error(`tasklist deletion state changed before local commit: ${projectName}`)
+    }
+    const next = new Map(bindings)
+    next.delete(projectName)
+    saveTasklistMap(next)
+    bindings.delete(projectName)
+    return cloneBinding(attempting)
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e)
+    try {
+      updateTasklistBinding(projectName, binding => {
+        if (binding.guid === expectedGuid && binding.deleting) binding.deleting.lastError = error
+      })
+    } catch (persistError) {
+      log(`tasklist: failed to persist delete error for ${projectName}: ${persistError}`)
+    }
+    throw e
+  }
+}
+
+/** Retry durable delete intents at worker startup. A failed retry leaves the
+ * tombstone in place and is surfaced to the caller; normal scans must skip it. */
+export async function reconcileTasklistDeletions(): Promise<void> {
+  const pending = [...bindings.entries()]
+    .filter(([, binding]) => !!binding.deleting)
+    .map(([projectName, binding]) => ({ projectName, guid: binding.guid }))
+  const failures: string[] = []
+  for (const item of pending) {
+    try {
+      await withTasklistLifecycleLock(item.projectName, () => finishTasklistDeletion(item.projectName, item.guid))
+      log(`tasklist: reconciled pending deletion for ${item.projectName}`)
+    } catch (e) {
+      failures.push(`${item.projectName}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  if (failures.length > 0) throw new Error(`tasklist deletion reconcile failed: ${failures.join('; ')}`)
 }
 
 export function taskStateFor(binding: TasklistBinding, taskGuid: string): TaskAutomationState {
@@ -285,6 +427,7 @@ function loadTasklistMap(): void {
         tasks: readTasks(item.tasks),
         processes: readProcesses(item.processes),
         worker: readWorker(item.worker),
+        deleting: readDeleting(item.deleting),
       }
       normalizeBinding(projectName, binding)
       bindings.set(projectName, binding)
@@ -295,15 +438,20 @@ function loadTasklistMap(): void {
   }
 }
 
-function saveTasklistMap(): void {
-  try {
-    const obj: Record<string, TasklistBinding> = {}
-    for (const [projectName, binding] of bindings) obj[projectName] = cloneBinding(binding)
-    mkdirSync(DATA_DIR, { recursive: true })
-    writeFileSync(TASKLIST_MAP_FILE, JSON.stringify(obj, null, 2))
-  } catch (e) {
-    log(`tasklist: save map failed: ${e}`)
-  }
+function commitBinding(projectName: string, binding: TasklistBinding): void {
+  const next = new Map(bindings)
+  next.set(projectName, cloneBinding(binding))
+  saveTasklistMap(next)
+  bindings.set(projectName, binding)
+}
+
+function saveTasklistMap(source: Map<string, TasklistBinding> = bindings): void {
+  const obj: Record<string, TasklistBinding> = {}
+  for (const [projectName, binding] of source) obj[projectName] = cloneBinding(binding)
+  // Persistence is part of the state transition: callers must observe a
+  // failed write instead of reporting success with an unrecoverable in-memory
+  // state. The shared store keeps the previous valid snapshot until rename.
+  writeJsonStateAtomic(TASKLIST_MAP_FILE, obj)
 }
 
 function normalizeBinding(projectName: string, binding: TasklistBinding): void {
@@ -323,7 +471,8 @@ function readSectionMap(raw: unknown): TasklistSectionMap {
   if (!raw || typeof raw !== 'object') return out
   const obj = raw as Record<string, unknown>
   for (const spec of TASKLIST_SECTION_SPECS) {
-    if (typeof obj[spec.key] === 'string' && obj[spec.key]) out[spec.key] = obj[spec.key]
+    const value = obj[spec.key]
+    if (typeof value === 'string' && value) out[spec.key] = value
   }
   return out
 }
@@ -370,6 +519,7 @@ function readProcesses(raw: unknown): Record<string, AutomationProcessRecord> {
       stdoutTail: typeof process.stdoutTail === 'string' ? process.stdoutTail : undefined,
       stderrTail: typeof process.stderrTail === 'string' ? process.stderrTail : undefined,
       error: typeof process.error === 'string' ? process.error : undefined,
+      treeCleanupWarning: typeof process.treeCleanupWarning === 'string' ? process.treeCleanupWarning : undefined,
     }
   }
   return out
@@ -382,5 +532,20 @@ function readWorker(raw: unknown): TasklistWorkerState {
     lastScanAt: typeof obj.lastScanAt === 'string' ? obj.lastScanAt : undefined,
     lastScanError: typeof obj.lastScanError === 'string' ? obj.lastScanError : undefined,
     runningTaskGuid: typeof obj.runningTaskGuid === 'string' ? obj.runningTaskGuid : undefined,
+    lastSectionEnsureAt: typeof obj.lastSectionEnsureAt === 'string' ? obj.lastSectionEnsureAt : undefined,
+  }
+}
+
+function readDeleting(raw: unknown): TasklistDeletionState | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const obj = raw as Partial<TasklistDeletionState>
+  if (typeof obj.requestedAt !== 'string' || !obj.requestedAt) return undefined
+  return {
+    requestedAt: obj.requestedAt,
+    lastAttemptAt: typeof obj.lastAttemptAt === 'string' ? obj.lastAttemptAt : undefined,
+    attempts: typeof obj.attempts === 'number' && Number.isFinite(obj.attempts) && obj.attempts >= 0
+      ? Math.floor(obj.attempts)
+      : 0,
+    lastError: typeof obj.lastError === 'string' ? obj.lastError : undefined,
   }
 }

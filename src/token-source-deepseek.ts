@@ -17,7 +17,7 @@
  * tokenSourceId 二选一,可并存。模块加载时 registerTokenSourceFactory 声明式登记。
  */
 
-import { config, type TokenSourceConfig } from './config'
+import type { TokenSourceConfig } from './config'
 import {
   type TokenSource,
   type TokenSourceModel,
@@ -170,7 +170,11 @@ registerTokenSourceFactory({
       },
       spawnEnv(base: Env): Env {
         const out = scrubAnthropicEnv(base)
-        const merged = { ...config.claude.env }
+        // `base` already includes config.claude.env. Re-applying the raw
+        // section after scrubbing would resurrect credentials belonging to a
+        // different Anthropic-compatible source. The selected source must be
+        // the final and sole authority for routing/authentication.
+        const merged: Env = { ...out }
         merged.ANTHROPIC_BASE_URL = baseUrl
         // DeepSeek Anthropic 端点认 x-api-key → ANTHROPIC_API_KEY(非 AUTH_TOKEN/Bearer)。
         merged.ANTHROPIC_API_KEY = apiKey
@@ -178,7 +182,7 @@ registerTokenSourceFactory({
         if (slots.opus) merged.ANTHROPIC_DEFAULT_OPUS_MODEL = slots.opus
         if (slots.sonnet) merged.ANTHROPIC_DEFAULT_SONNET_MODEL = slots.sonnet
         if (slots.haiku) merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = slots.haiku
-        return { ...out, ...merged }
+        return merged
       },
       resolveSpawnModel(model: string): string | undefined {
         // [1m] 后缀同 GLM 约定:加不加由真实 turn 观测定(见 context-window-observe.ts),

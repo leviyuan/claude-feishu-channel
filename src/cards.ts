@@ -81,9 +81,11 @@ export {
   type ResumeListCardOpts,
   type WriteLogEntry,
   type WriteLogCardOpts,
+  type SelectionResultCardOpts,
   turnListCard,
   resumeListCard,
   writeLogCard,
+  selectionResultCard,
   writeBodyFromToolInput,
 } from './cards/temp'
 export {

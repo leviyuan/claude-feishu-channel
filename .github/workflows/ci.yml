@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Typecheck, test, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Test
+        run: bun run test
+      - name: Test with fixed randomized order
+        run: bun run test:randomized
+      - name: Build distributable entry points
+        run: bun run build
+      - name: Set up minimum supported Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.15.0
+      - name: Smoke-check Node.js bundles
+        run: |
+          node --check dist/lodestar.js
+          node --check dist/lodestar-setup.js
+          node --check dist/lodestar-stop.js
+          node --check dist/lodestar-update.js
+          node --check dist/lodestar-version.js
+          node -e "Promise.all([import('@anthropic-ai/claude-agent-sdk'), import('@larksuiteoapi/node-sdk'), import('cross-spawn')])"
+
+  dependency-audit:
+    name: Production dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Reject production dependency advisories
+        run: bun run audit:production

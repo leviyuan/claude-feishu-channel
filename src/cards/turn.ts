@@ -192,7 +192,7 @@ function renderPlanContent(plan: TurnPlanStep[], explanation?: string | null, dr
 
 export function planElement(
   plan: TurnPlanStep[],
-  explanation?: string | null,
+  explanation: string | null | undefined,
   draftText = '',
   elementId: string,
 ): object {

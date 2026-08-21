@@ -90,7 +90,7 @@ describe('buildNotifyCard', () => {
     expect(findButtonValues(card)).toHaveLength(0)
   })
 
-  test('resolution marker replaces the button row across all 4 states', () => {
+  test('only retryable failed resolution keeps buttons; the other 4 states remove them', () => {
     const base = {
       title: 'ops', text: 'approve?', level: 'info' as const,
       notifyId: 'nf_abc',
@@ -100,6 +100,7 @@ describe('buildNotifyCard', () => {
       { status: 'processing' as const, want: /⏳/, color: 'blue' },
       { status: 'delivered' as const, want: /反馈已送达/, color: 'green' },
       { status: 'failed' as const, want: /回调失败:nope/, color: 'red', detail: 'nope' },
+      { status: 'unknown' as const, want: /确认状态未知，禁止自动重试/, color: 'red' },
       { status: 'done' as const, want: /已选择/, color: 'green' },
     ]
     for (const s of states) {
@@ -110,8 +111,7 @@ describe('buildNotifyCard', () => {
           operatorOpenId: 'ou_x', ...(s.detail ? { detail: s.detail } : {}),
         },
       })
-      // No interactive buttons in any resolution state.
-      expect(findButtonValues(card)).toHaveLength(0)
+      expect(findButtonValues(card)).toHaveLength(s.status === 'failed' ? 1 : 0)
       const marker: any = cardBody(card).find(
         (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('已选'),
       )

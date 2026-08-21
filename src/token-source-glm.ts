@@ -9,7 +9,7 @@
  * 模块加载时 registerTokenSourceFactory 声明式登记。
  */
 
-import { config, type TokenSourceConfig } from './config'
+import type { TokenSourceConfig } from './config'
 import {
   type TokenSource,
   type TokenSourceModel,
@@ -139,7 +139,13 @@ registerTokenSourceFactory({
       },
       spawnEnv(base: Env): Env {
         const out = scrubAnthropicEnv(base)
-        const merged = { ...config.claude.env }
+        // `base` already contains config.claude.env (ClaudeAgentProcess adds it
+        // before invoking the token-source transform).  Re-spreading the raw
+        // config here would undo scrubAnthropicEnv and could leave a competing
+        // API_KEY/AUTH_TOKEN from a previously selected source in the child.
+        // Keep the scrubbed non-Anthropic environment and inject only this
+        // source's routing/auth fields as the final authority.
+        const merged: Env = { ...out }
         merged.ANTHROPIC_BASE_URL = baseUrl
         merged.ANTHROPIC_AUTH_TOKEN = token
         // slots 只从 config slots 键来(零代码默认);resolveSpawnModel 下发具体
@@ -147,7 +153,7 @@ registerTokenSourceFactory({
         if (slots.opus) merged.ANTHROPIC_DEFAULT_OPUS_MODEL = slots.opus
         if (slots.sonnet) merged.ANTHROPIC_DEFAULT_SONNET_MODEL = slots.sonnet
         if (slots.haiku) merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = slots.haiku
-        return { ...out, ...merged }
+        return merged
       },
       resolveSpawnModel(model: string): string | undefined {
         // [1m] 是 CLI 客户端侧后缀(剥后缀 + context-1m beta header,窗口按 1M 记账)。

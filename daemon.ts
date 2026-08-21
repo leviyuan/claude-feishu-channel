@@ -22,10 +22,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
+import * as cards from './src/cards'
 import { actionCardResponse } from './src/card-action'
 import {
   get as getNotifyCallback,
   markResolved as markNotifyCallbackResolved,
+  recordCallbackSuccess,
   dispatchCallback,
   isDispatching,
   setDispatching,
@@ -37,11 +39,19 @@ import {
 import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
-import { startTasklistWorker } from './src/tasklist-worker'
+import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
+import { isStaleAtReceipt } from './src/inbound-message'
+import { drainDynamicWork, trackWork } from './src/inflight-work'
+import {
+  ActionDeduper,
+  PerKeyActor,
+  createCardActionAdmission,
+  createPerChatAdmission,
+} from './src/card-action-runtime'
 
 // ── PID guard ───────────────────────────────────────────────────────────
 // dev 路径 (`bun daemon.ts` 直接跑) 不经过 cli.ts, 所以这里也守一道。
@@ -60,6 +70,11 @@ mkdirSync(dirname(PID_FILE), { recursive: true })
 writePidFile(PID_FILE)
 
 let cleanupDone = false
+let shutdownRequested = false
+let shutdownPromise: Promise<void> | null = null
+let shutdownExitCode = 0
+let shutdownAliveSessionNames: string[] | null = null
+const SHUTDOWN_DEADLINE_MS = 15_000
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
@@ -68,33 +83,139 @@ const cleanup = () => {
   // anything the user already `kill`-ed (those are absent from the
   // sessions Map filter below and stay stopped after restart).
   try {
-    const alive = currentAliveSessionNames()
+    const alive = shutdownAliveSessionNames ?? currentAliveSessionNames()
     feishu.writeAliveMarker(alive)
     if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
   } catch (e) { log(`alive marker write failed: ${e}`) }
   try { unlinkSync(PID_FILE) } catch {}
   try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
 }
+
+function requestShutdown(reason: string, exitCode: number): Promise<void> {
+  // A later fatal error must upgrade an already-running graceful shutdown.
+  // Reusing the same drain promise is fine; reusing its original exit code is
+  // not, otherwise SIGTERM followed by an unhandled rejection exits 0.
+  shutdownExitCode = Math.max(shutdownExitCode, exitCode)
+  if (shutdownPromise) return shutdownPromise
+  shutdownRequested = true
+  // Seal both message and action admission synchronously before taking the
+  // dynamic work snapshot. Already-admitted tails remain drainable.
+  chatActor.close()
+  // Snapshot before Session.stop() clears each process and invokes its
+  // lifecycle callback. This marker means "revive after daemon restart", not
+  // "still alive after graceful teardown".
+  shutdownAliveSessionNames = currentAliveSessionNames()
+  try {
+    feishu.writeAliveMarker(shutdownAliveSessionNames)
+  } catch (e) {
+    log(`shutdown alive marker write failed: ${e}`)
+    shutdownExitCode = 1
+  }
+  shutdownPromise = (async () => {
+    log(`${reason}: staged shutdown begin sessions=${sessions.size}`)
+    try {
+      const stopping = (async () => {
+        await drainDynamicWork(() => [
+          ...chatActor.pending(),
+          ...inflightCardActions,
+        ])
+        return await Promise.allSettled([
+          ...[...sessions.values()].map(session =>
+            session.stop(`daemon ${reason}`, { announce: false })
+          ),
+          stopTasklistWorker(),
+        ])
+      })()
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null
+      const deadline = new Promise<'deadline'>(resolve => {
+        deadlineTimer = setTimeout(() => resolve('deadline'), SHUTDOWN_DEADLINE_MS)
+      })
+      const outcome = await Promise.race([
+        stopping.then(results => {
+          for (const result of results) {
+            if (result.status === 'rejected') {
+              shutdownExitCode = 1
+              log(`shutdown session stop failed: ${result.reason}`)
+            }
+          }
+          return 'stopped' as const
+        }),
+        deadline,
+      ])
+      if (deadlineTimer) clearTimeout(deadlineTimer)
+      if (outcome === 'deadline') {
+        shutdownExitCode = 1
+        log(`${reason}: shutdown deadline ${SHUTDOWN_DEADLINE_MS}ms reached; forcing exit`)
+      } else {
+        log(`${reason}: all sessions stopped`)
+      }
+    } catch (e) {
+      log(`${reason}: staged shutdown failed: ${e}`)
+      shutdownExitCode = 1
+    } finally {
+      cleanup()
+      process.exit(shutdownExitCode)
+    }
+  })()
+  return shutdownPromise
+}
+
 process.on('exit', cleanup)
-process.on('SIGTERM', () => { log('SIGTERM'); cleanup(); process.exit(0) })
-process.on('SIGINT',  () => { log('SIGINT');  cleanup(); process.exit(0) })
+process.on('SIGTERM', () => { void requestShutdown('SIGTERM', 0) })
+process.on('SIGINT',  () => { void requestShutdown('SIGINT', 0) })
 // Windows 没有 POSIX SIGTERM;NSSM/WinSW 这类 Windows service wrapper
 // 在停服务时通常发 SIGBREAK (Ctrl-Break 的内核映射),让进程优雅退出。
 // 仅在 Win32 上注册,避免 Linux/Mac 跑 listener-count 检查时多出一个
 // 无关的信号 handler。
 if (process.platform === 'win32') {
-  process.on('SIGBREAK', () => { log('SIGBREAK'); cleanup(); process.exit(0) })
+  process.on('SIGBREAK', () => { void requestShutdown('SIGBREAK', 0) })
 }
-process.on('unhandledRejection', e => log(`unhandledRejection: ${e}`))
-process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
+process.on('unhandledRejection', e => {
+  log(`unhandledRejection: ${e instanceof Error ? e.stack ?? e.message : e}`)
+  void requestShutdown('unhandledRejection', 1)
+})
+process.on('uncaughtException', e => {
+  log(`uncaughtException: ${e.stack ?? e.message}`)
+  void requestShutdown('uncaughtException', 1)
+})
 
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 let pendingReviveSessionNames = new Set<string>()
+const chatActor = new PerKeyActor()
+const cardActionDeduper = new ActionDeduper(30_000)
+const inflightCardActions = new Set<Promise<unknown>>()
+const messageAdmission = createPerChatAdmission<any>({
+  actor: chatActor,
+  key: data => String(data?.message?.chat_id ?? ''),
+  execute: (data, acceptedAt) => handleMessage(data, acceptedAt),
+})
+
+function trackCardActionWork<T>(work: Promise<T>): Promise<T> {
+  return trackWork(inflightCardActions, work)
+}
+
+/** Preserve Feishu delivery order per chat without delaying the WS ACK. Work
+ * in different groups remains concurrent; messages and lifecycle commands in
+ * one group cannot overtake an earlier attachment download/card open. */
+function enqueueMessage(data: any, source = 'ws'): boolean {
+  if (shutdownRequested) {
+    log(`${source}: reject inbound message: daemon shutdown in progress`)
+    return false
+  }
+  const chatId = String(data?.message?.chat_id ?? '')
+  const admitted = messageAdmission.accept(data)
+  if (!admitted.accepted) {
+    log(`${source}: reject inbound message${chatId ? '' : ' without chat_id'}: actor ${admitted.reason}`)
+    return false
+  }
+  void admitted.completion.catch(e => { log(`${source}: handleMessage rejected chat=${chatId.slice(0, 8)}…: ${e}`) })
+  return true
+}
 
 function currentAliveSessionNames(): string[] {
   const alive = new Set<string>()
-  for (const s of sessions.values()) if (s.isRunning()) alive.add(s.sessionName)
+  for (const s of sessions.values()) if (s.shouldRevive()) alive.add(s.sessionName)
   for (const name of pendingReviveSessionNames) alive.add(name)
   return [...alive]
 }
@@ -154,7 +275,10 @@ async function disbandTempSession(chatName: string): Promise<{ ok: boolean; erro
     const cid = feishu.chatIdForSession(chatName)
     if (cid) {
       const s = sessions.get(cid)
-      if (s?.isRunning()) await s.stop('bye 解散', { announce: false })
+      // stop() also retries a previously blocked/unconfirmed process stop;
+      // isRunning() intentionally excludes that user stop intent from revive
+      // markers, so it must not be used as the cleanup guard here.
+      if (s) await s.stop('bye 解散', { announce: false })
       s?.dispose()
       sessions.delete(cid)
     }
@@ -290,7 +414,7 @@ function extractPostMarkdown(
 const STALE_THRESHOLD_MS = 30_000
 const seenMessageIds = new Set<string>()
 
-async function handleMessage(data: any): Promise<void> {
+async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> {
   const message = data?.message
   if (!message) return
 
@@ -315,8 +439,8 @@ async function handleMessage(data: any): Promise<void> {
 
   // Drop replays of stale messages (Lark redelivers unacked events on reconnect).
   const createTime = Number(message.create_time ?? 0)
-  if (createTime > 0 && Date.now() - createTime > STALE_THRESHOLD_MS) {
-    log(`drop stale message ${msgId} age=${Math.round((Date.now() - createTime) / 1000)}s`)
+  if (isStaleAtReceipt(createTime, receivedAt, STALE_THRESHOLD_MS)) {
+    log(`drop stale message ${msgId} ageAtReceipt=${Math.round((receivedAt - createTime) / 1000)}s`)
     if (msgId) void feishu.addReaction(msgId, 'CrossMark')
     return
   }
@@ -441,6 +565,168 @@ async function handleMessage(data: any): Promise<void> {
 }
 
 // ── Card action handler ────────────────────────────────────────────────
+function cardActionLabel(kind: string): string {
+  const labels: Record<string, string> = {
+    permission: '权限决定', menu: '菜单选择', provider_select: '账号选择',
+    model_select: '模型选择', model_custom_prompt: '模型补录',
+    model_panel_cancel: '取消模型补录', model_effort_select: '模型 effort 选择',
+    ask: '问题回答', worktree_disband: 'worktree 解散', temp_fork_select: '会话分叉',
+    temp_back_select: '会话回滚', temp_resume_select: '会话恢复',
+    tasklist_enable: '启用任务清单', tasklist_delete_prompt: '删除任务清单',
+    tasklist_delete_confirm: '确认删除任务清单', token_source_enable: '启用账号',
+    agy_forward_codex: 'agy 结果转交', notify_callback: '通知反馈',
+  }
+  return labels[kind] ?? kind
+}
+
+function rawCardFromActionResult(result: any): object | null {
+  return result?.card?.type === 'raw' && result.card.data && typeof result.card.data === 'object'
+    ? result.card.data
+    : null
+}
+
+/** Internal-only metadata consumed by CardActionAdmission. The wrapper is
+ * never returned as the callback ACK, and presentation ignores this field. */
+function withBusinessOutcome(response: any, ok: boolean): any {
+  return { ...response, __businessOk: ok }
+}
+
+function withNotifyContext(reg: NotifyRegistration, response: any): any {
+  return {
+    ...response,
+    __cardActionMessageId: reg.messageId,
+    __cardActionChatId: reg.chatId,
+  }
+}
+
+function modelActionResponse(result: { ok: boolean; message: string; card?: object }): any {
+  return withBusinessOutcome(
+    result.card
+      ? actionCardResponse(result.card)
+      : { toast: { type: result.ok ? 'success' : 'error', content: result.message } },
+    result.ok,
+  )
+}
+
+async function sendActionReceipt(chatId: string, text: string): Promise<void> {
+  if (!chatId) {
+    log(`card-action: cannot send receipt without chat_id: ${text}`)
+    return
+  }
+  const sent = await feishu.sendTextRaw(chatId, text)
+  if (!sent) log(`card-action: visible receipt MISS chat=${chatId.slice(0, 8)}… text=${text.slice(0, 120)}`)
+}
+
+async function publishCardActionResult(data: any, result: any): Promise<void> {
+  const kind = String(data?.action?.value?.kind ?? 'unknown')
+  const label = cardActionLabel(kind)
+  const chatId = String(
+    result?.__cardActionChatId
+    ?? data?.__cardActionChatId
+    ?? data?.context?.open_chat_id
+    ?? '',
+  )
+  // Notify registrations already persist the authoritative message id and may
+  // be clicked through callback payloads that omit open_message_id. Ordinary
+  // session actions are admission-validated and use the context id.
+  const messageId = String(result?.__cardActionMessageId ?? data?.context?.open_message_id ?? '')
+  const card = rawCardFromActionResult(result)
+  if (card && messageId) {
+    try {
+      await feishu.updateCard(messageId, card)
+      return
+    } catch (e) {
+      log(`card-action: ${kind} original-card update failed: ${e instanceof Error ? e.message : e}`)
+      await sendActionReceipt(chatId, `⚠️ ${label}已处理，但原卡更新失败。请重新打开操作面板。`)
+      return
+    }
+  }
+  if (card) {
+    await sendActionReceipt(chatId, `⚠️ ${label}已处理，但回调缺少原卡 message_id，无法更新。`)
+    return
+  }
+  // Push-mode notify callbacks own their two-phase visible card update. Other
+  // notify outcomes (missing/expired registration, unknown button, persisted
+  // unknown state) still need a post-ACK receipt through the generic path.
+  if (kind === 'notify_callback' && result?.__cardActionCompletion) return
+  const toast = result?.toast
+  const content = typeof toast?.content === 'string' && toast.content.trim()
+    ? toast.content.trim()
+    : `${label}已完成`
+  const permissionDenied = kind === 'permission' && String(data?.action?.value?.decision ?? '') === 'deny'
+  const failed = result?.__businessOk === false || (toast?.type === 'error' && !permissionDenied)
+  const selfVisibleSuccess = new Set([
+    'permission', 'ask', 'token_source_enable', 'agy_forward_codex',
+  ])
+  if (!failed && selfVisibleSuccess.has(kind)) return
+  await sendActionReceipt(chatId, `${failed ? '❌' : '✅'} ${label}: ${content}`)
+}
+
+async function publishCardActionFailure(data: any, error: unknown): Promise<void> {
+  const kind = String(data?.action?.value?.kind ?? 'unknown')
+  const detail = error instanceof Error ? error.message : String(error)
+  await sendActionReceipt(
+    String(data?.__cardActionChatId ?? data?.context?.open_chat_id ?? ''),
+    `❌ ${cardActionLabel(kind)}失败: ${detail}`,
+  )
+}
+
+const cardActionAdmission = createCardActionAdmission<any, object>({
+  actor: chatActor,
+  deduper: cardActionDeduper,
+  scope: data => String(data?.context?.open_chat_id ?? '') || '__notify_global__',
+  execute: handleCardAction,
+  present: publishCardActionResult,
+  presentExecutionFailure: async (data, error) => {
+    const kind = String(data?.action?.value?.kind ?? 'unknown')
+    log(`handleCardAction ${kind}: ${error instanceof Error ? error.stack ?? error.message : error}`)
+    await publishCardActionFailure(data, error)
+  },
+  presentPresentationFailure: async (data, error) => {
+    const kind = String(data?.action?.value?.kind ?? 'unknown')
+    log(`card-action presentation ${kind}: ${error instanceof Error ? error.message : error}`)
+    await sendActionReceipt(
+      String(data?.context?.open_chat_id ?? ''),
+      `⚠️ ${cardActionLabel(kind)}已执行，但结果呈现失败。`,
+    )
+  },
+  businessSucceeded: (data, result) => {
+    if (typeof result?.__businessOk === 'boolean') return result.__businessOk
+    const permissionDenied = data?.action?.value?.kind === 'permission'
+      && data?.action?.value?.decision === 'deny'
+    return permissionDenied || result?.toast?.type !== 'error'
+  },
+  completion: (_data, result) => {
+    const completion = result?.__cardActionCompletion
+    return completion && typeof completion.then === 'function' ? completion : null
+  },
+  track: work => { trackCardActionWork(work) },
+  onBackgroundError: error => {
+    log(`card-action background: ${error instanceof Error ? error.stack ?? error.message : error}`)
+  },
+  responses: {
+    accepted: data => ({
+      toast: {
+        type: 'info',
+        content: `⏳ ${cardActionLabel(String(data?.action?.value?.kind ?? 'unknown'))}已接收，后台处理中…`,
+      },
+    }),
+    inflight: () => ({ toast: { type: 'info', content: '相同操作正在处理…' } }),
+    completed: () => ({
+      toast: {
+        type: 'info',
+        content: '该操作近期已执行或尝试；为防重复暂不再次执行，请查看原卡或群消息',
+      },
+    }),
+    closed: () => ({ toast: { type: 'error', content: '服务正在重启，请稍后重试' } }),
+    invalid: (_data, message) => ({ toast: { type: 'error', content: message } }),
+  },
+})
+
+function acceptCardAction(data: any): object {
+  return cardActionAdmission.accept(data)
+}
+
 async function handleCardAction(data: any): Promise<any> {
   const action = data?.action
   const value = action?.value
@@ -457,26 +743,58 @@ async function handleCardAction(data: any): Promise<any> {
   }
 
   const session = sessions.get(chatId)
-  if (!session) return { toast: { type: 'error', content: '会话不存在，请先发消息启动' } }
+  if (!session) {
+    return withBusinessOutcome(
+      { toast: { type: 'error', content: '会话不存在，请先发消息启动' } },
+      false,
+    )
+  }
 
   switch (value.kind) {
-    case 'permission':
-      await session.onPermissionDecision(value.request_id, value.decision, userId)
-      return { toast: { type: value.decision === 'deny' ? 'error' : 'success', content: '已处理' } }
-    case 'menu':
-      await session.onUserMessage(`(menu choice ${value.choice + 1})`)
-      return { toast: { type: 'success', content: 'OK' } }
+    case 'permission': {
+      const decision = String(value.decision ?? '')
+      if (!['allow', 'allow_always', 'deny'].includes(decision)) {
+        return { toast: { type: 'error', content: '无效的权限决定' } }
+      }
+      const result = await session.onPermissionDecision(
+        value.request_id,
+        decision as 'allow' | 'allow_always' | 'deny',
+        userId,
+      )
+      return withBusinessOutcome(
+        {
+          toast: {
+            type: result.ok ? (decision === 'deny' ? 'error' : 'success') : 'error',
+            content: result.message,
+          },
+        },
+        result.ok,
+      )
+    }
+    case 'menu': {
+      const choice = Number(value.choice ?? -1)
+      try {
+        if (!Number.isInteger(choice) || choice < 0) throw new Error('无效的菜单选项')
+        await session.onUserMessage(`(menu choice ${choice + 1})`)
+        return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
+          title: '📋 菜单选择',
+          message: `已选择第 ${choice + 1} 项`,
+          ok: true,
+        })), true)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
+          title: '📋 菜单选择', message, ok: false,
+        })), false)
+      }
+    }
     case 'provider_select': {
       const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''))
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'model_select': {
       const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId, value)
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'model_custom_prompt': {
       // context.open_message_id = 补录卡所在消息;等待态记住它,回复后原位更新。
@@ -485,13 +803,11 @@ async function handleCardAction(data: any): Promise<any> {
         String(value.panel_id ?? ''),
         String(data?.context?.open_message_id ?? ''),
       )
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'model_panel_cancel': {
-      const result = await session.onModelPanelCancel()
-      return actionCardResponse(result.card)
+      const result = await session.onModelPanelCancel(String(value.panel_id ?? ''))
+      return modelActionResponse(result)
     }
     case 'model_effort_select': {
       const result = await session.onModelEffortSelect(
@@ -501,9 +817,7 @@ async function handleCardAction(data: any): Promise<any> {
         userId,
         String(value.provider ?? ''),
       )
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'ask': {
       // Custom-text branch: form submit packages the input under
@@ -513,39 +827,51 @@ async function handleCardAction(data: any): Promise<any> {
       if (value.custom) {
         const fv = action?.form_value ?? action?.input ?? {}
         const customText: string = fv?.custom_answer ?? action?.input_value ?? ''
-        await session.onAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
-        return { toast: { type: customText.trim() ? 'success' : 'error', content: customText.trim() ? '已回答' : '请输入答案' } }
+        const answered = await session.onAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
+        return withBusinessOutcome(
+          { toast: { type: answered ? 'success' : 'error', content: answered ? '已回答' : customText.trim() ? '问题已失效或答案未被接受' : '请输入答案' } },
+          answered,
+        )
       }
-      await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
-      return { toast: { type: 'success', content: '已回答' } }
+      const answered = await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
+      return withBusinessOutcome(
+        { toast: { type: answered ? 'success' : 'error', content: answered ? '已回答' : '问题已失效或选项无效' } },
+        answered,
+      )
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'temp_fork_select': {
-      await session.onForkSelect(Number(value.anchorIdx ?? -1), userId)
-      return { toast: { type: 'success', content: '分叉中…' } }
+      const result = await session.onForkSelect(Number(value.anchorIdx ?? -1), userId)
+      return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
+        title: '🔱 会话分叉', message: result.message, ok: result.ok,
+      })), result.ok)
     }
     case 'temp_back_select': {
-      await session.onBackSelect(Number(value.anchorIdx ?? -1))
-      return { toast: { type: 'success', content: '回滚中…' } }
+      const result = await session.onBackSelect(Number(value.anchorIdx ?? -1))
+      return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
+        title: '⏪ 会话回滚', message: result.message, ok: result.ok,
+      })), result.ok)
     }
     case 'temp_resume_select': {
-      await session.onResumeSelect(String(value.sessionId ?? ''))
-      return { toast: { type: 'success', content: '恢复中…' } }
+      const result = await session.onResumeSelect(String(value.sessionId ?? ''))
+      return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
+        title: '🔁 会话恢复', message: result.message, ok: result.ok,
+      })), result.ok)
     }
     case 'tasklist_enable': {
       const result = await session.onTasklistEnable()
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'tasklist_delete_prompt': {
       const result = session.onTasklistDeletePrompt(String(value.guid ?? ''))
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'tasklist_delete_confirm': {
       const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'token_source_enable': {
       const { onTokenSourceEnable } = await import('./src/token-source-setup')
@@ -554,7 +880,10 @@ async function handleCardAction(data: any): Promise<any> {
     }
     case 'agy_forward_codex': {
       const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
-      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return withBusinessOutcome(
+        { toast: { type: result.ok ? 'success' : 'error', content: result.message } },
+        result.ok,
+      )
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
@@ -594,29 +923,48 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
     log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… not found (expired or pre-restart)`)
     return { toast: { type: 'error', content: '通知已过期或已移除' } }
   }
+  if (reg.unknownAt) {
+    return withNotifyContext(reg, withBusinessOutcome({
+      toast: {
+        type: 'error',
+        content: `外部回调可能已成功，但本地确认状态未知，已禁止自动重试${reg.unknownReason ? `: ${reg.unknownReason}` : ''}`,
+      },
+    }, true))
+  }
   // Idempotency: a finalized card refuses re-fire ("已处理过"); an
   // in-flight Phase-2 refuses concurrent double-click ("处理中"). Both
   // prevent two members / a double-click from firing the push twice.
   if (reg.resolvedAt) {
-    return { toast: { type: 'info', content: '已处理过' } }
+    return withNotifyContext(reg, { toast: { type: 'info', content: '已处理过' } })
   }
   if (isDispatching(notifyId)) {
-    return { toast: { type: 'info', content: '处理中…' } }
+    return withNotifyContext(reg, { toast: { type: 'info', content: '处理中…' } })
   }
   const button = reg.buttons.find((b) => b.id === buttonId)
   if (!button) {
     log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… unknown button_id="${buttonId}"`)
-    return { toast: { type: 'error', content: '未知按钮' } }
+    return withNotifyContext(reg, withBusinessOutcome(
+      { toast: { type: 'error', content: '未知按钮' } },
+      false,
+    ))
   }
 
   // Pull / display-only mode: no push to wait for — freeze on the
   // verdict now (single phase).
   if (!reg.callbackUrl) {
-    markNotifyCallbackResolved(reg.notifyId, button.id, userId)
+    try {
+      markNotifyCallbackResolved(reg.notifyId, button.id, userId)
+    } catch (e) {
+      return withNotifyContext(reg, withBusinessOutcome({
+        toast: { type: 'error', content: `保存反馈结果失败: ${e instanceof Error ? e.message : e}` },
+      }, false))
+    }
     log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… resolved button="${buttonId}" by=${userId.slice(0, 8)}… (no callback, pull/display)`)
-    return actionCardResponse(
-      buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
-    )
+    return withNotifyContext(reg, {
+      ...actionCardResponse(
+        buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
+      ),
+    })
   }
 
   // Push mode: ACK with a toast immediately, then async drive BOTH card
@@ -624,8 +972,17 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   // push → Phase 2 final). The dispatching guard is set synchronously
   // here so a fast second click is blocked before the async work starts.
   setDispatching(reg.notifyId)
-  void pushNotifyCallbackPhase2(reg, button, userId)
-  return { toast: { type: 'info', content: `⏳ 已选择:${button.text} · 推送中…` } }
+  const phase2 = trackCardActionWork(pushNotifyCallbackPhase2(reg, button, userId))
+  void phase2.catch(e => {
+    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 rejected: ${e instanceof Error ? e.message : e}`)
+  })
+  const completion = phase2.then<'complete' | 'retry'>(outcome =>
+    outcome === 'retry' ? 'retry' : 'complete'
+  ).catch(() => 'retry' as const)
+  return withNotifyContext(reg, {
+    toast: { type: 'info', content: `⏳ 已选择:${button.text} · 推送中…` },
+    __cardActionCompletion: completion,
+  })
 }
 
 // Drive the two card states via message.patch, fire-and-forget from
@@ -638,33 +995,77 @@ async function pushNotifyCallbackPhase2(
   reg: NotifyRegistration,
   button: NotifyButton,
   userId: string,
-): Promise<void> {
-  // Phase 1: processing card via message.patch (after the toast ACK).
-  const processingCard = buildNotifyCardFromReg(reg, {
-    status: 'processing', buttonId: button.id, text: button.text, operatorOpenId: userId,
-  })
+): Promise<'complete' | 'retry' | 'unknown'> {
   try {
-    await feishu.updateCard(reg.messageId, processingCard)
-  } catch (e) {
-    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-1 (processing) updateCard failed: ${e instanceof Error ? e.message : e}`)
-  }
+    // Phase 1: processing card via message.patch (after the toast ACK).
+    const processingCard = buildNotifyCardFromReg(reg, {
+      status: 'processing', buttonId: button.id, text: button.text, operatorOpenId: userId,
+    })
+    try {
+      await feishu.updateCard(reg.messageId, processingCard)
+    } catch (e) {
+      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-1 (processing) updateCard failed: ${e instanceof Error ? e.message : e}`)
+    }
 
-  // Push + Phase 2 final card.
-  const result = await dispatchCallback(reg, button, userId)
-  const resolution = result.ok
-    ? { status: 'delivered' as const, buttonId: button.id, text: button.text, operatorOpenId: userId, reply: result.reply }
-    : { status: 'failed' as const, buttonId: button.id, text: button.text, operatorOpenId: userId, detail: result.detail }
-  const finalCard = buildNotifyCardFromReg(reg, resolution)
-  try {
-    await feishu.updateCard(reg.messageId, finalCard)
-  } catch (e) {
-    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) updateCard failed: ${e instanceof Error ? e.message : e}`)
+    // Push + Phase 2 final card.
+    const result = await dispatchCallback(reg, button, userId)
+    let outcome: 'complete' | 'retry' | 'unknown' = result.ok ? 'complete' : 'retry'
+    let resolution: Parameters<typeof buildNotifyCardFromReg>[1]
+    if (result.ok) {
+      // The external side effect has already happened. A local persistence
+      // failure is therefore UNKNOWN, never retryable. recordCallbackSuccess
+      // attempts to persist that unknown tombstone and retains an in-memory
+      // guard even when the store itself remains unavailable.
+      const recorded = recordCallbackSuccess(reg.notifyId, button.id, userId)
+      if (recorded.state === 'complete') {
+        resolution = {
+          status: 'delivered', buttonId: button.id, text: button.text,
+          operatorOpenId: userId, reply: result.reply,
+        }
+      } else {
+        outcome = 'unknown'
+        resolution = {
+          status: 'unknown', buttonId: button.id, text: button.text,
+          operatorOpenId: userId, detail: recorded.detail,
+        }
+        log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… callback succeeded but tombstone is UNKNOWN: ${recorded.detail}`)
+        try {
+          await sendActionReceipt(
+            reg.chatId,
+            `⚠️ 通知反馈的外部回调已成功，但本地确认状态未知；为避免重复副作用，已禁止自动重试。${recorded.detail}`,
+          )
+        } catch (e) {
+          // Presentation failure after an external success must never turn the
+          // business outcome back into retry.
+          log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… UNKNOWN warning receipt failed: ${e instanceof Error ? e.message : e}`)
+        }
+      }
+    } else {
+      resolution = {
+        status: 'failed', buttonId: button.id, text: button.text,
+        operatorOpenId: userId, detail: result.detail,
+      }
+    }
+
+    try {
+      const finalCard = buildNotifyCardFromReg(reg, resolution)
+      await feishu.updateCard(reg.messageId, finalCard)
+    } catch (e) {
+      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) presentation failed: ${e instanceof Error ? e.message : e}`)
+      try {
+        await sendActionReceipt(
+          reg.chatId,
+          `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
+        )
+      } catch (receiptError) {
+        log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… final fallback receipt failed: ${receiptError instanceof Error ? receiptError.message : receiptError}`)
+      }
+    }
+    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${outcome === 'complete' ? 'delivered' : outcome === 'unknown' ? 'unknown/non-retryable' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
+    return outcome
+  } finally {
+    clearDispatching(reg.notifyId)
   }
-  if (result.ok) {
-    markNotifyCallbackResolved(reg.notifyId, button.id, userId)
-  }
-  clearDispatching(reg.notifyId)
-  log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${result.ok ? 'delivered' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
 }
 
 // ── WebSocket boot ─────────────────────────────────────────────────────
@@ -700,6 +1101,7 @@ function startDebugSocket(): void {
       unix: DEBUG_SOCK_FILE,
       fetch: async (req: Request) => {
         if (req.method !== 'POST') return new Response('use POST', { status: 405 })
+        if (shutdownRequested) return new Response('daemon shutdown in progress', { status: 503 })
         let body: any = {}
         try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
         if (!existsSync(DEBUG_CTX_FILE)) {
@@ -738,7 +1140,9 @@ function startDebugSocket(): void {
         }
         log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} msg_id=${realMsgId}`)
         // Don't await — match real WS dispatcher behavior (fire-and-forget per event).
-        handleMessage(payload).catch(e => log(`debug: handleMessage rejected: ${e}`))
+        if (!enqueueMessage(payload, 'debug')) {
+          return new Response('daemon shutdown in progress', { status: 503 })
+        }
         return new Response(JSON.stringify({ ok: true, msg_id: realMsgId }), {
           headers: { 'content-type': 'application/json' },
         })
@@ -876,13 +1280,15 @@ async function boot(): Promise<void> {
       // 这里立刻 return 让 dispatcher 回 ack,实际处理后台跑;handleMessage
       // 入口已用 seenMessageIds 做了同 message_id 去重,fire-and-forget
       // 不会引入重复处理。
-      handleMessage(d).catch(e => log(`handleMessage: ${e}`))
+      if (!enqueueMessage(d)) throw new Error('daemon shutdown in progress')
     },
   })
   dispatcher.register({
     'card.action.trigger': async (d: any) => {
       markEvent()
-      try { return await handleCardAction(d) } catch (e) { log(`handleCardAction: ${e}`) }
+      // Synchronous acceptance only: reserve the per-chat actor and dedupe
+      // slots before returning, then let the queued handler start next task.
+      return acceptCardAction(d)
     },
   })
 
@@ -935,7 +1341,10 @@ async function boot(): Promise<void> {
     const old = ws
     try { old?.close({ force: true }) } catch (e) { log(`[ws] rebuild: old close failed: ${e}`) }
     ws = makeWs()
-    void ws.start({ eventDispatcher: dispatcher })
+    void ws.start({ eventDispatcher: dispatcher }).catch(e => {
+      log(`[ws] rebuild start failed: ${e}`)
+      scheduleWsRebuild(`fresh client start failed: ${e}`, SETTLE_MS, verifyAfter)
+    })
     rebuilding = false
     if (verifyAfter) armVerify()
   }
@@ -954,7 +1363,7 @@ async function boot(): Promise<void> {
       if (lastEventAt >= armedAt) { consecRebuilds = 0; return }  // events resumed → healthy
       if (consecRebuilds >= MAX_CONSEC_REBUILDS) {
         log(`[ws] STILL deaf after ${MAX_CONSEC_REBUILDS} fresh rebuilds — auto-heal exhausted, ` +
-            `leaving last client up (no process exit). Escape hatch: systemctl --user restart feishu-daemon`)
+            `leaving last client up (no process exit). Restart the configured service or run lodestar-stop && lodestar-daemon`)
         consecRebuilds = 0
         return
       }
@@ -977,8 +1386,11 @@ async function boot(): Promise<void> {
   }
 
   ws = makeWs()
-  void ws.start({ eventDispatcher: dispatcher })
-  log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
+  void ws.start({ eventDispatcher: dispatcher }).catch(e => {
+    log(`[ws] initial start failed: ${e}`)
+    scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)
+  })
+  log(`lodestar-daemon: WS start requested, watching ${feishu.chatNameCache.size} groups`)
 
   // Liveness watchdog for the OTHER failure mode the deaf-heal can't see: a
   // wedged handshake / zombie socket that leaves the client stuck OFF
@@ -1026,4 +1438,7 @@ async function boot(): Promise<void> {
   await reviveAliveSessions()
 }
 
-boot().catch(e => { log(`boot fatal: ${e}`); process.exit(1) })
+boot().catch(e => {
+  log(`boot fatal: ${e}`)
+  void requestShutdown('boot fatal', 1)
+})

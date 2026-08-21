@@ -340,8 +340,9 @@ export function addElement(
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
   onFailure?: (code?: number) => void,
 ): Promise<void> {
+  if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (disposedCards.has(cardId) || s.closing || s.writeDead) return Promise.resolve()
+  if (s.closing || s.writeDead) return Promise.resolve()
   const elementId = (element as { element_id?: string }).element_id
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
@@ -383,8 +384,9 @@ export function replaceElement(
   onFailure?: (code?: number) => void,
   notifyCardFailure = true,
 ): Promise<void> {
+  if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (disposedCards.has(cardId) || s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
@@ -447,8 +449,9 @@ export function deleteElement(
   elementId: string,
   onFailure?: (code?: number) => void,
 ): Promise<void> {
+  if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (disposedCards.has(cardId) || s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
@@ -501,8 +504,11 @@ export function patchSummaryThrottled(cardId: string, content: string): void {
     st.timer = null
     if (st.latest === st.lastSent) return
     const toSend = st.latest
-    st.lastSent = toSend
-    void patchSettings(cardId, { config: { summary: { content: toSend } } })
+    void patchSettingsChecked(cardId, { config: { summary: { content: toSend } } })
+      .then(landed => {
+        const current = summaryStates.get(cardId)
+        if (landed && current === st) current.lastSent = toSend
+      })
   }, SUMMARY_FLUSH_MS)
 }
 
@@ -528,20 +534,35 @@ export function cancelSummary(cardId: string): void {
  * failed". Keeping all writes on execution-time allocation makes the
  * seq order match the queue order. */
 export function patchSettings(cardId: string, settings: object): Promise<void> {
-  if (disposedCards.has(cardId)) return Promise.resolve()
+  return patchSettingsChecked(cardId, settings).then(() => {})
+}
+
+/** Checked settings mutation for terminal/static-card transactions. Unlike
+ * the legacy fire-and-forget wrapper, callers can distinguish a landed PATCH
+ * from a timeout/rejection and must not dispose bookkeeping on false. */
+export async function patchSettingsChecked(cardId: string, settings: object): Promise<boolean> {
+  if (disposedCards.has(cardId)) return false
   const s = state(cardId)
-  if (s.closing || s.writeDead) return Promise.resolve()
-  s.queue = s.queue.then(async () => {
-    if (disposedCards.has(cardId) || s.writeDead) return
-    try {
+  if (s.closing || s.writeDead) return false
+  let landed = false
+  let failed = false
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    'patchSettings',
+    async () => {
+      if (disposedCards.has(cardId) || s.writeDead) return
       const seq = nextSeq(cardId)
       await call('PATCH', `/cards/${cardId}/settings`, {
         settings: JSON.stringify(settings),
         sequence: seq,
       })
-    } catch (e) { log(`cardkit patchSettings ${cardId}: ${e}`) }
-  })
-  return s.queue
+      landed = true
+    },
+    () => { failed = true },
+    true,
+  ))
+  await s.queue
+  return landed && !failed && !disposedCards.has(cardId) && !s.writeDead
 }
 
 /** Drop in-memory bookkeeping for a finished card. */

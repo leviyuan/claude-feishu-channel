@@ -13,9 +13,10 @@
  * 任何 anthropic 兼容端点通用,无 provider 特判,无模型名白名单。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { CONTEXT_WINDOW_CACHE_FILE as CACHE_FILE_CONST } from './paths'
 import { log } from './log'
+import { writeJsonStateAtomic } from './state-store'
 
 /** 惰性取缓存路径:paths 常量是 import 时按当时 LODESTAR_DATA_DIR 求值的,
  *  测试套件里晚设的 env 要能生效(单跑/全量一致)。生产路径不变。 */
@@ -44,12 +45,12 @@ function loadCache(): WindowCache {
     log(`context-window-observe: cache read MISS (${e?.message ?? e}), starting fresh`)
     cache = {}
   }
-  return cache
+  return cache ?? {}
 }
 
 function saveCache(): void {
   try {
-    writeFileSync(cacheFile(), JSON.stringify(loadCache(), null, 2) + '\n')
+    writeJsonStateAtomic(cacheFile(), loadCache())
   } catch (e: any) {
     log(`context-window-observe: cache write MISS (${e?.message ?? e})`)
   }

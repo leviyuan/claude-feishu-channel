@@ -1,15 +1,17 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { spawn } from 'node:child_process'
+import { spawn as crossSpawn } from 'cross-spawn'
 import { delimiter, join, posix, win32 } from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
   query,
   type EffortLevel,
+  type McpServerConfig,
   type ModelInfo,
   type Query,
   type SDKMessage,
   type SDKUserMessage,
+  type SettingSource,
   type SpawnOptions as ClaudeSdkSpawnOptions,
   type SpawnedProcess,
   type PermissionResult,
@@ -55,6 +57,11 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
     if (this.closed) return
     this.closed = true
     while (this.waiters.length) this.waiters.shift()?.({ value: undefined, done: true })
+  }
+
+  abort(): void {
+    this.items = []
+    this.close()
   }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<T> {
@@ -133,10 +140,10 @@ function windowsShellShim(path: string): boolean {
 }
 
 function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
-  const child = spawn(options.command, options.args, {
+  const child = crossSpawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env as NodeJS.ProcessEnv,
-    shell: true,
+    shell: false,
     signal: options.signal,
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
@@ -314,15 +321,17 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
   return null
 }
 
-/** SDK contextWindow 历史 max,按 claude 路由 key 在 daemon 进程内全局共享。
+/** SDK contextWindow 历史 max,按 token source + claude 路由 key 在 daemon 进程内全局共享。
  * context window 是模型路由属性(与 session 无关):任一 session 探测到的真实
  * 窗口(GLM-5.2[1m] → 1M)锁定后,同路由所有 session 立即用作分母,不再各自
  * 首轮回落默认 200K。daemon 重启后重新探测(不持久化,重启不常发生)。 */
 const contextWindowMaxByRoute = new Map<string, number>()
 
-function claudeRouteKey(model: string | null | undefined): string {
+function claudeRouteKey(model: string | null | undefined, tokenSourceId?: string | null): string {
   // opts.model 形如 'claude:glm' / 'claude:default';null 归一到 default。
-  return model && model.trim() ? model : 'claude:default'
+  const source = tokenSourceId?.trim() || 'no-source'
+  const route = model && model.trim() ? model : 'claude:default'
+  return `${source}:${route}`
 }
 
 /** 仅供测试重置全局缓存,保证用例隔离。 */
@@ -504,7 +513,7 @@ export function toolsFromProfile(
  * the common case (most projects ship no .mcp.json, and loadProjectMcp
  * defaults to true so every spawn probes once); other failures are logged
  * so the project knows its MCP didn't load. */
-export function readProjectMcpServers(workDir: string): Record<string, unknown> | undefined {
+export function readProjectMcpServers(workDir: string): Record<string, McpServerConfig> | undefined {
   const mcpPath = join(workDir, '.mcp.json')
   let raw: string
   try {
@@ -521,7 +530,7 @@ export function readProjectMcpServers(workDir: string): Record<string, unknown> 
   try {
     const parsed = JSON.parse(raw)
     if (parsed && typeof parsed === 'object' && parsed.mcpServers && typeof parsed.mcpServers === 'object') {
-      return parsed.mcpServers as Record<string, unknown>
+      return parsed.mcpServers as Record<string, McpServerConfig>
     }
     log(`claude-agent-process: project .mcp.json has no mcpServers object at ${mcpPath}`)
     return undefined
@@ -560,17 +569,20 @@ function normalizeDialogQuestion(raw: unknown): Record<string, unknown> | null {
 
 function normalizeDialogOptions(raw: unknown): Array<Record<string, string>> {
   if (!Array.isArray(raw)) return []
-  return raw
-    .map(item => {
-      if (typeof item === 'string') return { label: item }
-      if (!item || typeof item !== 'object') return null
-      const obj = item as Record<string, unknown>
-      const label = firstString(obj.label, obj.value, obj.text, obj.title)
-      if (!label?.trim()) return null
-      const description = firstString(obj.description, obj.detail, obj.preview)
-      return description ? { label, description } : { label }
-    })
-    .filter((item): item is Record<string, string> => item !== null)
+  const options: Array<Record<string, string>> = []
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      options.push({ label: item })
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const obj = item as Record<string, unknown>
+    const label = firstString(obj.label, obj.value, obj.text, obj.title)
+    if (!label?.trim()) continue
+    const description = firstString(obj.description, obj.detail, obj.preview)
+    options.push(description ? { label, description } : { label })
+  }
+  return options
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -640,8 +652,11 @@ export class ClaudeAgentProcess extends EventEmitter {
   private opts: ClaudeSpawnOpts
   private input = new AsyncQueue<SDKUserMessage>()
   private query: Query | null = null
+  private readonly abortController = new AbortController()
   private alive = true
   private expectedExit = false
+  private readonly exitPromise: Promise<void>
+  private resolveExit!: () => void
   private started = false
   private pendingPermissions = new Map<string, PendingControl>()
   private pendingInjectedContext: string[] = []
@@ -668,6 +683,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   constructor(opts: ClaudeSpawnOpts) {
     super()
     this.on('error', () => {})
+    this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
     this.tokenSourceId = opts.tokenSourceId ?? null
     this.lastEffort = opts.effort
@@ -698,6 +714,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         prompt: this.input,
         options: {
           cwd: this.opts.workDir,
+          abortController: this.abortController,
           ...(model ? { model } : {}),
           effort: this.opts.effort as EffortLevel,
           resume: this.opts.resumeSessionId,
@@ -721,7 +738,7 @@ export class ClaudeAgentProcess extends EventEmitter {
                 PATH: buildClaudeSpawnPath(),
                 ...config.claude.env,
               },
-          settingSources,
+          settingSources: [...settingSources] as SettingSource[],
           tools: toolsOption,
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),
           ...(mcpServers ? { mcpServers } : {}),
@@ -742,10 +759,9 @@ export class ClaudeAgentProcess extends EventEmitter {
         },
       })
     } catch (e) {
-      this.alive = false
       const err = e instanceof Error ? e : new Error(String(e))
       this.emit('error', err)
-      this.emit('exit', { code: 1, signal: null, expected: this.expectedExit })
+      this.finishExit(1, null)
       return
     }
     void this.readLoop(this.query)
@@ -824,16 +840,37 @@ export class ClaudeAgentProcess extends EventEmitter {
   async kill(timeoutMs = 5000): Promise<void> {
     if (!this.alive) return
     this.expectedExit = true
-    this.input.close()
-    try { this.query?.close() }
-    catch {}
-    const start = Date.now()
-    while (this.alive && Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, 100))
+    this.denyPendingPermissions('claude process is stopping')
+    // Hard process stop: queued user turns belong to the discarded process
+    // generation and must never drain during the SDK abort window.
+    this.input.abort()
+    if (!this.started || !this.query) {
+      this.finishExit(null, null)
+      return
     }
-    if (this.alive) {
-      this.alive = false
-      this.emit('exit', { code: null, signal: 'SIGKILL', expected: this.expectedExit })
+
+    let closeError: Error | null = null
+    try {
+      this.query.close()
+    } catch (e) {
+      closeError = e instanceof Error ? e : new Error(String(e))
+    }
+    if (!this.abortController.signal.aborted) {
+      this.abortController.abort(closeError ?? new Error('claude process shutdown requested'))
+    }
+
+    if (!await this.waitForExit(timeoutMs)) {
+      const error = new Error(
+        `claude Agent SDK query did not exit within ${timeoutMs}ms after close/abort`,
+        closeError ? { cause: closeError } : undefined,
+      )
+      log(`claude-agent-process: kill failed: ${error.message}`)
+      throw error
+    }
+    if (closeError) {
+      const error = new Error(`claude Agent SDK close failed: ${closeError.message}`, { cause: closeError })
+      log(`claude-agent-process: kill failed: ${error.message}`)
+      throw error
     }
   }
 
@@ -990,6 +1027,11 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.finishExit(null, null)
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
+      if (this.expectedExit && this.abortController.signal.aborted) {
+        log(`claude-agent-process: read loop stopped after requested shutdown: ${err.message}`)
+        this.finishExit(null, null)
+        return
+      }
       log(`claude-agent-process: read loop failed: ${err.message}`)
       this.emit('error', err)
       this.finishExit(1, null)
@@ -1000,13 +1042,33 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.alive) return
     this.alive = false
     this.turnActive = false
-    for (const [id, pending] of this.pendingPermissions) {
-      pending.cleanup?.()
-      pending.resolve({ behavior: 'cancelled' })
-      this.pendingPermissions.delete(id)
-    }
+    this.denyPendingPermissions('claude process exited')
+    this.resolveExit()
     log(`claude-agent-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
     this.emit('exit', { code, signal, expected: this.expectedExit })
+  }
+
+  private denyPendingPermissions(message: string): void {
+    for (const [id, pending] of this.pendingPermissions) {
+      pending.cleanup?.()
+      pending.resolve({ behavior: 'deny', message })
+      this.pendingPermissions.delete(id)
+    }
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (!this.alive) return true
+    return new Promise(resolve => {
+      let settled = false
+      const finish = (exited: boolean) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        resolve(exited)
+      }
+      const timeout = setTimeout(() => finish(!this.alive), Math.max(0, timeoutMs))
+      void this.exitPromise.then(() => finish(true))
+    })
   }
 
   private handleMessage(message: SDKMessage): void {
@@ -1100,17 +1162,24 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'task_notification':
         // task_notification 是任务结算的权威信号:带终态 status + 最终 usage。
+        if (typeof raw.task_id !== 'string' || !raw.task_id) {
+          log('claude-agent-process: task_notification missing task_id')
+          return
+        }
+        if (raw.status !== 'completed' && raw.status !== 'failed' && raw.status !== 'stopped') {
+          log(`claude-agent-process: task_notification unknown status=${String(raw.status)} task=${raw.task_id}`)
+          return
+        }
         this.emit('bg_task_settled', {
-          task_id: String(raw.task_id ?? ''),
+          task_id: raw.task_id,
           tool_use_id: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
-          status: raw.status === 'completed' || raw.status === 'failed' || raw.status === 'stopped'
-            ? raw.status
-            : 'completed',
+          status: raw.status,
           summary: typeof raw.summary === 'string' ? raw.summary : undefined,
           usage: raw.usage,
         })
         return
       default:
+        log(`claude-agent-process: unhandled system subtype=${String(raw.subtype ?? 'unknown')}`)
         return
     }
   }
@@ -1233,7 +1302,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 窗口(GLM-5.2[1m] → 1M)全局锁定,所有 session 立即用作分母,不再各自首轮
     // 回落默认 200K。取 max 且单调不降,避免忽高忽低。SDK 从未上报 → null(--)。
     if (total.contextWindow != null) {
-      const routeKey = claudeRouteKey(this.opts.model)
+      const routeKey = claudeRouteKey(this.opts.model, this.tokenSourceId)
       const prev = contextWindowMaxByRoute.get(routeKey) ?? 0
       if (total.contextWindow > prev) {
         contextWindowMaxByRoute.set(routeKey, total.contextWindow)
@@ -1253,7 +1322,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         }
       }
     }
-    this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null
+    this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model, this.tokenSourceId)) ?? total.contextWindow ?? null
     // 上下文占用 = session 当前上下文 = 最后一次 API call 的输入侧 token。从 claude
     // session transcript 读最后一条 assistant 的 per-call usage(transcript 带 finalize
     // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
@@ -1285,7 +1354,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       if (isWindowError) {
         // lastModel 带 'claude:' 前缀(claudeModelKey 归一),观测缓存的 key 是裸模型名
         // —— 剥前缀+后缀再写,与观测臂/resolveSpawnModel 同一 key 空间。
-        const rawModel = this.lastModel ?? claudeRouteKey(this.opts.model)
+        const rawModel = this.lastModel ?? (this.opts.model?.trim() || 'claude:default')
         const model = rawModel.replace(/^claude:/, '')
         downgradeContextWindow(this.tokenSourceId, model)
         log(`claude-agent-process: context window exceeded on ${model} — downgraded to 200K (no [1m] next spawn)`)

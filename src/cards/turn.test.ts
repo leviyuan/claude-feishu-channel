@@ -696,7 +696,8 @@ describe('bash-like tool card rendering', () => {
     }
 
     expect(summarizeToolInput('Bash', input)).toBe('查看端口占用')
-    expect(toolCallElement(2, 'Bash', input, null, '✅').elements[0].content).toContain('netstat -ano')
+    const el = toolCallElement(2, 'Bash', input, null, '✅') as any
+    expect(el.elements[0].content).toContain('netstat -ano')
   })
 
   test('unwraps single-quoted PowerShell exe and command', () => {

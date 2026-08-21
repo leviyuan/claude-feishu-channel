@@ -9,6 +9,7 @@ import {
   listProjectWorktrees,
   readWorktreeInstructionsForManagedBranch,
   removeProjectWorktreeIfClean,
+  withProjectWorktreeLock,
   worktreeInstructionsPathForManagedBranch,
 } from './worktree'
 
@@ -20,6 +21,57 @@ afterEach(() => {
 })
 
 describe('project worktrees', () => {
+  test('serializes create and remove for one canonical project root', async () => {
+    const { repo } = initRepo()
+    let releaseCreate!: () => void
+    const createGate = new Promise<void>(resolve => { releaseCreate = resolve })
+    let created!: () => void
+    const createdReady = new Promise<void>(resolve => { created = resolve })
+    const creating = withProjectWorktreeLock(repo, async () => {
+      const result = ensureProjectWorktree(repo, 'feishu', 'serialized-work')
+      created()
+      await createGate
+      return result
+    })
+    await createdReady
+
+    let removeEntered = false
+    const removing = withProjectWorktreeLock(join(repo, '.'), async () => {
+      removeEntered = true
+      return removeProjectWorktreeIfClean(repo, 'feishu', 'serialized-work')
+    })
+    await Promise.resolve()
+    expect(removeEntered).toBe(false)
+
+    releaseCreate()
+    const [, removed] = await Promise.all([creating, removing])
+    expect(removeEntered).toBe(true)
+    expect(removed.removedWorktree).toBe(true)
+  })
+
+  test('keeps different projects concurrent and releases the lock after errors', async () => {
+    const first = initRepo().repo
+    const second = initRepo().repo
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const events: string[] = []
+    const holding = withProjectWorktreeLock(first, async () => {
+      events.push('first:start')
+      await firstGate
+      events.push('first:end')
+    })
+    await Promise.resolve()
+    await withProjectWorktreeLock(second, async () => { events.push('second') })
+    expect(events).toEqual(['first:start', 'second'])
+    releaseFirst()
+    await holding
+
+    await expect(withProjectWorktreeLock(first, async () => {
+      throw new Error('expected lock probe')
+    })).rejects.toThrow('expected lock probe')
+    await expect(withProjectWorktreeLock(first, async () => 'recovered')).resolves.toBe('recovered')
+  })
+
   test('creates sibling worktree and lists it from work branches', () => {
     const { root, repo } = initRepo()
     const result = ensureProjectWorktree(repo, 'feishu', 'feature-worktree')

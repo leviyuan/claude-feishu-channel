@@ -25,7 +25,7 @@ beforeEach(() => {
     return new Response(JSON.stringify({ code: 0, data: {} }), {
       headers: { 'Content-Type': 'application/json' },
     })
-  }) as typeof fetch
+  }) as unknown as typeof fetch
 })
 
 afterEach(() => {
@@ -57,7 +57,7 @@ describe('cardkit card operations', () => {
       }), {
         headers: { 'Content-Type': 'application/json' },
       })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     await expect(cardkit.convertMessageToCard('om_recent', { retryDelaysMs: [0, 0] }))
       .resolves.toBe('card_ready')
@@ -106,12 +106,42 @@ describe('cardkit write-dead card', () => {
 })
 
 describe('checked card writes', () => {
+  test('patchSettingsChecked reports whether the terminal PATCH landed', async () => {
+    const cardId = 'card_checked_settings'
+    cardkit.recordCardCreated(cardId, 1)
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300308, msg: 'settings rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(false)
+    await cardkit.dispose(cardId)
+  })
+
+  test('patchSettingsChecked reopens an expired stream and retries once', async () => {
+    const cardId = 'card_checked_settings_reopen'
+    cardkit.recordCardCreated(cardId, 1)
+    let attempt = 0
+    globalThis.fetch = (async () => {
+      attempt++
+      return new Response(JSON.stringify(attempt === 1
+        ? { code: 300309, msg: 'streaming mode is closed' }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    expect(attempt).toBe(3) // failed PATCH → reopen PATCH → terminal PATCH retry
+    await cardkit.dispose(cardId)
+  })
+
   test('replaceElementChecked reports a Feishu PUT rejection', async () => {
     const cardId = 'card_checked_replace'
     cardkit.recordCardCreated(cardId, 1)
     globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300308, msg: 'element rejected' }), {
       headers: { 'Content-Type': 'application/json' },
-    })) as typeof fetch
+    })) as unknown as typeof fetch
 
     expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
       tag: 'markdown', element_id: 'assistant_0', content: 'x',
@@ -124,7 +154,7 @@ describe('checked card writes', () => {
     cardkit.recordCardCreated(addCard, 1)
     globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300315, msg: 'add rejected' }), {
       headers: { 'Content-Type': 'application/json' },
-    })) as typeof fetch
+    })) as unknown as typeof fetch
     expect(await cardkit.addElementChecked(addCard, {
       tag: 'markdown', element_id: 'math_1', content: 'x',
     })).toBe(false)
@@ -134,7 +164,7 @@ describe('checked card writes', () => {
     cardkit.recordCardCreated(deleteCard, 2)
     globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300313, msg: 'delete rejected' }), {
       headers: { 'Content-Type': 'application/json' },
-    })) as typeof fetch
+    })) as unknown as typeof fetch
     expect(await cardkit.deleteElementChecked(deleteCard, 'math_1')).toBe(false)
     await cardkit.dispose(deleteCard)
   })
@@ -149,7 +179,7 @@ describe('checked card writes', () => {
       })],
     ] as const) {
       cardkit.recordCardCreated(cardId, 1)
-      globalThis.fetch = (async () => response.clone()) as typeof fetch
+      globalThis.fetch = (async () => response.clone()) as unknown as typeof fetch
       expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
         tag: 'markdown', element_id: 'assistant_0', content: 'x',
       }, { notifyCardFailure: false })).toBe(false)
@@ -168,7 +198,7 @@ describe('checked card writes', () => {
         : { code: 0, data: {} }), {
         headers: { 'Content-Type': 'application/json' },
       })
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
       tag: 'markdown', element_id: 'assistant_0', content: 'first',
@@ -214,7 +244,7 @@ describe('disposed card write guard (review #3)', () => {
         return new Response(JSON.stringify({ code: 0, data: {} }), {
           headers: { 'Content-Type': 'application/json' },
         })
-      }) as typeof fetch
+      }) as unknown as typeof fetch
     })
 
     const first = cardkit.addElementChecked(cardId, {

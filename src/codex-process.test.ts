@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 
 import {
   diffUsageTotals,
@@ -12,6 +13,133 @@ import {
   imageGenerationOutput,
   usageFromTokenUsagePayload,
 } from './codex-process'
+
+function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
+  const proc = Object.create(CodexProcess.prototype) as any
+  proc.alive = true
+  proc.expectedExit = false
+  proc.requestCounter = 0
+  proc.pending = new Map()
+  proc.serverRequests = new Map()
+  proc.proc = {
+    stdin: {
+      destroyed: false,
+      writableEnded: false,
+      writable: true,
+      write: () => true,
+      ...stdinOverrides,
+    },
+    kill: () => true,
+  }
+  proc.exitPromise = new Promise<void>(resolve => { proc.resolveExit = resolve })
+  return proc
+}
+
+describe('codex JSON-RPC lifecycle reliability', () => {
+  test('registers pending before write and clears its timeout on response', async () => {
+    let written = ''
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        written = chunk
+        const id = JSON.parse(chunk).id
+        proc.handleMessage({ id, result: { ok: true } })
+        return true
+      },
+    })
+
+    await expect(proc.request('model/list', {}, 20)).resolves.toEqual({ ok: true })
+    expect(JSON.parse(written)).toMatchObject({ id: 1, method: 'model/list' })
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('rejects dead stdin writes without leaving a pending request', async () => {
+    const proc = makeCodexLifecycleHarness({ writable: false })
+
+    await expect(proc.request('initialize', {}, 20)).rejects.toThrow('request write failed')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('rejects asynchronous stdin write failures without leaking pending', async () => {
+    const proc = makeCodexLifecycleHarness({
+      write: (_chunk: string, callback: (error?: Error) => void) => {
+        queueMicrotask(() => callback(new Error('EPIPE')))
+        return true
+      },
+    })
+
+    await expect(proc.request('initialize', {}, 20)).rejects.toThrow('EPIPE')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('times out unanswered requests and removes them from pending', async () => {
+    const proc = makeCodexLifecycleHarness()
+
+    await expect(proc.request('thread/start', {}, 5)).rejects.toThrow('timed out after 5ms')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('waits for real exit after SIGKILL instead of returning after delivery', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const signals: string[] = []
+    proc.proc.kill = (signal: string) => {
+      signals.push(signal)
+      if (signal === 'SIGKILL') {
+        queueMicrotask(() => {
+          proc.alive = false
+          proc.resolveExit()
+        })
+      }
+      return true
+    }
+
+    await expect(proc.kill(5)).resolves.toBeUndefined()
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(proc.alive).toBe(false)
+  })
+
+  test('rejects kill when neither TERM nor KILL produces an exit', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const signals: string[] = []
+    proc.proc.kill = (signal: string) => {
+      signals.push(signal)
+      return true
+    }
+
+    await expect(proc.kill(2)).rejects.toThrow('did not exit after SIGTERM and SIGKILL')
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+  })
+})
+
+describe('codex rollout incremental reader', () => {
+  test('reads only appended bytes and retains an incomplete JSON line', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-'))
+    const file = join(root, 'rollout.jsonl')
+    try {
+      const proc = Object.create(CodexProcess.prototype) as any
+      const seen: any[] = []
+      proc.sessionId = 'thread-1'
+      proc.rolloutFilePath = file
+      proc.rolloutReadOffset = 0
+      proc.rolloutLineRemainder = ''
+      proc.rolloutDecoder = new StringDecoder('utf8')
+      proc.emitRolloutImageGeneration = (payload: any) => { seen.push(payload) }
+
+      const line = JSON.stringify({ payload: { type: 'image_generation_end', call_id: 'img-1' } })
+      const split = Math.floor(line.length / 2)
+      writeFileSync(file, line.slice(0, split))
+      proc.flushRolloutImageGenerations()
+      expect(seen).toHaveLength(0)
+      expect(proc.rolloutReadOffset).toBe(split)
+
+      appendFileSync(file, line.slice(split) + '\n')
+      proc.flushRolloutImageGenerations()
+      expect(seen).toEqual([{ type: 'image_generation_end', call_id: 'img-1' }])
+      expect(proc.rolloutReadOffset).toBe(Buffer.byteLength(line + '\n'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('codex process compaction notifications', () => {
   test('detects explicit thread compaction notifications', () => {
@@ -616,6 +744,9 @@ describe('codex subagent item filtering (main-card cleanliness)', () => {
     const steps = events.filter(([e]) => e === 'subagent_step')
     expect(steps).toHaveLength(2)
     expect(steps[0][1]).toMatchObject({ thread_id: 'sub-thread-1', tool: 'Bash', phase: 'started' })
+    expect(steps[1][1]).toMatchObject({
+      thread_id: 'sub-thread-1', tool: 'Bash', phase: 'completed', brief: '→ 3 passed',
+    })
   })
 
   test('subagent Bash step brief unwraps PowerShell-wrapped desc command', () => {

@@ -127,7 +127,7 @@ function parseToml(text: string): Record<string, Record<string, string>> {
   const out: Record<string, Record<string, string>> = { _: {} }
   let section = '_'
   for (const raw of text.split('\n')) {
-    const line = raw.replace(/(^|[^\\])#.*$/, '$1').trim()
+    const line = stripTomlComment(raw).trim()
     if (!line) continue
     const sec = line.match(/^\[([^\]]+)\]$/)
     if (sec) {
@@ -151,6 +151,31 @@ function parseToml(text: string): Record<string, Record<string, string>> {
     }
   }
   return out
+}
+
+/** Remove a TOML comment marker only when it appears outside quoted strings.
+ * App secrets, tokens and URLs may legitimately contain `#`; the old regex
+ * truncated those values before credential validation. */
+function stripTomlComment(raw: string): string {
+  let quote: 'single' | 'double' | null = null
+  let escaped = false
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (quote === 'double') {
+      if (escaped) { escaped = false; continue }
+      if (ch === '\\') { escaped = true; continue }
+      if (ch === '"') quote = null
+      continue
+    }
+    if (quote === 'single') {
+      if (ch === "'") quote = null
+      continue
+    }
+    if (ch === '"') quote = 'double'
+    else if (ch === "'") quote = 'single'
+    else if (ch === '#') return raw.slice(0, i)
+  }
+  return raw
 }
 
 function loadConfig(): LodestarConfig {
@@ -182,6 +207,9 @@ function loadConfig(): LodestarConfig {
   const liveElapsed: LiveElapsedMode = liveElapsedRaw
   const notifyBind = t.notify?.bind ?? '127.0.0.1'
   const notifyPortRaw = t.notify?.port ?? '9876'
+  if (!/^\d+$/.test(notifyPortRaw.trim())) {
+    throw new Error(`lodestar: [notify].port must be an integer, got "${notifyPortRaw}"`)
+  }
   const notifyPort = Number.parseInt(notifyPortRaw, 10)
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)

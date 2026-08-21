@@ -41,6 +41,28 @@ export interface WorktreeInstructionsFile {
 const WORK_BRANCH_PREFIX = 'work/'
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
 const AUTOMATION_WORKTREE_PREFIX = 'AI-'
+const projectWorktreeTails = new Map<string, Promise<void>>()
+
+/** Serialize every worktree registry transaction for one canonical repository.
+ * Text-command creation/reactivation and card-action disbanding enter through
+ * different dispatch paths, so the mutex belongs beside the Git primitives,
+ * not in either UI handler. Distinct repositories remain concurrent. */
+export async function withProjectWorktreeLock<T>(projectDir: string, run: () => Promise<T>): Promise<T> {
+  const real = realpathSync(projectDir)
+  const key = process.platform === 'win32' ? real.toLowerCase() : real
+  const previous = projectWorktreeTails.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>(resolveGate => { release = resolveGate })
+  const tail = previous.catch(() => {}).then(() => gate)
+  projectWorktreeTails.set(key, tail)
+  await previous.catch(() => {})
+  try {
+    return await run()
+  } finally {
+    release()
+    if (projectWorktreeTails.get(key) === tail) projectWorktreeTails.delete(key)
+  }
+}
 
 export function normalizeWorktreeSlug(raw: string): string | null {
   const slug = raw.trim()
