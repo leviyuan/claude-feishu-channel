@@ -92,8 +92,10 @@ type PendingServerToolInput = {
 export interface ClaudeSpawnOpts extends SpawnOpts {
   model?: string
   effort: ClaudeReasoningEffort
+  /** Claude SDK conversation id to resume before optional forkSession. */
+  resumeSessionId?: string
   /** SDK resumeSessionAt:只 resume 到该 assistant 消息 uuid 为止(回到历史某点)。
-   *  用于 fk/bk —— 不传则 resume 完整历史。Claude 专属(Codex 无此能力)。 */
+   *  这是 Claude 的 checkpoint 形态；Codex 对应使用 canonical turn id。 */
   resumeSessionAt?: string
   /** SDK forkSession:true = resume 时派生新 session id,原 transcript 不动。
    *  fk/bk 都用它(避免破坏/污染原会话)。 */
@@ -1107,6 +1109,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'session_state_changed':
         if (raw.state === 'running' && !this.turnActive) {
           this.turnActive = true
+          // A checkpoint belongs to exactly one clean turn. Clear the prior
+          // assistant UUID at the authoritative SDK turn boundary.
+          this.lastAssistantUuid = null
           this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId })
         } else if (raw.state === 'idle') {
           this.turnActive = false
@@ -1374,11 +1379,20 @@ export class ClaudeAgentProcess extends EventEmitter {
       is_error: this.lastResult.is_error,
       duration_ms: this.lastResult.duration_ms,
       usage: this.lastUsage,
+      checkpoint: !this.lastResult.is_error && this.lastAssistantUuid && this.sessionId
+        ? {
+            provider: 'claude',
+            kind: 'assistant-message',
+            id: this.lastAssistantUuid,
+            source: { provider: 'claude', sessionId: this.sessionId, cwd: this.opts.workDir },
+          }
+        : null,
     })
   }
 
   private failTurnStart(e: Error): void {
     this.turnActive = false
+    this.lastAssistantUuid = null
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,

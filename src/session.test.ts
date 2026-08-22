@@ -1,12 +1,15 @@
 import { EventEmitter } from 'node:events'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
-  boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
+  boundResumes, branchBaseBySession, deletedReactions, projectProfiles, resetFeishuMock,
   modelSelections, sentCards, sentRawTexts, sentTexts, urgentPushes,
+  setResumeWriteError, setTurnAnchorWriteError,
+  turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
+const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
 const { getTokenSource, resetTokenSourceRegistry } = await import('./token-source')
@@ -148,6 +151,14 @@ function turnState(cardId = 'card_session_turn'): any {
     rotateGivenUp: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
+  }
+}
+
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error('condition timed out')
+    await new Promise(resolve => setTimeout(resolve, 1))
   }
 }
 
@@ -1188,6 +1199,23 @@ describe('Session workDir project profile override', () => {
     expect(session.workDir).toBe('/abs/custom/withoverride[feature-x]')
   })
 
+  test('keeps a temporary session created from a worktree in that worktree cwd', () => {
+    projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
+    const session = new Session('withoverride[feature-x]*0821-1337', 'oc_test_temp_worktree')
+    expect(session.workDir).toBe('/abs/custom/withoverride[feature-x]')
+  })
+
+  test('refuses a persisted resume ref after the project profile cwd changes', () => {
+    modelSelections.set('moved-project', { provider: 'codex', model: null, effort: null })
+    resumeRefs.set('moved-project:codex', {
+      provider: 'codex', sessionId: 'thread-from-old-cwd', cwd: '/abs/old/project',
+    })
+    projectProfiles.set('moved-project', { cwd: '/abs/new/project' })
+    const session = new Session('moved-project', 'oc_moved_project') as any
+
+    expect(() => session.spawnAgent(session.lastSessionRef)).toThrow('conversation launch cwd mismatch')
+  })
+
   test('falls back to PROJECTS_ROOT/<name> without profile', () => {
     const session = new Session('plainproject', 'oc_test_plain')
     expect(session.workDir).toBe('/tmp/lodestar-projects/plainproject')
@@ -1684,6 +1712,65 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
     expect(session.backgroundDetailAdded.size).toBe(0)
     expect(session.openingBackground).toBe(false)
   })
+
+  test('an old background open cannot revive after reset or clear a newer opening owner', async () => {
+    const session = new Session('background-open-generation', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('old')]
+
+    let releaseOldConvert: () => void = () => {}
+    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
+    let releaseNewConvert: () => void = () => {}
+    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
+    let convertCount = 0
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        const n = ++convertCount
+        if (n === 1) await oldConvertGate
+        if (n === 2) await newConvertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_bg_old' : 'card_bg_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      session.onBackgroundTaskChanged()
+      await waitUntil(() => convertCount === 1)
+
+      await session.resetBackgroundTasks()
+      expect(session.backgroundCard).toBeNull()
+      expect(session.openingBackground).toBe(false)
+
+      session.backgroundTasks = [makeRunningTask('new')]
+      session.onBackgroundTaskChanged()
+      await waitUntil(() => convertCount === 2)
+
+      releaseOldConvert()
+      await waitUntil(() => calls.some(call =>
+        call.method === 'PATCH' && call.path === '/cards/card_bg_old/settings'
+      ))
+      expect(session.backgroundCard).toBeNull()
+      expect(session.openingBackground).toBe(true)
+
+      releaseNewConvert()
+      await waitUntil(() => session.backgroundCard?.cardId === 'card_bg_new' && !session.openingBackground)
+      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['new'])
+    } finally {
+      releaseOldConvert()
+      releaseNewConvert()
+      session.stopBackgroundRefreshTick()
+      if (session.backgroundRefreshTimer) clearTimeout(session.backgroundRefreshTimer)
+      session.backgroundRefreshTimer = null
+      const cardId = session.backgroundCard?.cardId
+      session.backgroundCard = null
+      session.backgroundTasks = []
+      if (cardId) await cardkit.dispose(cardId)
+      globalThis.fetch = baseFetch
+    }
+  })
 })
 
 describe('Session codex plan live panel (plan_live)', () => {
@@ -1949,6 +2036,75 @@ describe('Session lifecycle reliability', () => {
     await session.stop('测试收尾', { announce: false })
   })
 
+  test('an obsolete main-card open cannot replace a newer process turn or clear its opening owner', async () => {
+    const session = new Session('stale-main-open', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const newProc = new FakeAgentProc('claude', 'new-session')
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+
+    let releaseOldConvert: () => void = () => {}
+    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
+    let releaseNewConvert: () => void = () => {}
+    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
+    let convertCount = 0
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        const n = ++convertCount
+        if (n === 1) await oldConvertGate
+        if (n === 2) await newConvertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_old_open' : 'card_new_open' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      session.attachProc(oldProc)
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['old input']
+      oldProc.emit('init', { session_id: 'old-session' })
+      await waitUntil(() => convertCount === 1)
+
+      session.attachProc(newProc)
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['new input']
+      newProc.emit('init', { session_id: 'new-session' })
+      await waitUntil(() => convertCount === 2)
+
+      releaseOldConvert()
+      await waitUntil(() => calls.some(call =>
+        call.method === 'PATCH' && call.path === '/cards/card_old_open/settings'
+      ))
+      expect(session.currentTurn).toBeNull()
+      expect(session.openingTurn).toBe(true)
+
+      releaseNewConvert()
+      await waitUntil(() => session.currentTurn?.cardId === 'card_new_open' && !session.openingTurn)
+      expect(session.currentTurn.cardId).toBe('card_new_open')
+      expect(session.proc).toBe(newProc)
+    } finally {
+      releaseOldConvert()
+      releaseNewConvert()
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('cold reset failure never leaves a main-card opening owner behind', async () => {
+    const session = new Session('cold-reset-failure', 'chat_id') as any
+    session.resetFreshConversationState = () => { throw new Error('reset failed') }
+
+    await expect(session.startColdUserTurn('hello', 'hello', 'ou_user')).rejects.toThrow('reset failed')
+
+    expect(session.openingTurn).toBe(false)
+    expect(session.openingTurnOwner).toBeNull()
+    expect(sentCards).toHaveLength(0)
+  })
+
   test('opens a mid-turn card before feeding the buffered batch and drops input on card init failure', async () => {
     const session = new Session('midturn-card-first', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'session-1')
@@ -2050,6 +2206,588 @@ describe('Session lifecycle reliability', () => {
     }
   })
 
+  test('an old close snapshots usage and reactions without clearing the next turn', async () => {
+    const session = new Session('close-snapshot', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'old-session')
+    oldProc.lastUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 }
+    ;(oldProc as any).lastContextWindow = 1000
+    session.proc = oldProc
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    const oldTurn = turnState('card_close_snapshot_old')
+    oldTurn.userOpenId = ''
+    session.currentTurn = oldTurn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 }
+    session.lastTurnDelta = { tokens: 111, costUsd: 1.234, durationMs: 1000 }
+    session.currentBatchReactionIds = new Map([['om_old_batch', 'rid_old_batch']])
+    session.pendingReactionIds = new Map([['om_old_pending', 'rid_old_pending']])
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+
+    let signalFlushStarted: () => void = () => {}
+    const flushStarted = new Promise<void>(resolve => { signalFlushStarted = resolve })
+    let releaseFlush: () => void = () => {}
+    const flushGate = new Promise<void>(resolve => { releaseFlush = resolve })
+    const realFlush = cardkit.flush
+    const flushSpy = spyOn(cardkit, 'flush').mockImplementation(async (cardId: string) => {
+      if (cardId === oldTurn.cardId) {
+        signalFlushStarted()
+        await flushGate
+      }
+      await realFlush(cardId)
+    })
+
+    try {
+      const closing = session.closeTurnCard(undefined, { hasFreshResult: true })
+      await flushStarted
+
+      const newProc = new FakeAgentProc('codex', 'new-session')
+      newProc.lastUsage = { input_tokens: 9000, output_tokens: 999, total_tokens: 9999 }
+      session.attachProc(newProc)
+      const newTurn = turnState('card_close_snapshot_new')
+      session.currentTurn = newTurn
+      session.lastTurnUsage = { input_tokens: 9000, output_tokens: 999, total_tokens: 9999 }
+      session.lastTurnDelta = { tokens: 9999, costUsd: 9.999, durationMs: 9000 }
+      session.currentBatchReactionIds = new Map([['om_new_batch', 'rid_new_batch']])
+      session.pendingReactionIds = new Map([['om_new_pending', 'rid_new_pending']])
+
+      releaseFlush()
+      await closing
+
+      expect(session.currentTurn).toBe(newTurn)
+      expect([...session.currentBatchReactionIds.entries()]).toEqual([['om_new_batch', 'rid_new_batch']])
+      expect([...session.pendingReactionIds.entries()]).toEqual([['om_new_pending', 'rid_new_pending']])
+      expect(deletedReactions).toContainEqual(['om_old_batch', 'rid_old_batch'])
+      expect(deletedReactions).toContainEqual(['om_old_pending', 'rid_old_pending'])
+      expect(deletedReactions).not.toContainEqual(['om_new_batch', 'rid_new_batch'])
+
+      const footer = calls.find(call =>
+        call.method === 'PUT' && call.path === `/cards/${oldTurn.cardId}/elements/footer`
+      )
+      const footerContent = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(footerContent).toContain('$1.234')
+      expect(footerContent).not.toContain('$9.999')
+      const settingsCall = calls.find(call =>
+        call.method === 'PATCH' && call.path === `/cards/${oldTurn.cardId}/settings`
+      )
+      const settings = JSON.parse(settingsCall?.body.settings ?? '{}')
+      expect(settings.config.summary.content).toContain('📶 11')
+      expect(settings.config.summary.content).not.toContain('999')
+    } finally {
+      releaseFlush()
+      flushSpy.mockRestore()
+      if (session.currentTurn) session.stopFooterStatus(session.currentTurn)
+      session.currentTurn = null
+      await cardkit.dispose(oldTurn.cardId)
+    }
+  })
+
+  test('restart waits for a close that already removed currentTurn before spawning', async () => {
+    const session = new Session('restart-close-owner', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const oldTurn = turnState('card_restart_close_owner')
+    oldTurn.provider = 'claude'
+    oldTurn.userOpenId = ''
+    session.proc = oldProc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.currentTurn = oldTurn
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+
+    let signalFlushStarted: () => void = () => {}
+    const flushStarted = new Promise<void>(resolve => { signalFlushStarted = resolve })
+    let releaseFlush: () => void = () => {}
+    const flushGate = new Promise<void>(resolve => { releaseFlush = resolve })
+    const realFlush = cardkit.flush
+    const flushSpy = spyOn(cardkit, 'flush').mockImplementation(async (cardId: string) => {
+      if (cardId === oldTurn.cardId) {
+        signalFlushStarted()
+        await flushGate
+      }
+      await realFlush(cardId)
+    })
+    const spawned: FakeAgentProc[] = []
+    session.spawnAgent = () => {
+      const proc = new FakeAgentProc('claude', `new-session-${spawned.length + 1}`)
+      spawned.push(proc)
+      return proc
+    }
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    try {
+      const oldClose = session.closeTurnCard('旧轮收尾')
+      await flushStarted
+      expect(session.currentTurn).toBeNull()
+
+      const restarting = session.restart(false, { announce: false })
+      await waitUntil(() => oldProc.killCalls === 1)
+      expect(spawned).toHaveLength(0)
+
+      releaseFlush()
+      await oldClose
+      expect(await restarting).toBe(true)
+      expect(spawned).toHaveLength(1)
+      expect(session.proc).toBe(spawned[0])
+    } finally {
+      releaseFlush()
+      flushSpy.mockRestore()
+      if (session.proc?.isAlive()) await session.stop('测试收尾', { announce: false })
+      await cardkit.dispose(oldTurn.cardId)
+    }
+  })
+
+  test('Claude pending precommit failure leaves the old binding untouched and never starts replacement', async () => {
+    const session = new Session('rollback-anchor-commit', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = 'old-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'old-session', cwd: session.workDir }
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'claude', kind: 'assistant-message', id: 'assistant-old',
+        source: { provider: 'claude', sessionId: 'old-session', cwd: session.workDir },
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    const nextAnchor = {
+      checkpoint: {
+        provider: 'claude', kind: 'assistant-message', id: 'assistant-next',
+        source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+      },
+      preview: 'next input', ts: 2, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+
+    const replacement = new FakeAgentProc('claude', 'replacement-session')
+    session.restartUnlocked = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-session'
+      session.lastSessionRef = { provider: 'claude', sessionId: 'replacement-session', cwd: session.workDir }
+      session.status = 'idle'
+      return true
+    }
+    const realReplace = feishu.replaceTurnAnchors
+    let replaceCalls = 0
+    const replaceSpy = spyOn(feishu, 'replaceTurnAnchors').mockImplementation((sessionName, anchors, base) => {
+      replaceCalls++
+      if (replaceCalls === 1) throw new Error('turn-map fsync failed')
+      return realReplace(sessionName, anchors, base)
+    })
+
+    try {
+      await expect(session.rollbackTo(
+        {
+          kind: 'fork',
+          source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+          through: nextAnchor.checkpoint,
+        },
+        { anchors: [nextAnchor], base: { kind: 'fresh' } },
+        { announce: false },
+      )).rejects.toThrow('turn-map fsync failed')
+
+      expect(replacement.killCalls).toBe(0)
+      expect(session.proc).toBeNull()
+      expect(session.status).toBe('stopped')
+      expect(session.lastSessionId).toBe('old-session')
+      expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+      expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+      expect(boundResumes).not.toContainEqual([session.sessionName, 'old-session', 'claude'])
+      expect(replaceCalls).toBe(1)
+    } finally {
+      replaceSpy.mockRestore()
+    }
+  })
+
+  test('Codex rollback stops replacement and restores state when post-start branch commit fails', async () => {
+    const session = new Session('codex-rollback-anchor-commit', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = 'old-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir }
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-old',
+        source: { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir },
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    const nextAnchor = {
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-next',
+        source: { provider: 'codex', sessionId: 'source-thread', cwd: session.workDir },
+      },
+      preview: 'next input', ts: 2, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+
+    const replacement = new FakeAgentProc('codex', 'replacement-thread')
+    session.restartUnlocked = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-thread'
+      session.lastSessionRef = { provider: 'codex', sessionId: 'replacement-thread', cwd: session.workDir }
+      session.status = 'idle'
+      return true
+    }
+    const realReplace = feishu.replaceTurnAnchors
+    let replaceCalls = 0
+    const replaceSpy = spyOn(feishu, 'replaceTurnAnchors').mockImplementation((sessionName, anchors, base, pending) => {
+      replaceCalls++
+      if (replaceCalls === 1) throw new Error('turn-map fsync failed')
+      return realReplace(sessionName, anchors, base, pending)
+    })
+
+    try {
+      await expect(session.rollbackTo(
+        {
+          kind: 'fork',
+          source: { provider: 'codex', sessionId: 'source-thread', cwd: session.workDir },
+          through: nextAnchor.checkpoint,
+        },
+        { anchors: [nextAnchor], base: { kind: 'fresh' } },
+        { announce: false },
+      )).rejects.toThrow('turn-map fsync failed')
+
+      expect(replacement.killCalls).toBe(1)
+      expect(session.proc).toBeNull()
+      expect(session.status).toBe('stopped')
+      expect(session.lastSessionId).toBe('old-thread')
+      expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+      expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+      expect(boundResumes).toContainEqual([session.sessionName, 'old-thread', 'codex'])
+      expect(replaceCalls).toBe(2)
+    } finally {
+      replaceSpy.mockRestore()
+    }
+  })
+
+  test('rollback stops an attached replacement when restart throws after it became ready', async () => {
+    const session = new Session('rollback-ready-throw', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = 'old-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'old-session', cwd: session.workDir }
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'claude', kind: 'assistant-message', id: 'assistant-old',
+        source: { provider: 'claude', sessionId: 'old-session', cwd: session.workDir },
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const replacement = new FakeAgentProc('claude', 'replacement-session')
+    session.restartUnlocked = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-session'
+      session.lastSessionRef = { provider: 'claude', sessionId: 'replacement-session', cwd: session.workDir }
+      session.status = 'idle'
+      throw new Error('ready callback failed')
+    }
+
+    await expect(session.rollbackTo({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+    })).rejects.toThrow('ready callback failed')
+
+    expect(replacement.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(session.lastSessionId).toBe('old-session')
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+    expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+  })
+
+  test('Claude rs precommits pending fork intent before restart and restores it on failure', async () => {
+    const session = new Session('pending-rollback', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = {
+      provider: 'claude', sessionId: 'previous-session', cwd: session.workDir,
+    }
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    let sawPrecommit = false
+    session.restartUnlocked = async () => {
+      sawPrecommit = pendingConversationLaunchBySession.get(session.sessionName)?.launch.source.sessionId === 'source-session'
+      return false
+    }
+
+    const ok = await session.rollbackTo(launch, {
+      anchors: [], base: launch,
+    })
+
+    expect(ok).toBe(false)
+    expect(sawPrecommit).toBe(true)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('Claude startForked persists pending intent before startup grace', async () => {
+    const session = new Session('pending-start-forked', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = null
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    let sawPrecommit = false
+    session.startUnlocked = async () => {
+      sawPrecommit = pendingConversationLaunchBySession.has(session.sessionName)
+      return true
+    }
+
+    expect(await session.startForked(launch)).toBe(true)
+    expect(sawPrecommit).toBe(true)
+    expect(pendingConversationLaunchBySession.get(session.sessionName)).toEqual({
+      launch,
+      previousSessionId: null,
+    })
+  })
+
+  test('constructor restores pending fork or materialized resume without silent fresh start', () => {
+    const pendingName = 'pending-reload'
+    const pendingCwd = `/tmp/lodestar-projects/${pendingName}`
+    const pending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: pendingCwd },
+      },
+      previousSessionId: 'previous-session',
+    }
+    modelSelections.set(pendingName, {
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+    })
+    resumeRefs.set(`${pendingName}:claude`, {
+      provider: 'claude', sessionId: 'previous-session', cwd: pendingCwd,
+    })
+    pendingConversationLaunchBySession.set(pendingName, pending)
+    const beforeInit = new Session(pendingName, 'chat_pending') as any
+    expect(beforeInit.pendingMaterializationLaunch()).toEqual(pending.launch)
+
+    const materializedName = 'pending-materialized-reload'
+    const materializedCwd = `/tmp/lodestar-projects/${materializedName}`
+    const materializedPending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: materializedCwd },
+      },
+      previousSessionId: 'previous-session',
+    }
+    modelSelections.set(materializedName, {
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+    })
+    resumeRefs.set(`${materializedName}:claude`, {
+      provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd,
+    })
+    pendingConversationLaunchBySession.set(materializedName, materializedPending)
+    const afterInit = new Session(materializedName, 'chat_materialized') as any
+    expect(afterInit.pendingMaterializationLaunch()).toEqual({
+      kind: 'resume',
+      source: {
+        provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd,
+      },
+    })
+  })
+
+  test('Claude init binds the new id and first result consumes the durable pending marker', () => {
+    const session = new Session('pending-materialize', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: 'previous-session' }
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = {
+      provider: 'claude', sessionId: 'previous-session', cwd: session.workDir,
+    }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.proc = new FakeAgentProc('claude', 'new-session')
+
+    expect(session.persistResumableSessionId(true)).toBeNull()
+    expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('new-session')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+    expect(session.pendingMaterializationLaunch()).toEqual({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'new-session', cwd: session.workDir },
+    })
+
+    expect(session.consumePendingConversationMaterialization()).toBeNull()
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('Claude init rejects a fork that reuses source or previous session id', () => {
+    const session = new Session('pending-same-id', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: 'source-session' }
+    session.lastSessionId = 'source-session'
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.proc = new FakeAgentProc('claude', 'source-session')
+
+    expect(() => session.persistResumableSessionId(true)).toThrow('did not materialize an independent session id')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+  })
+
+  test('Claude result without a session id keeps the durable fork intent', () => {
+    const session = new Session('pending-missing-session-id', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: 'previous-session' }
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = {
+      provider: 'claude', sessionId: 'previous-session', cwd: session.workDir,
+    }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.proc = new FakeAgentProc('claude', null)
+
+    expect(session.persistResumableSessionId()).toContain('did not provide a materialized session id')
+    expect(session.consumePendingConversationMaterialization()).toContain('保留 pending marker')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+  })
+
+  test('Codex constructor clears stale Claude pending before validating its old cwd', () => {
+    const sessionName = 'codex-clears-stale-claude-pending'
+    modelSelections.set(sessionName, {
+      provider: 'codex', model: 'gpt-5.6-sol', effort: 'low', tokenSourceId: 'codex-sub',
+    })
+    pendingConversationLaunchBySession.set(sessionName, {
+      launch: {
+        kind: 'fork',
+        source: { provider: 'claude', sessionId: 'source-session', cwd: '/srv/old-claude-project' },
+      },
+      previousSessionId: null,
+    })
+
+    expect(() => new Session(sessionName, 'chat_id')).not.toThrow()
+    expect(pendingConversationLaunchBySession.has(sessionName)).toBe(false)
+  })
+
+  test('explicit fresh and provider switch clear pending intent before changing routing', async () => {
+    const session = new Session('pending-clear', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: null }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.startUnlocked = async () => true
+
+    expect(await session.restartUnlocked(false, { announce: false })).toBe(true)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+
+    session.selectedProvider = 'claude'
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    setTurnAnchorWriteError(new Error('turn state fsync failed'))
+    await expect(session.applyModelSelectionUnlocked('codex', 'gpt-5.6-sol', 'low', 'codex-sub'))
+      .rejects.toThrow('turn state fsync failed')
+    expect(session.selectedProvider).toBe('claude')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+    setTurnAnchorWriteError(null)
+  })
+
+  test('result still terminalizes the turn when resume-map persistence fails', async () => {
+    const session = new Session('resume-write-result', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    const turn = turnState('card_resume_write_result')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+    setResumeWriteError(new Error('resume-map fsync failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-1',
+        source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+      },
+    })
+
+    await waitUntil(() => session.currentTurn === null)
+    expect(session.status).toBe('idle')
+    expect(session.lastSessionId).toBe('thread-current')
+    expect(sentRawTexts.some(text => text.includes('resume-map fsync failed'))).toBe(true)
+    setResumeWriteError(null)
+  })
+
+  test('result exposes checkpoint persistence failure and does not retain an in-memory-only anchor', async () => {
+    const session = new Session('anchor-write-result', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+    setTurnAnchorWriteError(new Error('turn-map fsync failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-1',
+        source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(session.status).toBe('idle')
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(sentRawTexts.some(text => text.includes('turn-map fsync failed'))).toBe(true)
+    setTurnAnchorWriteError(null)
+  })
+
+  test('result racing card open carries checkpoint persistence failure into deferred close', () => {
+    const session = new Session('anchor-write-open-race', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+    const owner = session.beginTurnOpen(proc, session.procEpoch)
+    setTurnAnchorWriteError(new Error('turn-map race failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-race',
+        source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+      },
+    })
+
+    expect(owner.sawResult).toBe(true)
+    expect(owner.terminalSuffix).toContain('turn-map race failed')
+    expect(owner.terminalForcePush).toBe(true)
+    session.releaseTurnOpen(owner)
+    setTurnAnchorWriteError(null)
+  })
+
   test('stop clears visible state but keeps an unconfirmed process blocked until its real exit', async () => {
     const session = new Session('stop-kill-failure', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'session-1')
@@ -2114,6 +2852,22 @@ describe('Session lifecycle reliability', () => {
     proc.alive = false
     proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
     expect(session.proc).toBeNull()
+  })
+
+  test('legacy resume cwd verification fails before an existing process is killed', async () => {
+    const session = new Session('legacy-resume-cwd', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'running-thread')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.lastSessionId = 'legacy-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'legacy-thread', cwd: null }
+    session.resolveLegacyResumeRef = async () => { throw new Error('stored cwd mismatch') }
+
+    expect(await session.restart(true, { announce: false })).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.status).toBe('idle')
   })
 
   test('process ownership still becomes blocked when kill and terminal cleanup both fail', async () => {

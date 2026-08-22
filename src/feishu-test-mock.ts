@@ -11,13 +11,26 @@
  * 捕获数组是共享可变状态,测试文件在 beforeEach 里调 resetFeishuMock()。
  */
 import { mock } from 'bun:test'
+import type { TurnAnchor } from './feishu'
+import type { ConversationBranchBase, PendingConversationLaunch } from './conversation'
 
 export const sentCards: object[] = []
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
+export const clearedResumes: Array<[string, string | undefined]> = []
 export const urgentPushes: Array<[string, string[]]> = []
+/** session-temp fork/back 测试使用的内存 turn-map 及 mutation 记录。 */
+export const turnAnchorsBySession = new Map<string, TurnAnchor[]>()
+export const clearedTurnAnchorSessions: string[] = []
+export const seededTurnAnchors: Array<[string, TurnAnchor[]]> = []
+export const branchBaseBySession = new Map<string, ConversationBranchBase>()
+export const pendingConversationLaunchBySession = new Map<string, PendingConversationLaunch>()
+let resumeWriteError: Error | null = null
+export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
+let turnAnchorWriteError: Error | null = null
+export function setTurnAnchorWriteError(error: Error | null): void { turnAnchorWriteError = error }
 /** task v2 list 调用捕获(测 tasklist-worker 的 scanTaskSections 调用预算:每个 section
  *  只能拉一次,防 2026-07-30 修掉的双重拉取回归)。beforeEach 调 resetFeishuMock() 清空。 */
 export const listSectionTasksCalls: Array<[string, boolean | undefined]> = []
@@ -29,11 +42,15 @@ export const modelSelections = new Map<string, {
   effort: string | null
   tokenSourceId?: string | null
 }>()
+export const resumeRefs = new Map<string, { provider: 'codex' | 'claude'; sessionId: string; cwd: string | null }>()
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string }>()
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, urgentPushes]) {
+  for (const arr of [
+    sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, clearedResumes, urgentPushes,
+    clearedTurnAnchorSessions, seededTurnAnchors,
+  ]) {
     arr.length = 0
   }
   for (const arr of [listSectionTasksCalls, listTasklistSectionsCalls, listTasklistTasksCalls]) {
@@ -41,12 +58,22 @@ export function resetFeishuMock(): void {
   }
   projectProfiles.clear()
   modelSelections.clear()
+  resumeRefs.clear()
+  turnAnchorsBySession.clear()
+  resumeWriteError = null
+  turnAnchorWriteError = null
+  branchBaseBySession.clear()
+  pendingConversationLaunchBySession.clear()
 }
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
   resolveProjectDir: (name: string) => projectProfiles.get(name)?.cwd?.trim() || `/tmp/lodestar-projects/${name}`,
-  getSessionResume: () => null,
+  getSessionResume: (sessionName: string, provider = 'codex') => resumeRefs.get(`${sessionName}:${provider}`)?.sessionId ?? null,
+  getSessionResumeRef: (sessionName: string, provider = 'codex') => {
+    const ref = resumeRefs.get(`${sessionName}:${provider}`)
+    return ref ? { ...ref } : null
+  },
   getSessionModelSelection: (sessionName: string) => modelSelections.get(sessionName) ?? null,
   getTenantToken: async () => 'tenant-token',
   preferredChatForSession: new Map(),
@@ -80,21 +107,91 @@ mock.module('./feishu', () => ({
     listTasklistTasksCalls.push([guid, completed])
     return []
   },
-  bindSessionResume: (sessionName: string, sessionId: string, provider?: string) => {
-    boundResumes.push([sessionName, sessionId, provider])
+  bindSessionResume: (sessionName: string, sessionIdOrRef: string | { sessionId: string; provider: string }, provider?: string) => {
+    const normalized = typeof sessionIdOrRef === 'string'
+      ? { sessionId: sessionIdOrRef, provider: provider ?? 'codex', cwd: null }
+      : sessionIdOrRef
+    boundResumes.push([sessionName, normalized.sessionId, normalized.provider])
+    resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized as any)
+  },
+  bindSessionResumeChecked: (sessionName: string, sessionIdOrRef: string | { sessionId: string; provider: string }, provider?: string) => {
+    if (resumeWriteError) throw resumeWriteError
+    const normalized = typeof sessionIdOrRef === 'string'
+      ? { sessionId: sessionIdOrRef, provider: provider ?? 'codex', cwd: null }
+      : sessionIdOrRef
+    boundResumes.push([sessionName, normalized.sessionId, normalized.provider])
+    resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized as any)
+  },
+  clearSessionResumeChecked: (sessionName: string, provider?: string) => {
+    clearedResumes.push([sessionName, provider])
+    if (provider) resumeRefs.delete(`${sessionName}:${provider}`)
   },
   bindSessionModel: () => {},
+  bindSessionModelChecked: () => {},
   isOpenAIChatGPTAuthenticated: () => true,
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
-  // 临时群 / fork / back / rs 恢复相关 stub(测试不验证这些路径,no-op / 空返回)
-  tempProjectName: () => null,
-  tempChatName: (project: string) => `${project}*0000-0000`,
-  appendTurnAnchor: () => {},
-  getTurnAnchors: () => [],
-  truncateTurnAnchors: () => {},
-  seedTurnAnchors: () => {},
-  clearTurnAnchors: () => {},
+  // 临时群 / fork / back / rs 恢复相关 stub。
+  tempProjectName: (name: string) => /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
+    ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
+    : null,
+  tempChatName: (project: string, additionallyUsed: Iterable<string> = []) => {
+    const used = new Set(additionallyUsed)
+    let name = `${project}*0000-0000`
+    for (let seq = 2; used.has(name); seq++) name = `${project}*0000-0000-${seq}`
+    return name
+  },
+  appendTurnAnchor: (sessionName: string, anchor: TurnAnchor) => {
+    const current = turnAnchorsBySession.get(sessionName) ?? []
+    turnAnchorsBySession.set(sessionName, [...current, anchor])
+  },
+  appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
+    if (turnAnchorWriteError) throw turnAnchorWriteError
+    const current = turnAnchorsBySession.get(sessionName) ?? []
+    turnAnchorsBySession.set(sessionName, [...current, anchor])
+  },
+  getTurnAnchors: (sessionName: string) => turnAnchorsBySession.get(sessionName) ?? [],
+  getSessionBranchBase: (sessionName: string) => branchBaseBySession.get(sessionName) ?? null,
+  getPendingConversationLaunch: (sessionName: string) => pendingConversationLaunchBySession.get(sessionName) ?? null,
+  setPendingConversationLaunchChecked: (sessionName: string, pending: PendingConversationLaunch | null) => {
+    if (turnAnchorWriteError) throw turnAnchorWriteError
+    if (pending) pendingConversationLaunchBySession.set(sessionName, pending)
+    else pendingConversationLaunchBySession.delete(sessionName)
+  },
+  truncateTurnAnchors: (sessionName: string, keepCount: number) => {
+    const current = turnAnchorsBySession.get(sessionName)
+    if (current && current.length > keepCount) {
+      turnAnchorsBySession.set(sessionName, current.slice(0, keepCount))
+    }
+  },
+  seedTurnAnchors: (sessionName: string, anchors: TurnAnchor[]) => {
+    const copied = anchors.slice()
+    seededTurnAnchors.push([sessionName, copied])
+    if (copied.length > 0) turnAnchorsBySession.set(sessionName, copied)
+  },
+  clearTurnAnchors: (sessionName: string) => {
+    clearedTurnAnchorSessions.push(sessionName)
+    turnAnchorsBySession.delete(sessionName)
+    branchBaseBySession.delete(sessionName)
+    pendingConversationLaunchBySession.delete(sessionName)
+  },
+  replaceTurnAnchors: (
+    sessionName: string,
+    anchors: TurnAnchor[],
+    base: ConversationBranchBase,
+    pending?: PendingConversationLaunch | null,
+  ) => {
+    if (turnAnchorWriteError) throw turnAnchorWriteError
+    clearedTurnAnchorSessions.push(sessionName)
+    const copied = anchors.slice()
+    seededTurnAnchors.push([sessionName, copied])
+    turnAnchorsBySession.set(sessionName, copied)
+    branchBaseBySession.set(sessionName, base)
+    if (pending !== undefined) {
+      if (pending) pendingConversationLaunchBySession.set(sessionName, pending)
+      else pendingConversationLaunchBySession.delete(sessionName)
+    }
+  },
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
   disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
 }))

@@ -2,16 +2,16 @@
  * 临时群 / fork / back / rs 恢复 相关卡片。
  *
  *   - turnListCard     fk/bk 的"用户输入列表"卡片(倒序,每条一个按钮)
- *   - resumeListCard   rs 空闲模式的"项目最近 24h 会话"列表
- *   - writeLogCard     bk 回滚后发的"回滚段 Write 记录"卡(代码块,可复制)
+ *   - resumeListCard   rs 空闲模式的"项目最近会话"列表
+ *   - writeLogCard     bk 后发的"观察到的文件变更"卡(代码块,可复制)
  *
  * 和 cards/worktree.ts 同一套 schema 2.0 + column_set + button callback 风格。
  * 按钮的 value.kind 在 daemon.ts handleCardAction 里 dispatch。
  */
 
 export interface TurnListEntry {
-  /** 在 feishu.getTurnAnchors() 数组里的 0-based 索引;daemon 据此定位 resumeSessionAt */
-  idx: number
+  /** 仅供当前 panel 解析的稳定、不透明 choice id。 */
+  choiceId: string
   preview: string
   ts: number
 }
@@ -23,29 +23,33 @@ export interface TempListNotice {
 
 export interface TurnListCardOpts {
   projectName: string
+  /** 调用方登记的短期选择面板 id；回调必须同时校验 panel 和 choice。 */
+  panelId: string
   mode: 'fork' | 'back'
   entries: TurnListEntry[]
   notice?: TempListNotice
 }
 
 export interface ResumeListEntry {
-  /** Claude session_id(transcript 文件名,去 .jsonl);恢复时直接 resume 它 */
-  sessionId: string
-  /** 首条用户输入(会话主题),从 transcript 提取 */
+  /** 仅供当前 panel 解析的稳定、不透明 choice id。 */
+  choiceId: string
+  /** 首条用户输入（会话主题）。 */
   preview: string
   ts: number
 }
 
 export interface ResumeListCardOpts {
   projectName: string
+  /** 调用方登记的短期选择面板 id；回调必须同时校验 panel 和 choice。 */
+  panelId: string
   entries: ResumeListEntry[]
 }
 
 export interface WriteLogEntry {
-  /** Write / Edit / NotebookEdit / MultiEdit */
+  /** Write / Edit / NotebookEdit / MultiEdit / FileChange */
   tool: string
   path: string
-  /** content(Write)/ new_string(Edit)/ 摘要;已由调用方截断 */
+  /** content(Write) / new_string(Edit) / diff(FileChange) / 摘要。 */
   body: string
 }
 
@@ -60,19 +64,33 @@ export interface SelectionResultCardOpts {
   ok: boolean
 }
 
+export interface ResumeSelectionResultCardOpts {
+  projectName: string
+  provider: 'claude' | 'codex'
+  selectedPreview: string
+  selectedTs: number
+  sourceSessionId: string
+  sourceStatus?: string
+  previousSessionId: string | null
+  newSessionId: string | null
+  bindingState: 'changed' | 'prepared' | 'unchanged' | 'unknown'
+  message: string
+  ok: boolean
+}
+
 const WRITE_BODY_MAX = 800
 
 export function turnListCard(opts: TurnListCardOpts): object {
   const isFork = opts.mode === 'fork'
-  const btnText = isFork ? '分叉' : '回滚'
+  const btnText = isFork ? '分叉' : '回退'
   const kind = isFork ? 'temp_fork_select' : 'temp_back_select'
   const hint = isFork
-    ? '💡 选一条「用户输入」→ 从这条**之前**开临时群分叉(原会话不动)'
-    : '💡 选一条「用户输入」→ 当前会话回退到这条**之前**(之后的作废,并附 Write 记录)'
+    ? '💡 选择一条「用户输入」，将在临时群从它**之前**创建独立对话分支；选中的输入本身不包含。\n分支与本群共享 cwd 和磁盘文件；只分叉对话历史，不复制或回滚文件，原会话不动。'
+    : '⚠️ 选择一条「用户输入」，将停止本群当前 turn 和后台任务，并从它**之前**创建后续对话分支；选中的输入本身不包含。\n只回退对话历史，不会回滚 cwd 中的文件。'
   const elements: object[] = []
   if (opts.notice) elements.push({ tag: 'markdown', content: noticeMarkdown(opts.notice) })
   if (!opts.entries.length) {
-    elements.push({ tag: 'markdown', content: '_当前会话还没有已完成的 turn,无法分叉/回滚。_' })
+    elements.push({ tag: 'markdown', content: '_当前会话还没有已完成的 turn，无法分叉/回退。_' })
   } else {
     elements.push({ tag: 'markdown', content: hint })
     for (const e of opts.entries) {
@@ -96,7 +114,10 @@ export function turnListCard(opts: TurnListCardOpts): object {
               tag: 'button',
               text: { tag: 'plain_text', content: btnText },
               type: isFork ? 'primary' : 'danger',
-              behaviors: [{ type: 'callback', value: { kind, anchorIdx: e.idx } }],
+              behaviors: [{
+                type: 'callback',
+                value: { kind, panel_id: opts.panelId, choice_id: e.choiceId },
+              }],
             }],
           },
         ],
@@ -107,7 +128,7 @@ export function turnListCard(opts: TurnListCardOpts): object {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: `${isFork ? '🔱 fk 分叉' : '⏪ bk 回滚'} · ${opts.projectName}` },
+      title: { tag: 'plain_text', content: `${isFork ? '🔱 fk 分叉' : '⏪ bk 回退'} · ${opts.projectName}` },
       template: isFork ? 'turquoise' : 'orange',
     },
     body: { elements },
@@ -117,9 +138,12 @@ export function turnListCard(opts: TurnListCardOpts): object {
 export function resumeListCard(opts: ResumeListCardOpts): object {
   const elements: object[] = []
   if (!opts.entries.length) {
-    elements.push({ tag: 'markdown', content: `_项目「${opts.projectName}」最近 24h 没有可恢复的会话。_` })
+    elements.push({ tag: 'markdown', content: `_项目「${opts.projectName}」没有可创建分支的历史会话。_` })
   } else {
-    elements.push({ tag: 'markdown', content: '💡 选一个会话在**当前群**接续(相当于把别处的对话搬到这)' })
+    elements.push({
+      tag: 'markdown',
+      content: '💡 选择一个历史会话，在**当前群**创建独立对话分支；源会话不动。\n新分支共享当前 cwd 和磁盘文件；只分叉对话历史，不复制或回滚文件。',
+    })
     for (const e of opts.entries) {
       elements.push({
         tag: 'column_set',
@@ -130,7 +154,7 @@ export function resumeListCard(opts: ResumeListCardOpts): object {
             weight: 5,
             elements: [{
               tag: 'markdown',
-              content: `**${inlineCode(e.sessionId.slice(0, 8))}** · ${fmtTime(e.ts)}\n${inlineCode(e.preview.slice(0, 60) || '(无摘要)')}`,
+              content: `**${fmtTime(e.ts)}**\n${inlineCode(e.preview.slice(0, 60) || '(无摘要)')}`,
             }],
           },
           {
@@ -139,9 +163,16 @@ export function resumeListCard(opts: ResumeListCardOpts): object {
             weight: 1,
             elements: [{
               tag: 'button',
-              text: { tag: 'plain_text', content: '恢复' },
+              text: { tag: 'plain_text', content: '分支' },
               type: 'primary',
-              behaviors: [{ type: 'callback', value: { kind: 'temp_resume_select', sessionId: e.sessionId } }],
+              behaviors: [{
+                type: 'callback',
+                value: {
+                  kind: 'temp_resume_select',
+                  panel_id: opts.panelId,
+                  choice_id: e.choiceId,
+                },
+              }],
             }],
           },
         ],
@@ -152,7 +183,7 @@ export function resumeListCard(opts: ResumeListCardOpts): object {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: `🔁 rs 恢复 · ${opts.projectName}` },
+      title: { tag: 'plain_text', content: `🔁 rs 独立分支 · ${opts.projectName}` },
       template: 'purple',
     },
     body: { elements },
@@ -161,7 +192,7 @@ export function resumeListCard(opts: ResumeListCardOpts): object {
 
 export function writeLogCard(opts: WriteLogCardOpts): object {
   const code = opts.entries.length === 0
-    ? '(回滚段内无 Write 类操作)'
+    ? '(回退范围内未观察到 Write/Edit/FileChange 类文件变更)'
     : opts.entries
       .map(e => {
         const body = e.body.length > WRITE_BODY_MAX ? e.body.slice(0, WRITE_BODY_MAX) + '\n…(截断)' : e.body
@@ -172,14 +203,14 @@ export function writeLogCard(opts: WriteLogCardOpts): object {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: `📋 回滚段 Write 记录 · ${opts.projectName}` },
+      title: { tag: 'plain_text', content: `📋 观察到的文件变更 · ${opts.projectName}` },
       template: 'grey',
     },
     body: {
       elements: [
         {
           tag: 'markdown',
-          content: '回滚段内执行的 Write 类操作如下。点代码块右上角复制 → 编辑 → 重发给回滚后的会话,让它重做你想保留的部分。',
+          content: '以下是回退范围内观察到的文件变更，可复制、编辑后交给新分支参考。bk 只回退对话历史，不会回滚磁盘文件；Shell/MCP 等工具造成的副作用可能未被记录。',
         },
         { tag: 'markdown', content: '```\n' + code + '\n```' },
       ],
@@ -207,6 +238,92 @@ export function selectionResultCard(opts: SelectionResultCardOpts): object {
   }
 }
 
+/** Terminal in-place replacement for an rs history picker. It keeps the
+ * trusted selection snapshot visible after the buttons are consumed, so the
+ * user can verify which backend/history produced the current branch. */
+export function resumeSelectionResultCard(opts: ResumeSelectionResultCardOpts): object {
+  const provider = opts.provider === 'codex' ? 'Codex' : 'Claude'
+  const stateLabel = opts.bindingState === 'changed'
+    ? '已接入'
+    : opts.bindingState === 'prepared'
+      ? '已准备'
+    : opts.bindingState === 'unchanged'
+      ? '未切换'
+      : '状态待确认'
+  const stateIcon = opts.bindingState === 'changed'
+    ? '✅'
+    : opts.bindingState === 'prepared'
+      ? '⏳'
+      : opts.bindingState === 'unchanged'
+        ? '❌'
+        : '⚠️'
+  const preview = opts.selectedPreview.slice(0, 80) || '(无摘要)'
+  const sourceStatus = opts.sourceStatus
+    ? ` · 状态 ${inlineCode(opts.sourceStatus)}`
+    : ''
+  const outcome = opts.bindingState === 'changed'
+    ? [
+        '**当前群**',
+        `新会话 ${inlineCode(compactSessionId(opts.newSessionId))}`,
+        '',
+        '源会话未修改；新分支与当前群共享 cwd 和磁盘文件。',
+      ].join('\n')
+    : opts.bindingState === 'prepared'
+      ? [
+        '**当前群**',
+        'Claude 独立分支已准备；发送下一条消息时生成并接入新会话。',
+        '',
+        '源会话未修改；新分支与当前群共享 cwd 和磁盘文件。',
+      ].join('\n')
+      : opts.bindingState === 'unchanged'
+      ? [
+        `${escapeMarkdown(opts.message)}`,
+        '',
+        `本群原绑定 ${inlineCode(compactSessionId(opts.previousSessionId))}；源会话未修改。`,
+      ].join('\n')
+      : [
+        `${escapeMarkdown(opts.message)}`,
+        '',
+        `后端返回会话 ${inlineCode(compactSessionId(opts.newSessionId))}；当前绑定无法确认。`,
+        '请发送 hi 或 rs 检查当前状态，不要把本卡视为成功回执。',
+      ].join('\n')
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `🔁 rs ${stateLabel} · ${opts.projectName}`,
+      },
+      template: opts.bindingState === 'changed'
+        ? 'green'
+        : opts.bindingState === 'prepared'
+          ? 'purple'
+          : opts.bindingState === 'unchanged'
+            ? 'red'
+            : 'orange',
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: `${stateIcon} ${opts.bindingState === 'changed' ? '已从所选历史创建独立分支' : opts.bindingState === 'prepared' ? '已准备从所选历史创建独立分支' : opts.bindingState === 'unchanged' ? '历史分支创建失败' : '分支结果需要确认'}`,
+        },
+        {
+          tag: 'markdown',
+          content: [
+            `**所选历史 · ${provider}**`,
+            `**${fmtTime(opts.selectedTs)}**${sourceStatus}`,
+            inlineCode(preview),
+            `源会话 ${inlineCode(compactSessionId(opts.sourceSessionId))}`,
+          ].join('\n'),
+        },
+        { tag: 'markdown', content: outcome },
+      ],
+    },
+  }
+}
+
 function fmtTime(ts: number): string {
   const d = new Date(ts)
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -214,10 +331,22 @@ function fmtTime(ts: number): string {
 }
 
 function inlineCode(s: string): string {
-  return '`' + s.replace(/`/g, '\\`').replace(/\n/g, ' ') + '`'
+  return '`' + escapeHtml(s.replace(/`/g, '\\`').replace(/\n/g, ' ')) + '`'
+}
+
+function compactSessionId(value: string | null): string {
+  const id = value?.trim() ?? ''
+  if (!id) return 'MISS'
+  return id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
 }
 
 function escapeMarkdown(s: string): string {
+  return escapeHtml(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/([`*_{}\[\]()#+\-.!|>~])/g, '\\$1')
+}
+
+function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
@@ -243,4 +372,36 @@ export function writeBodyFromToolInput(tool: string, input: any): string {
       .join('\n---\n')
   }
   return ''
+}
+
+/**
+ * 把后端文件工具输入展开成 writeLogCard 可消费的记录。
+ * Claude 的 Write/Edit 等一次对应一条；Codex FileChange 一次可能含多个文件，
+ * 因此按 changes[path,diff] 逐条展开。Shell/MCP 不在这里推断，避免伪造记录。
+ */
+export function writeLogEntriesFromToolInput(tool: string, input: any): WriteLogEntry[] {
+  if (!input || typeof input !== 'object') return []
+
+  if (tool === 'FileChange' || tool === 'fileChange') {
+    if (!Array.isArray(input.changes)) return []
+    return input.changes
+      .filter((change: any) => change && typeof change === 'object')
+      .map((change: any) => ({
+        tool,
+        path: typeof change.path === 'string' && change.path ? change.path : '?',
+        body: typeof change.diff === 'string'
+          ? change.diff
+          : typeof change.unified_diff === 'string'
+            ? change.unified_diff
+            : '',
+      }))
+  }
+
+  if (!['Write', 'Edit', 'NotebookEdit', 'MultiEdit'].includes(tool)) return []
+  const path = input.file_path ?? input.path ?? input.notebook_path
+  return [{
+    tool,
+    path: typeof path === 'string' && path ? path : '?',
+    body: writeBodyFromToolInput(tool, input),
+  }]
 }

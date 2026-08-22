@@ -21,12 +21,6 @@ export type TokenSourceAgent = 'claude' | 'codex'
 /** 已知 kinds(文档用;TokenSource.kind 是 string,加新 source 不必扩这里)。 */
 export type TokenSourceKind = 'codex-subscription' | 'glm-coding-plan' | 'claude-native'
 
-export interface TokenSourceCapabilities {
-  /** 支持 resumeSessionAt / fork(claude=true, codex=false —— codex 无此能力) */
-  resumeSessionAt: boolean
-  fork: boolean
-}
-
 /** 该账号下可选的具体模型(codex 订阅 7 个、glm 账号 8 个) */
 export interface TokenSourceModel {
   model: string
@@ -91,7 +85,6 @@ export interface TokenSource {
   /** 绑定哪个 agent 进程(协议强制:claude 走 Anthropic,codex 走 OpenAI/app-server) */
   agent: TokenSourceAgent
   display: string
-  capabilities: TokenSourceCapabilities
   /** 配没配凭据(面板据此决定可选 vs 灰显「启用」)。廉价同步信号:
    *  codex 看 ~/.codex 登录态;glm 看 config 有没有 token。精确有效性在 spawn/查额度时暴露。 */
   enabled: boolean

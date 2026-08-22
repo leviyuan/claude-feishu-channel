@@ -206,7 +206,7 @@ function cardActionSemanticKey(data: any): string {
     case 'worktree_disband': resource = { slug: value.slug }; break
     case 'temp_fork_select':
     case 'temp_back_select':
-    case 'temp_resume_select': resource = null; break
+    case 'temp_resume_select': resource = { panel_id: value.panel_id }; break
     case 'tasklist_delete_prompt':
     case 'tasklist_delete_confirm': resource = { guid: value.guid }; break
     case 'tasklist_enable': resource = { guid: value.guid, project: value.project, panel_id: value.panel_id }; break

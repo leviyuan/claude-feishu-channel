@@ -138,7 +138,6 @@ registerTokenSourceFactory({
       kind: 'deepseek',
       agent: 'claude',
       display: cfg.display?.trim() || 'DeepSeek',
-      capabilities: { resumeSessionAt: true, fork: true },
       enabled,
       models: [],
       defaultModel: cfgDefaultModel ?? '',

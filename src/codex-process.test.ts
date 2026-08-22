@@ -35,6 +35,55 @@ function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {})
   return proc
 }
 
+type ProtocolCall = { method: string; params: any }
+
+function makeCodexProtocolHarness(
+  opts: Record<string, unknown> = {},
+  respond?: (method: string, params: any) => any | Promise<any>,
+): { proc: any; calls: ProtocolCall[]; writes: any[]; events: Array<[string, any]> } {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const calls: ProtocolCall[] = []
+  const writes: any[] = []
+  const events: Array<[string, any]> = []
+  proc.opts = { workDir: '/repo', ...opts }
+  proc.readyPromise = null
+  proc.initializePromise = null
+  proc.currentTurnId = null
+  proc.sessionId = null
+  proc.lastCompletedTurnId = null
+  proc.lastUsage = null
+  proc.lastResult = {
+    cost_usd: null,
+    cost_delta_usd: null,
+    duration_ms: null,
+    num_turns: null,
+    usage: null,
+    subtype: null,
+    is_error: false,
+  }
+  proc.write = (message: any) => {
+    writes.push(message)
+    return true
+  }
+  proc.request = async (method: string, params: any) => {
+    calls.push({ method, params })
+    if (respond) return respond(method, params)
+    if (method === 'initialize') return {}
+    if (method === 'thread/start') return { thread: { id: 'fresh-thread', cwd: '/repo' } }
+    if (method === 'thread/resume') return { thread: { id: params.threadId, cwd: '/repo' } }
+    if (method === 'thread/fork') return { thread: { id: 'forked-thread', cwd: '/repo' } }
+    if (method === 'model/list' || method === 'thread/list') return { data: [], nextCursor: null }
+    throw new Error(`unexpected request ${method}`)
+  }
+  proc.primeRolloutImageGenerationScan = () => {}
+  proc.flushRolloutImageGenerations = () => {}
+  proc.emit = (event: string, payload: any) => {
+    events.push([event, payload])
+    return true
+  }
+  return { proc, calls, writes, events }
+}
+
 describe('codex JSON-RPC lifecycle reliability', () => {
   test('registers pending before write and clears its timeout on response', async () => {
     let written = ''
@@ -107,6 +156,382 @@ describe('codex JSON-RPC lifecycle reliability', () => {
 
     await expect(proc.kill(2)).rejects.toThrow('did not exit after SIGTERM and SIGKILL')
     expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+  })
+})
+
+describe('codex app-server conversation protocol', () => {
+  test('catalog and main launch share one initialize handshake and send initialized once', async () => {
+    let releaseInitialize!: () => void
+    const initializeGate = new Promise<void>(resolve => { releaseInitialize = resolve })
+    const { proc, calls, writes } = makeCodexProtocolHarness({}, async (method, _params) => {
+      if (method === 'initialize') {
+        await initializeGate
+        return {}
+      }
+      if (method === 'thread/start') return { thread: { id: 'main-thread', cwd: '/repo' } }
+      if (method === 'model/list') return { data: [], nextCursor: null }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    const main = proc.initializeAndStartThread()
+    const catalog = proc.listModels()
+    await Promise.resolve()
+    expect(calls.filter(c => c.method === 'initialize')).toHaveLength(1)
+
+    releaseInitialize()
+    await expect(Promise.all([main, catalog])).resolves.toEqual([undefined, []])
+    expect(calls.filter(c => c.method === 'initialize')).toHaveLength(1)
+    expect(writes).toEqual([{ method: 'initialized' }])
+    expect(calls.findIndex(c => c.method === 'initialize')).toBeLessThan(calls.findIndex(c => c.method === 'thread/start'))
+    expect(calls.findIndex(c => c.method === 'initialize')).toBeLessThan(calls.findIndex(c => c.method === 'model/list'))
+  })
+
+  test('does not issue catalog requests when the initialized notification cannot be written', async () => {
+    const { proc, calls } = makeCodexProtocolHarness()
+    proc.write = () => false
+
+    await expect(proc.listModels()).rejects.toThrow('initialized notification write failed')
+    expect(calls.filter(c => c.method === 'initialize')).toHaveLength(1)
+    expect(calls.some(c => c.method === 'model/list')).toBe(false)
+  })
+
+  test('maps an explicit fresh launch to thread/start', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'fresh' },
+    })
+
+    await proc.initializeAndStartThread()
+    const launches = calls.filter(c => c.method.startsWith('thread/'))
+    expect(launches).toHaveLength(1)
+    expect(launches[0].method).toBe('thread/start')
+    expect(launches[0].params).not.toHaveProperty('threadId')
+    expect(proc.sessionId).toBe('fresh-thread')
+  })
+
+  test('maps explicit resume to thread/resume', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'explicit-thread', cwd: '/repo' } },
+    })
+    await proc.initializeAndStartThread()
+    expect(calls.find(c => c.method === 'thread/resume')?.params).toMatchObject({
+      threadId: 'explicit-thread', cwd: '/repo', excludeTurns: true,
+    })
+  })
+
+  test('maps a Codex turn checkpoint to thread/fork lastTurnId', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: {
+        kind: 'fork',
+        source,
+        through: { provider: 'codex', kind: 'turn', id: 'turn-7', source },
+      },
+    })
+
+    await proc.initializeAndStartThread()
+    expect(calls.find(c => c.method === 'thread/fork')?.params).toMatchObject({
+      threadId: 'source-thread',
+      lastTurnId: 'turn-7',
+      cwd: '/repo',
+      excludeTurns: true,
+    })
+    expect(proc.sessionId).toBe('forked-thread')
+  })
+
+  test('rejects a non-turn fork checkpoint before sending thread/fork', async () => {
+    const source = { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: {
+        kind: 'fork',
+        source,
+        through: { provider: 'codex', kind: 'assistant-message', id: 'message-1', source },
+      },
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('must be a codex turn checkpoint')
+    expect(calls.some(c => c.method === 'thread/fork')).toBe(false)
+  })
+
+  test('rejects a fork response that reuses the source id without falling back', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'fork', source },
+    }, async (method, params) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/fork') return { thread: { id: params.threadId, cwd: '/repo' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('returned source thread id')
+    expect(calls.filter(c => c.method === 'thread/fork')).toHaveLength(1)
+    expect(calls.some(c => c.method === 'thread/resume' || c.method === 'thread/start')).toBe(false)
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('rejects a fork response without a new thread id', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'fork', source },
+    }, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/fork') return { thread: { cwd: '/repo' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('thread/fork returned no thread.id')
+    expect(calls.some(c => c.method === 'thread/resume' || c.method === 'thread/start')).toBe(false)
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('rejects a launch response for a different cwd before exposing the thread id', async () => {
+    const { proc } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') return { thread: { id: 'wrong-cwd-thread', cwd: '/other' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('returned cwd=/other, expected /repo')
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('turn/start response and notification share one canonical transition', async () => {
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') return { turn: { id: 'turn-response' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+
+    await proc.startTurn('hello')
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-response' },
+    })
+
+    expect(proc.currentTurnId).toBe('turn-response')
+    expect(events.filter(([event]) => event === 'turn_started')).toEqual([
+      ['turn_started', { turn_id: 'turn-response', thread_id: 'main-thread' }],
+    ])
+  })
+
+  test('does not revive a completed turn when its turn/start response arrives late', async () => {
+    let resolveStart!: (value: any) => void
+    const startResponse = new Promise<any>(resolve => { resolveStart = resolve })
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') return startResponse
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+    proc.lastCompletedTurnId = 'previous-turn'
+
+    const pending = proc.startTurn('fast turn')
+    await Promise.resolve()
+    expect(proc.lastCompletedTurnId).toBeNull()
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'fast-turn' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'fast-turn', status: 'completed', durationMs: 1 },
+    })
+    resolveStart({ turn: { id: 'fast-turn' } })
+    await pending
+
+    expect(proc.currentTurnId).toBeNull()
+    expect(proc.lastCompletedTurnId).toBe('fast-turn')
+    expect(events.filter(([event]) => event === 'turn_started')).toHaveLength(1)
+  })
+
+  test('ignores an old request timeout after its turn completed and the next turn started', async () => {
+    let rejectFirst!: (error: Error) => void
+    let resolveSecond!: (value: any) => void
+    const firstResponse = new Promise<any>((_resolve, reject) => { rejectFirst = reject })
+    const secondResponse = new Promise<any>(resolve => { resolveSecond = resolve })
+    let requestIndex = 0
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
+      requestIndex += 1
+      return requestIndex === 1 ? firstResponse : secondResponse
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+
+    proc.sendUserText('first')
+    await Promise.resolve()
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'first-turn' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'first-turn', status: 'completed', durationMs: 1 },
+    })
+
+    proc.sendUserText('second')
+    await Promise.resolve()
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'second-turn' },
+    })
+
+    rejectFirst(new Error('turn/start request timed out'))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(proc.currentTurnId).toBe('second-turn')
+    expect(proc.lastResult.is_error).toBe(false)
+    expect(events.filter(([event]) => event === 'result')).toEqual([
+      ['result', expect.objectContaining({ turn_id: 'first-turn', is_error: false })],
+    ])
+
+    resolveSecond({ turn: { id: 'second-turn' } })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(proc.currentTurnId).toBe('second-turn')
+    expect(events.filter(([event]) => event === 'turn_started')).toHaveLength(2)
+  })
+
+  test('still reports a turn/start rejection owned by the current generation', async () => {
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') throw new Error('current request failed')
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+
+    proc.sendUserText('will fail')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(proc.currentTurnId).toBeNull()
+    expect(events.filter(([event]) => event === 'result')).toEqual([
+      ['result', expect.objectContaining({
+        subtype: 'codex_turn_start_failed',
+        is_error: true,
+        error: 'current request failed',
+      })],
+    ])
+  })
+
+  test('records the canonical main-thread turn/completed id publicly', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-9'
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-9', status: 'completed', durationMs: 25 },
+    })
+
+    expect(proc.lastCompletedTurnId).toBe('turn-9')
+    expect(proc.currentTurnId).toBeNull()
+    expect(events.filter(([event]) => event === 'result')).toEqual([
+      ['result', expect.objectContaining({
+        turn_id: 'turn-9',
+        checkpoint: {
+          provider: 'codex',
+          kind: 'turn',
+          id: 'turn-9',
+          source: { provider: 'codex', sessionId: 'main-thread', cwd: '/repo' },
+        },
+      })],
+    ])
+  })
+
+  test('failed or malformed terminal turns cannot reuse an earlier checkpoint', () => {
+    for (const turn of [
+      { id: 'failed-turn', status: 'failed', error: { type: 'model_error' } },
+      { status: 'completed' },
+    ]) {
+      const { proc, events } = makeCodexProtocolHarness()
+      proc.sessionId = 'main-thread'
+      proc.lastCompletedTurnId = 'previous-turn'
+      proc.handleNotification('turn/completed', { threadId: 'main-thread', turn })
+
+      expect(proc.lastCompletedTurnId).toBeNull()
+      expect(events.find(([event]) => event === 'result')?.[1].checkpoint).toBeNull()
+    }
+  })
+
+  test('lists exact-cwd interactive conversations across every page without over-filtering their source', async () => {
+    const { proc, calls, writes } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list' && params.cursor === null) {
+        return {
+          data: [{ id: 'newer', cwd: '/repo', preview: 'new task', updatedAt: 1_777_000_000, status: { type: 'idle' } }],
+          nextCursor: 'page-2',
+        }
+      }
+      if (method === 'thread/list' && params.cursor === 'page-2') {
+        return {
+          data: [{ id: 'older', cwd: '/repo', preview: 'old task', updatedAt: 1_776_000_000, status: { type: 'systemError' } }],
+          nextCursor: null,
+        }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.listConversations()).resolves.toEqual([
+      { provider: 'codex', sessionId: 'newer', cwd: '/repo', preview: 'new task', ts: 1_777_000_000_000, status: 'idle' },
+      { provider: 'codex', sessionId: 'older', cwd: '/repo', preview: 'old task', ts: 1_776_000_000_000, status: 'systemError' },
+    ])
+    expect(calls.filter(c => c.method === 'thread/list').map(c => c.params)).toEqual([
+      {
+        cursor: null,
+        limit: 100,
+        sortKey: 'updated_at',
+        sortDirection: 'desc',
+        cwd: '/repo',
+      },
+      {
+        cursor: 'page-2',
+        limit: 100,
+        sortKey: 'updated_at',
+        sortDirection: 'desc',
+        cwd: '/repo',
+      },
+    ])
+    expect(writes).toEqual([{ method: 'initialized' }])
+    expect(calls.some(c => c.method === 'thread/start')).toBe(false)
+  })
+
+  test('surfaces thread/list transport and malformed-response failures', async () => {
+    const failed = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list') throw new Error('list unavailable')
+      throw new Error(`unexpected request ${method}`)
+    }).proc
+    await expect(failed.listConversations()).rejects.toThrow('list unavailable')
+
+    const malformed = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list') return { nextCursor: null }
+      throw new Error(`unexpected request ${method}`)
+    }).proc
+    await expect(malformed.listConversations()).rejects.toThrow('no data array')
+
+    const wrongCwd = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list') {
+        return { data: [{ id: 'wrong', cwd: '/other', preview: 'x', updatedAt: 1 }], nextCursor: null }
+      }
+      throw new Error(`unexpected request ${method}`)
+    }).proc
+    await expect(wrongCwd.listConversations()).rejects.toThrow('invalid thread summary')
+  })
+
+  test('resolves a legacy resume id through stable thread/read cwd metadata', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/read') return { thread: { id: params.threadId, cwd: '/repo' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+    await expect(proc.readConversationRef('legacy-thread')).resolves.toEqual({
+      provider: 'codex', sessionId: 'legacy-thread', cwd: '/repo',
+    })
+    expect(calls.find(call => call.method === 'thread/read')?.params).toEqual({
+      threadId: 'legacy-thread', includeTurns: false,
+    })
   })
 })
 

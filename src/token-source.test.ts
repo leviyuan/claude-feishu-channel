@@ -13,7 +13,6 @@ function source(id: string, refresh: () => Promise<void>): TokenSource {
     kind: 'test',
     agent: 'claude',
     display: id,
-    capabilities: { resumeSessionAt: true, fork: true },
     enabled: true,
     models: [],
     defaultModel: '',

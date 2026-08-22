@@ -60,6 +60,8 @@ export interface AgentProcess extends EventEmitter {
   readonly tokenSourceId: string | null
   sessionId: string | null
   lastAssistantUuid: string | null
+  /** Canonical completed turn id when the backend exposes turn-granular forks (Codex). */
+  lastCompletedTurnId?: string | null
   lastModel: string | null
   lastEffort: AgentReasoningEffort | null
   lastUsage: CodexUsage | null

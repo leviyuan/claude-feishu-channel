@@ -112,12 +112,14 @@ describe('card action identity', () => {
   test('collapses every choice from one menu/temp source card into one stage', () => {
     expect(cardActionDedupeKey(data({ kind: 'menu', request_id: 'menu-1', choice: 0 })))
       .toBe(cardActionDedupeKey(data({ kind: 'menu', request_id: 'menu-1', choice: 2 })))
-    expect(cardActionDedupeKey(data({ kind: 'temp_fork_select', anchorIdx: 0 })))
-      .toBe(cardActionDedupeKey(data({ kind: 'temp_fork_select', anchorIdx: 3 })))
-    expect(cardActionDedupeKey(data({ kind: 'temp_back_select', anchorIdx: 1 })))
-      .toBe(cardActionDedupeKey(data({ kind: 'temp_back_select', anchorIdx: 4 })))
-    expect(cardActionDedupeKey(data({ kind: 'temp_resume_select', sessionId: 'session-a' })))
-      .toBe(cardActionDedupeKey(data({ kind: 'temp_resume_select', sessionId: 'session-b' })))
+    expect(cardActionDedupeKey(data({ kind: 'temp_fork_select', panel_id: 'fork-panel', choice_id: 'a' })))
+      .toBe(cardActionDedupeKey(data({ kind: 'temp_fork_select', panel_id: 'fork-panel', choice_id: 'b' })))
+    expect(cardActionDedupeKey(data({ kind: 'temp_back_select', panel_id: 'back-panel', choice_id: 'a' })))
+      .toBe(cardActionDedupeKey(data({ kind: 'temp_back_select', panel_id: 'back-panel', choice_id: 'b' })))
+    expect(cardActionDedupeKey(data({ kind: 'temp_resume_select', panel_id: 'resume-panel', choice_id: 'a' })))
+      .toBe(cardActionDedupeKey(data({ kind: 'temp_resume_select', panel_id: 'resume-panel', choice_id: 'b' })))
+    expect(cardActionDedupeKey(data({ kind: 'temp_fork_select', panel_id: 'fork-panel-a', choice_id: 'x' })))
+      .not.toBe(cardActionDedupeKey(data({ kind: 'temp_fork_select', panel_id: 'fork-panel-b', choice_id: 'x' })))
   })
 
   test('keeps independent ask questions distinct', () => {

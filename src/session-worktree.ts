@@ -7,7 +7,7 @@ import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
 export function worktreeProjectName(s: Session): string {
-  return worktree.projectNameFromSessionName(s.sessionName)
+  return worktree.projectNameFromSessionName(feishu.tempProjectName(s.sessionName) ?? s.sessionName)
 }
 
 export function worktreeProjectDir(s: Session): string {
@@ -15,10 +15,11 @@ export function worktreeProjectDir(s: Session): string {
 }
 
 export function worktreeSessionDir(s: Session): string {
+  const sessionName = feishu.tempProjectName(s.sessionName) ?? s.sessionName
   const projectName = worktreeProjectName(s)
   const projectDir = feishu.resolveProjectDir(projectName)
-  if (projectName === s.sessionName) return projectDir
-  const slug = s.sessionName.slice(projectName.length + 1, -1)
+  if (projectName === sessionName) return projectDir
+  const slug = sessionName.slice(projectName.length + 1, -1)
   return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 

@@ -67,11 +67,13 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
-/** Per-session turn 锚点列表:每条 = {本 turn 最后 assistant uuid, 用户输入预览, 时间}。
- *  fk/bk 用它列"用户输入前的分界点";rs 空闲模式用它列项目最近 24h 会话。
+/** Per-session branch baseline + backend-native turn checkpoints + durable pending Claude fork。
+ *  fk/bk 用它列"用户输入前的分界点"；rs 历史由各 backend 自己发现。
  *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
+/** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
+export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
  *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow

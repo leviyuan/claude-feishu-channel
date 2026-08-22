@@ -10,7 +10,7 @@
 - Claude 进程使用 Agent SDK `query()` streaming input。`permissionMode: default` 下普通工具由 `canUseTool` 明确放行，AskUserQuestion 必须等待飞书回答；`task_*`、`compact_boundary`、resume/fork 与 project profile 行为不可在通用事件归一化时丢失。
 - Token Source 通过 factory 自注册并拥有 enabled、模型刷新、spawn env、模型解析、setting sources 和额度。GLM/DeepSeek 注入凭据前要 scrub 其他 Anthropic env，默认只读 project/local settings；native 才读取 user settings。跨 source 即使同属 Claude，也必须换进程才能更换 base URL/凭据。
 - 模型面板是 source→model→effort。同 provider/source 的设置调用 `setModelSettings`；Claude 下一轮生效，Codex 仍需 restart 才应用持久目标。跨 provider/source 或 Claude profile 切换在 turn/开卡/排队期间拒绝，空闲时终止不匹配进程；resume id 按 provider 隔离。
-- `fk`/`bk`/空闲 `rs` 依赖 Claude 原生 fork/resume 能力与 `~/.claude/projects/<encoded-cwd>/*.jsonl`，并用 cwd 隔离项目。不要把它误写成 Codex app-server 能力，也不要恢复会漏历史或误归 worktree 的自建 resume 索引。
+- `fk`/`bk`/进程已停时的 `rs` 使用 backend-native 会话能力：Claude 以 transcript + `forkSession/resumeSessionAt` 实现，Codex 以 app-server `thread/list` + `thread/fork(lastTurnId)` 实现。共享 checkpoint 必须携带 provider、源会话 id 与原生锚点；Claude fork 在首条输入前必须持久化 pending launch，materialize 新 session id 后才能清除。禁止扫描/复制 Codex rollout、重建旁路索引或把 fork 失败静默退化成 resume。
 - 所有生产 Card Kit mutation 经 `cardkit.ts` 的 per-card queue 和执行时 sequence。必须知道写入结果的事务使用 checked API；普通 fire-and-forget 调用不能用于决定 rendered/持久状态是否成功。
 - `math-render.ts` 在共享的 Markdown code-range 解析之外识别公式：简单 inline 转 Unicode，复杂 inline 与 display 用 MathJax→SVG→Resvg 生成图片；CJK 使用 SVG `<text>` 与平台系统字体链，禁止恢复字符占位/path swap。
 - 公式结果是严格按源码顺序的 markdown/image blocks。含公式的 assistant 段以固定 segment id 的顶层 `column_set` 承载 raw markdown，渲染完成后用一次 checked PUT 原子替换子元素链；渲染、上传或 PUT 失败都保留原始 LaTeX，不能逐图顶层追加或因增强失败触发整卡换卡。turn close/rotation 按 cardId 等待 math in-flight，成功后才标记 rendered。

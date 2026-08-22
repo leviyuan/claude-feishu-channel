@@ -28,6 +28,12 @@ import {
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 import { shellCommandDescription } from './cards/shell-command'
 import type { AgentReasoningEffort } from './agent-process'
+import {
+  validateConversationLaunch,
+  type ConversationLaunch,
+  type ConversationRef,
+  type ConversationSummary,
+} from './conversation'
 import type {
   BgTaskSettledEvent,
   BgTaskStartedEvent,
@@ -79,7 +85,8 @@ const CODEX_REQUEST_TIMEOUT_MS = 30_000
 
 export interface SpawnOpts {
   workDir: string
-  resumeSessionId?: string
+  /** Explicit backend conversation lifecycle. */
+  launch?: ConversationLaunch
   model?: string
   effort?: CodexReasoningEffort
   appendSystemPrompt?: string
@@ -235,6 +242,13 @@ type ServerRequestState = {
   params: any
 }
 
+type TurnStartAttempt = {
+  generation: number
+  turnId: string | null
+  confirmed: boolean
+  terminal: boolean
+}
+
 export class CodexProcess extends EventEmitter {
   readonly provider = 'codex' as const
   readonly tokenSourceId: string | null
@@ -250,8 +264,14 @@ export class CodexProcess extends EventEmitter {
   private resolveExit!: () => void
   private opts: SpawnOpts
   private readyPromise: Promise<void> | null = null
-  private catalogInitPromise: Promise<void> | null = null
+  private initializePromise: Promise<void> | null = null
   private currentTurnId: string | null = null
+  private turnStartGeneration = 0
+  private turnStartOwner: TurnStartAttempt | null = null
+  private turnStartOwnersByTurnId = new Map<string, TurnStartAttempt>()
+  /** Bounded terminal-turn memory prevents a late turn/start response from
+   * reviving a turn whose turn/completed notification already arrived. */
+  private finishedTurnIds = new Set<string>()
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
   private rolloutLineRemainder = ''
@@ -272,6 +292,8 @@ export class CodexProcess extends EventEmitter {
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
+  /** Canonical app-server turn id from the latest main-thread turn/completed notification. */
+  lastCompletedTurnId: string | null = null
   lastModel: string | null = null
   lastEffort: CodexReasoningEffort | null = null
   lastUsage: CodexUsage | null = null
@@ -473,18 +495,25 @@ export class CodexProcess extends EventEmitter {
         return
       }
       case 'turn/started': {
-        this.currentTurnId = params.turn?.id ?? null
-        this.emit('turn_started', {
-          turn_id: this.currentTurnId,
-          thread_id: params.threadId ?? this.sessionId,
-        })
+        this.recordTurnStarted(params.turn, params.threadId ?? this.sessionId, 'turn/started notification')
         return
       }
       case 'turn/completed': {
         this.flushRolloutImageGenerations()
         const turn = params.turn ?? {}
+        const completedTurnId = typeof turn.id === 'string' && turn.id ? turn.id : null
+        if (completedTurnId) {
+          this.markTurnStartTerminal(completedTurnId)
+          this.rememberFinishedTurn(completedTurnId)
+        } else {
+          logUnhandledAppServerPayload('TURN_COMPLETED_MISSING_ID', { method, params })
+        }
         const status = turn.status
         const isError = status === 'failed' || !!turn.error
+        const isCheckpointable = status === 'completed' && !isError && !!completedTurnId
+        // Never leave a previous turn's checkpoint visible on a failed,
+        // interrupted, or malformed terminal notification.
+        this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
         const subtype = isError ? (turn.error?.type ?? turn.error?.message ?? 'failed') : 'success'
         this.lastResult = {
           cost_usd: null,
@@ -496,7 +525,21 @@ export class CodexProcess extends EventEmitter {
           is_error: isError,
         }
         this.currentTurnId = null
-        this.emit('result', { subtype, is_error: isError, duration_ms: this.lastResult.duration_ms, usage: this.lastUsage })
+        this.emit('result', {
+          subtype,
+          is_error: isError,
+          duration_ms: this.lastResult.duration_ms,
+          usage: this.lastUsage,
+          turn_id: completedTurnId,
+          checkpoint: isCheckpointable && this.sessionId
+            ? {
+                provider: 'codex',
+                kind: 'turn',
+                id: completedTurnId,
+                source: { provider: 'codex', sessionId: this.sessionId, cwd: this.opts.workDir },
+              }
+            : null,
+        })
         return
       }
       case 'turn/plan/updated': {
@@ -1161,7 +1204,7 @@ export class CodexProcess extends EventEmitter {
    *  (2026-08-20 源码核实:上游缺 meter 名时 codex 解析器强补 "codex"),
    *  额度状态只认 read。须在 initialize 之后调用。 */
   async readRateLimits(): Promise<any> {
-    await this.readyPromise
+    await this.ensureInitialized()
     return this.request('account/rateLimits/read', {})
   }
 
@@ -1172,41 +1215,90 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  private async ensureCatalogReady(): Promise<void> {
-    if (this.readyPromise) {
-      await this.readyPromise
-      return
+  /** Initialize this app-server transport exactly once, then complete the
+   * JSON-RPC handshake before any catalog or thread request is sent. */
+  private async ensureInitialized(): Promise<void> {
+    if (!this.initializePromise) {
+      this.initializePromise = this.request('initialize', this.initializeParams()).then(() => {
+        if (!this.write({ method: 'initialized' })) {
+          throw new Error('codex app-server initialized notification write failed')
+        }
+      })
     }
-    if (!this.catalogInitPromise) {
-      this.catalogInitPromise = this.request('initialize', this.initializeParams()).then(() => {})
-    }
-    await this.catalogInitPromise
+    await this.initializePromise
   }
 
   private async initializeAndStartThread(): Promise<void> {
-    await this.request('initialize', this.initializeParams())
+    const launch = this.conversationLaunch()
+    await this.ensureInitialized()
 
     const params = this.threadParams()
-    const res = this.opts.resumeSessionId
-      ? await this.request('thread/resume', {
-          threadId: this.opts.resumeSessionId,
-          ...params,
-          excludeTurns: true,
-          persistExtendedHistory: false,
-        })
-      : await this.request('thread/start', {
-          ...params,
-          experimentalRawEvents: false,
-          persistExtendedHistory: false,
-        })
+    let method: 'thread/start' | 'thread/resume' | 'thread/fork'
+    let res: any
+    if (launch.kind === 'resume') {
+      method = 'thread/resume'
+      res = await this.request(method, {
+        threadId: launch.source.sessionId,
+        ...params,
+        excludeTurns: true,
+        persistExtendedHistory: false,
+      })
+    } else if (launch.kind === 'fork') {
+      method = 'thread/fork'
+      res = await this.request(method, {
+        threadId: launch.source.sessionId,
+        ...(launch.through ? { lastTurnId: launch.through.id } : {}),
+        ...params,
+        excludeTurns: true,
+      })
+    } else {
+      method = 'thread/start'
+      res = await this.request(method, {
+        ...params,
+        experimentalRawEvents: false,
+        persistExtendedHistory: false,
+      })
+    }
     const thread = res?.thread
-    this.sessionId = thread?.id ?? this.opts.resumeSessionId ?? null
+    if (typeof thread?.id !== 'string' || !thread.id) {
+      throw new Error(`codex app-server ${method} returned no thread.id`)
+    }
+    const returnedCwd = typeof thread.cwd === 'string'
+      ? thread.cwd
+      : typeof res?.cwd === 'string'
+        ? res.cwd
+        : null
+    if (returnedCwd !== this.opts.workDir) {
+      throw new Error(`codex app-server ${method} returned cwd=${returnedCwd ?? 'MISS'}, expected ${this.opts.workDir}`)
+    }
+    if (launch.kind === 'fork' && thread.id === launch.source.sessionId) {
+      throw new Error(`codex app-server thread/fork returned source thread id ${thread.id}`)
+    }
+    this.sessionId = thread.id
     if (res?.model) this.lastModel = res.model
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort ?? null
     log(`codex-process: thread=${this.sessionId}`)
     this.primeRolloutImageGenerationScan()
     this.emit('init', { session_id: this.sessionId, thread })
+  }
+
+  private conversationLaunch(): ConversationLaunch {
+    const launch: ConversationLaunch = this.opts.launch
+      ?? { kind: 'fresh' }
+    validateConversationLaunch(launch, 'codex', this.opts.workDir)
+    if (launch.kind !== 'fresh' && (typeof launch.source.sessionId !== 'string' || !launch.source.sessionId)) {
+      throw new Error(`codex ${launch.kind} launch requires a source session id`)
+    }
+    if (launch.kind === 'fork' && launch.through) {
+      if (launch.through.provider !== 'codex' || launch.through.kind !== 'turn') {
+        throw new Error('codex fork through checkpoint must be a codex turn checkpoint')
+      }
+      if (typeof launch.through.id !== 'string' || !launch.through.id) {
+        throw new Error('codex fork through checkpoint requires a turn id')
+      }
+    }
+    return launch
   }
 
   private threadParams(): Record<string, unknown> {
@@ -1236,11 +1328,12 @@ export class CodexProcess extends EventEmitter {
 
   sendUserText(text: string, files: string[] = []): void {
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
-    void this.startTurn(fileHints + text).catch(e => this.failTurnStart(e))
+    const attempt = this.beginTurnStart()
+    void this.startTurn(fileHints + text, attempt).catch(e => this.failTurnStart(e, attempt))
   }
 
   async listModels(): Promise<CodexModel[]> {
-    await this.ensureCatalogReady()
+    await this.ensureInitialized()
     const models: CodexModel[] = []
     let cursor: string | null = null
     do {
@@ -1270,6 +1363,77 @@ export class CodexProcess extends EventEmitter {
       cursor = typeof res?.nextCursor === 'string' && res.nextCursor ? res.nextCursor : null
     } while (cursor)
     return models
+  }
+
+  /** List persisted Codex interactive conversations for this exact cwd.
+   * App-server owns discovery and pagination; Lodestar does not scan rollouts
+   * or substitute a second session index. `sourceKinds` is intentionally
+   * omitted: current app-server can persist Lodestar-created threads as `vscode`,
+   * and the protocol-defined default already selects interactive sources while
+   * excluding sub-agent-only histories. */
+  async listConversations(): Promise<ConversationSummary[]> {
+    await this.ensureInitialized()
+    const conversations: ConversationSummary[] = []
+    const seenCursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const res = await this.request('thread/list', {
+        cursor,
+        limit: 100,
+        sortKey: 'updated_at',
+        sortDirection: 'desc',
+        cwd: this.opts.workDir,
+      })
+      if (!Array.isArray(res?.data)) {
+        throw new Error('thread/list returned no data array')
+      }
+      for (const raw of res.data) {
+        if (
+          typeof raw?.id !== 'string' || !raw.id
+          || typeof raw.preview !== 'string'
+          || typeof raw.updatedAt !== 'number' || !Number.isFinite(raw.updatedAt)
+          || typeof raw.cwd !== 'string' || raw.cwd !== this.opts.workDir
+        ) {
+          throw new Error('thread/list returned an invalid thread summary')
+        }
+        const status = typeof raw.status === 'string'
+          ? raw.status
+          : typeof raw.status?.type === 'string'
+            ? raw.status.type
+            : undefined
+        conversations.push({
+          provider: 'codex',
+          sessionId: raw.id,
+          cwd: raw.cwd,
+          preview: raw.preview,
+          // app-server timestamps are Unix seconds; card/history callers use ms.
+          ts: raw.updatedAt * 1000,
+          ...(status ? { status } : {}),
+        })
+      }
+      const nextCursor = res?.nextCursor
+      if (nextCursor !== null && typeof nextCursor !== 'string') {
+        throw new Error('thread/list returned an invalid nextCursor')
+      }
+      if (nextCursor && seenCursors.has(nextCursor)) {
+        throw new Error(`thread/list repeated pagination cursor ${nextCursor}`)
+      }
+      if (nextCursor) seenCursors.add(nextCursor)
+      cursor = nextCursor
+    } while (cursor)
+    return conversations
+  }
+
+  /** Resolve one legacy resume id to its authoritative stored cwd without loading it. */
+  async readConversationRef(sessionId: string): Promise<ConversationRef> {
+    if (!sessionId.trim()) throw new Error('thread/read requires a session id')
+    await this.ensureInitialized()
+    const res = await this.request('thread/read', { threadId: sessionId, includeTurns: false })
+    const thread = res?.thread
+    if (thread?.id !== sessionId || typeof thread.cwd !== 'string') {
+      throw new Error('thread/read returned an invalid conversation reference')
+    }
+    return { provider: 'codex', sessionId, cwd: thread.cwd }
   }
 
   async injectThreadItems(items: any[]): Promise<void> {
@@ -1303,7 +1467,12 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  private failTurnStart(e: unknown): void {
+  private failTurnStart(e: unknown, attempt: TurnStartAttempt): void {
+    if (!this.ownsTurnStartFailure(attempt)) {
+      log(`codex-process: ignored stale turn/start failure generation=${attempt.generation}`)
+      return
+    }
+    this.turnStartOwner = null
     const message = e instanceof Error ? e.message : String(e)
     log(`codex-process: turn/start failed: ${message}`)
     this.lastResult = {
@@ -1316,6 +1485,7 @@ export class CodexProcess extends EventEmitter {
       is_error: true,
     }
     this.currentTurnId = null
+    this.lastCompletedTurnId = null
     this.emit('result', {
       subtype: this.lastResult.subtype,
       is_error: true,
@@ -1325,17 +1495,112 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  private async startTurn(text: string): Promise<void> {
-    if (!this.readyPromise) this.sendInitialize()
-    await this.readyPromise
-    if (!this.sessionId) throw new Error('codex thread not initialized')
-    await this.request('turn/start', {
-      threadId: this.sessionId,
-      input: [{ type: 'text', text, text_elements: [] }],
-      cwd: this.opts.workDir,
-      approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+  private recordTurnStarted(
+    turn: any,
+    threadId: unknown,
+    source: string,
+    attempt?: TurnStartAttempt,
+  ): void {
+    const turnId = typeof turn?.id === 'string' && turn.id ? turn.id : null
+    if (!turnId) {
+      throw new Error(`codex app-server ${source} returned no turn.id`)
+    }
+    this.confirmTurnStart(turnId, attempt)
+    if (this.finishedTurnIds?.has(turnId)) return
+    // turn/start response and turn/started notification describe the same
+    // transition. Whichever arrives first owns the event; the duplicate only
+    // confirms the canonical id.
+    const changed = this.currentTurnId !== turnId
+    this.currentTurnId = turnId
+    if (!changed) return
+    this.lastCompletedTurnId = null
+    this.emit('turn_started', {
+      turn_id: turnId,
+      thread_id: typeof threadId === 'string' && threadId ? threadId : this.sessionId,
     })
+  }
+
+  private beginTurnStart(): TurnStartAttempt {
+    const attempt: TurnStartAttempt = {
+      generation: (this.turnStartGeneration ?? 0) + 1,
+      turnId: null,
+      confirmed: false,
+      terminal: false,
+    }
+    this.turnStartGeneration = attempt.generation
+    this.turnStartOwner = attempt
+    return attempt
+  }
+
+  private confirmTurnStart(turnId: string, explicitAttempt?: TurnStartAttempt): void {
+    if (!this.turnStartOwnersByTurnId) this.turnStartOwnersByTurnId = new Map()
+    const attempt = explicitAttempt
+      ?? this.turnStartOwnersByTurnId.get(turnId)
+      ?? this.turnStartOwner
+    if (!attempt) return
+    if (attempt.turnId && attempt.turnId !== turnId) {
+      throw new Error(
+        `codex turn/start generation=${attempt.generation} changed turn id from ${attempt.turnId} to ${turnId}`,
+      )
+    }
+    if (attempt.terminal) return
+    attempt.turnId = turnId
+    attempt.confirmed = true
+    this.turnStartOwnersByTurnId.set(turnId, attempt)
+  }
+
+  private markTurnStartTerminal(turnId: string): void {
+    if (!this.turnStartOwnersByTurnId) this.turnStartOwnersByTurnId = new Map()
+    let attempt = this.turnStartOwnersByTurnId.get(turnId)
+    if (!attempt && this.turnStartOwner && (!this.currentTurnId || this.currentTurnId === turnId)) {
+      attempt = this.turnStartOwner
+      this.confirmTurnStart(turnId, attempt)
+    }
+    if (!attempt) return
+    attempt.confirmed = true
+    attempt.terminal = true
+    this.turnStartOwnersByTurnId.delete(turnId)
+    if (this.turnStartOwner === attempt) this.turnStartOwner = null
+  }
+
+  private ownsTurnStartFailure(attempt: TurnStartAttempt): boolean {
+    return this.turnStartOwner === attempt && !attempt.confirmed && !attempt.terminal
+  }
+
+  private rememberFinishedTurn(turnId: string): void {
+    // Object.create(CodexProcess.prototype) test/probe harnesses do not run
+    // class field initializers, so retain lazy initialization here.
+    if (!this.finishedTurnIds) this.finishedTurnIds = new Set<string>()
+    this.finishedTurnIds.add(turnId)
+    if (this.finishedTurnIds.size <= 64) return
+    const oldest = this.finishedTurnIds.values().next().value
+    if (typeof oldest === 'string') this.finishedTurnIds.delete(oldest)
+  }
+
+  private async startTurn(text: string, suppliedAttempt?: TurnStartAttempt): Promise<void> {
+    const attempt = suppliedAttempt ?? this.beginTurnStart()
+    // A turn/start transport failure also emits result; clear the previous
+    // checkpoint before any await so that failure cannot reuse it as an anchor.
+    this.lastCompletedTurnId = null
+    try {
+      if (!this.readyPromise) this.sendInitialize()
+      await this.readyPromise
+      if (!this.sessionId) throw new Error('codex thread not initialized')
+      const res = await this.request('turn/start', {
+        threadId: this.sessionId,
+        input: [{ type: 'text', text, text_elements: [] }],
+        cwd: this.opts.workDir,
+        approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
+      })
+      this.recordTurnStarted(res?.turn, this.sessionId, 'turn/start response', attempt)
+    } catch (e) {
+      if (!this.ownsTurnStartFailure(attempt)) {
+        log(`codex-process: ignored stale turn/start rejection generation=${attempt.generation}`)
+        return
+      }
+      throw e
+    }
   }
 
   sendInterrupt(): void {

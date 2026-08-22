@@ -52,6 +52,12 @@ import {
   createCardActionAdmission,
   createPerChatAdmission,
 } from './src/card-action-runtime'
+import {
+  createTempSessionRuntime,
+  type CreateTempSessionOptions,
+  type CreateTempSessionResult,
+  type DisbandTempSessionResult,
+} from './src/temp-session-runtime'
 
 // ── PID guard ───────────────────────────────────────────────────────────
 // dev 路径 (`bun daemon.ts` 直接跑) 不经过 cli.ts, 所以这里也守一道。
@@ -224,72 +230,34 @@ function writeCurrentAliveMarker(): void {
   feishu.writeAliveMarker(currentAliveSessionNames())
 }
 
+const tempSessionRuntime = createTempSessionRuntime<Session>({
+  registry: sessions,
+  createSession: (sessionName, chatId) => new Session(sessionName, chatId, {
+    onLifecycleChange: writeCurrentAliveMarker,
+    onCreateTempSession: createTempSession,
+    onDisbandTempSession: disbandTempSession,
+  }),
+  ensureChatForSession: feishu.createTempChatForSession,
+  disbandChatForSessionExact: feishu.disbandChatForSessionExact,
+  chatIdForSession: feishu.chatIdForSession,
+  clearSessionConversationState: feishu.clearSessionConversationState,
+  registerTempSessionLease: feishu.registerTempSessionLease,
+  hasTempSessionLease: feishu.hasTempSessionLease,
+  replaceTurnAnchors: feishu.replaceTurnAnchors,
+  runExclusive: (chatId, task) => chatActor.enqueue(chatId, task),
+  log,
+})
+
 function sessionFor(chatId: string, sessionName: string): Session {
-  let s = sessions.get(chatId)
-  if (!s) {
-    s = new Session(sessionName, chatId, {
-      onLifecycleChange: writeCurrentAliveMarker,
-      onCreateTempSession: createTempSession,
-      onDisbandTempSession: disbandTempSession,
-    })
-    sessions.set(chatId, s)
-  }
-  return s
+  return tempSessionRuntime.sessionFor(chatId, sessionName)
 }
 
-/** 建临时群 + 在其中启动 session(btw 干净新会话 / fk 从 resumeSessionAt 锚点 fork)。
- *  SessionOpts 回调,由 session-temp 通过 s.opts 调用。*/
-async function createTempSession(opts: {
-  chatName: string
-  userOpenId: string
-  resumeSessionId?: string
-  resumeSessionAt?: string
-}): Promise<{ ok: boolean; chatId?: string; error?: string }> {
-  try {
-    const ensured = await feishu.ensureChatForSession(opts.chatName, opts.userOpenId)
-    const tempSession = sessionFor(ensured.chatId, opts.chatName)
-    if (tempSession.isRunning()) {
-      return { ok: false, error: `${opts.chatName} 已有会话在跑,先 bye 解散再重试` }
-    }
-    const ok = opts.resumeSessionId
-      ? await tempSession.startForked(opts.resumeSessionId, opts.resumeSessionAt, { announce: true })
-      : await tempSession.start({ announce: true })
-    if (!ok) {
-      // 启动失败:解散刚建的群 + 清 Session,不留半创建状态(群在但没 claude)。
-      try { await feishu.disbandChatForSession(opts.chatName) } catch {}
-      sessions.delete(ensured.chatId)
-      tempSession.dispose()
-      return { ok: false, error: `${tempSession.backendLabel()} 启动失败,已自动解散临时群` }
-    }
-    return { ok: true, chatId: ensured.chatId }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    log(`daemon: createTempSession "${opts.chatName}" failed: ${msg}`)
-    return { ok: false, error: msg }
-  }
+async function createTempSession(opts: CreateTempSessionOptions): Promise<CreateTempSessionResult> {
+  return await tempSessionRuntime.createTempSession(opts)
 }
 
-/** 解散临时群 + 停掉它的 Session + 清锚点(bye 用)。*/
-async function disbandTempSession(chatName: string): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const cid = feishu.chatIdForSession(chatName)
-    if (cid) {
-      const s = sessions.get(cid)
-      // stop() also retries a previously blocked/unconfirmed process stop;
-      // isRunning() intentionally excludes that user stop intent from revive
-      // markers, so it must not be used as the cleanup guard here.
-      if (s) await s.stop('bye 解散', { announce: false })
-      s?.dispose()
-      sessions.delete(cid)
-    }
-    await feishu.disbandChatForSession(chatName)
-    feishu.clearTurnAnchors(chatName)
-    return { ok: true }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    log(`daemon: disbandTempSession "${chatName}" failed: ${msg}`)
-    return { ok: false, error: msg }
-  }
+async function disbandTempSession(chatName: string, expectedChatId: string): Promise<DisbandTempSessionResult> {
+  return await tempSessionRuntime.disbandTempSession(chatName, expectedChatId)
 }
 
 /** Auto-restart any session that was alive when the previous daemon
@@ -587,8 +555,12 @@ function rawCardFromActionResult(result: any): object | null {
 
 /** Internal-only metadata consumed by CardActionAdmission. The wrapper is
  * never returned as the callback ACK, and presentation ignores this field. */
-function withBusinessOutcome(response: any, ok: boolean): any {
-  return { ...response, __businessOk: ok }
+function withBusinessOutcome(response: any, ok: boolean, message?: string): any {
+  return {
+    ...response,
+    __businessOk: ok,
+    ...(message ? { __businessMessage: message } : {}),
+  }
 }
 
 function withNotifyContext(reg: NotifyRegistration, response: any): any {
@@ -631,18 +603,25 @@ async function publishCardActionResult(data: any, result: any): Promise<void> {
   // session actions are admission-validated and use the context id.
   const messageId = String(result?.__cardActionMessageId ?? data?.context?.open_message_id ?? '')
   const card = rawCardFromActionResult(result)
+  const businessFailure = result?.__businessOk === false && typeof result?.__businessMessage === 'string'
+    ? ` 业务失败: ${result.__businessMessage.replace(/\s+/g, ' ').trim().slice(0, 300)}。`
+    : ''
   if (card && messageId) {
     try {
       await feishu.updateCard(messageId, card)
       return
     } catch (e) {
       log(`card-action: ${kind} original-card update failed: ${e instanceof Error ? e.message : e}`)
-      await sendActionReceipt(chatId, `⚠️ ${label}已处理，但原卡更新失败。请重新打开操作面板。`)
+      const recovery = kind === 'temp_resume_select'
+        ? '请发送 rs 查看当前状态。'
+        : '请重新打开操作面板。'
+      await sendActionReceipt(chatId, `⚠️ ${label}已处理，但原卡更新失败。${businessFailure}${recovery}`)
       return
     }
   }
   if (card) {
-    await sendActionReceipt(chatId, `⚠️ ${label}已处理，但回调缺少原卡 message_id，无法更新。`)
+    const recovery = kind === 'temp_resume_select' ? '请发送 rs 查看当前状态。' : ''
+    await sendActionReceipt(chatId, `⚠️ ${label}已处理，但回调缺少原卡 message_id，无法更新。${businessFailure}${recovery}`)
     return
   }
   // Push-mode notify callbacks own their two-phase visible card update. Other
@@ -844,22 +823,30 @@ async function handleCardAction(data: any): Promise<any> {
       return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'temp_fork_select': {
-      const result = await session.onForkSelect(Number(value.anchorIdx ?? -1), userId)
-      return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
-        title: '🔱 会话分叉', message: result.message, ok: result.ok,
-      })), result.ok)
+      const result = await session.onForkSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
+      return withBusinessOutcome(result.replaceCard === false
+        ? { toast: { type: 'error', content: result.message } }
+        : actionCardResponse(cards.selectionResultCard({ title: '🔱 会话分叉', message: result.message, ok: result.ok })), result.ok)
     }
     case 'temp_back_select': {
-      const result = await session.onBackSelect(Number(value.anchorIdx ?? -1))
-      return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
-        title: '⏪ 会话回滚', message: result.message, ok: result.ok,
-      })), result.ok)
+      const result = await session.onBackSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
+      return withBusinessOutcome(result.replaceCard === false
+        ? { toast: { type: 'error', content: result.message } }
+        : actionCardResponse(cards.selectionResultCard({ title: '⏪ 会话回滚', message: result.message, ok: result.ok })), result.ok)
     }
     case 'temp_resume_select': {
-      const result = await session.onResumeSelect(String(value.sessionId ?? ''))
-      return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
-        title: '🔁 会话恢复', message: result.message, ok: result.ok,
-      })), result.ok)
+      const result = await session.onResumeSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
+      if (result.replaceCard === false) {
+        return withBusinessOutcome({ toast: { type: 'error', content: result.message } }, result.ok)
+      }
+      if (!result.resumePresentation) {
+        throw new Error('rs selection result missing trusted presentation snapshot')
+      }
+      return withBusinessOutcome(actionCardResponse(cards.resumeSelectionResultCard({
+        ...result.resumePresentation,
+        message: result.message,
+        ok: result.ok,
+      })), result.ok, result.message)
     }
     case 'tasklist_enable': {
       const result = await session.onTasklistEnable()
@@ -1165,6 +1152,7 @@ async function boot(): Promise<void> {
   // 不阻塞 boot —— 拉完前面板显 MISS,拉完自动有。失败如实留空,绝不假数据。
   const { refreshAllTokenSourceModels } = await import('./src/token-source')
   void refreshAllTokenSourceModels()
+  feishu.loadTempSessionLeases()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
   feishu.loadSessionTurnsMap()

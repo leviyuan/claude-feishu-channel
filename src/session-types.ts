@@ -6,6 +6,8 @@
  */
 
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
+import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
+import type { TurnAnchor } from './feishu'
 
 export interface TurnState {
   cardId: string
@@ -161,17 +163,18 @@ export interface SessionOpts {
    * session starts, stops, exits, or changes process lifecycle. Scripts
    * that construct Session directly can omit it. */
   onLifecycleChange?: () => void
-  /** Daemon hook:建临时群并在其中启动一个 session(btw 干净新会话 / fk 从锚点 fork)。
-   *  resumeSessionId+resumeSessionAt 都给 fk(从历史点派生);btw 都不传 = 全新。
-   *  返回 {ok, chatId};失败 ok=false 由调用方提示用户。*/
+  /** Daemon hook:建临时群并按显式 launch/routing 启动一个 session。 */
   onCreateTempSession?: (opts: {
     chatName: string
     userOpenId: string
-    resumeSessionId?: string
-    resumeSessionAt?: string
+    workDir: string
+    routing: ConversationRouting
+    launch: ConversationLaunch
+    branchBase: ConversationBranchBase
+    seedAnchors?: TurnAnchor[]
   }) => Promise<{ ok: boolean; chatId?: string; error?: string }>
   /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用)。*/
-  onDisbandTempSession?: (chatName: string) => Promise<{ ok: boolean; error?: string }>
+  onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string }>
 }
 
 /** Per-turn delta extracted from the SDK `result` message — feeds the

@@ -39,7 +39,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     return true
   }
   // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
-  // bk/back = 立刻终止当前 + 列 turn 回滚(选后回滚 + 发 Write 记录卡)。
+  // bk/back = 列 turn；点选并通过 stale/owner 校验后才终止并切到新分支。
   if (raw.trim().match(/^btw$/i)) {
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
     await s.runBtwCommand(userOpenId)
@@ -51,14 +51,14 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
   }
   if (raw.trim().match(/^(?:fk|fork)$/i)) {
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 fk。'); return true }
-    await s.showForkList()
+    await s.showForkList(userOpenId)
     return true
   }
   if (raw.trim().match(/^(?:bk|back)$/i)) {
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 bk。'); return true }
-    // 立刻终止当前会话(保留 lastSessionId 供选后回滚),再弹回滚列表
-    if (s.isRunning()) await s.stop('回滚前终止', { announce: false })
-    await s.showBackList()
+    // 只展示选择卡；真正的 stop→fork 在点击具体锚点并通过 owner/provider/cwd
+    // 校验之后发生，避免用户看完不点也被提前终止。
+    await s.showBackList(userOpenId)
     return true
   }
   const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
@@ -226,13 +226,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       }
       return true
     case 'restart':
-      // rs 优化:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true),它已
-      // resetBackgroundTasks);claude 空闲 = 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。
-      // codex 空闲:codex 无 transcript,showResumeList→listClaudeSessions/onResumeSelect 是
-      // claude-only(列不出 codex 会话、点任何项也被 provider 拦死),直接 fall-through 走
-      // restart(true) resume 已按 provider 持久化的 lastSessionId(getSessionResume)。
-      if (!s.isRunning() && s.selectedProvider !== 'codex') {
-        await s.showResumeList()
+      // 进程已停:双后端都列同 cwd 历史并从所选会话创建独立 fork。
+      // 进程存活:保持原有 restart(true) 语义，打断并恢复当前绑定。
+      if (!s.isRunning()) {
+        await s.showResumeList(userOpenId)
         return true
       }
       // 进行中 / codex 空闲:resume the prior conversation — kills the current proc and

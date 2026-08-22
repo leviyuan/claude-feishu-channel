@@ -361,6 +361,39 @@ describe('Claude user dialog bridge', () => {
     ])
   })
 
+  test('emits a turn-local Claude checkpoint and clears it at the next turn boundary', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const results: any[] = []
+    proc.on('result', (event: any) => results.push(event))
+    proc.handleMessage({
+      type: 'system', subtype: 'session_state_changed', state: 'running',
+      uuid: 'turn-1', session_id: 'claude-session-1',
+    })
+    proc.handleMessage({
+      type: 'assistant', uuid: 'assistant-1',
+      message: { model: 'opus', content: [{ type: 'text', text: 'done' }] },
+    })
+    proc.handleMessage({
+      type: 'result', subtype: 'success', session_id: 'claude-session-1',
+      is_error: false, duration_ms: 1, usage: {}, modelUsage: {},
+    })
+    expect(results[0].checkpoint).toEqual({
+      provider: 'claude', kind: 'assistant-message', id: 'assistant-1',
+      source: { provider: 'claude', sessionId: 'claude-session-1', cwd: '/tmp' },
+    })
+
+    proc.handleMessage({
+      type: 'system', subtype: 'session_state_changed', state: 'running',
+      uuid: 'turn-2', session_id: 'claude-session-1',
+    })
+    expect(proc.lastAssistantUuid).toBeNull()
+    proc.handleMessage({
+      type: 'result', subtype: 'error', session_id: 'claude-session-1',
+      is_error: true, duration_ms: 1, usage: {}, modelUsage: {},
+    })
+    expect(results[1].checkpoint).toBeNull()
+  })
+
   test('routes AskUserQuestion through canUseTool permission flow', async () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
