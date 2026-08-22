@@ -33,6 +33,89 @@ afterEach(() => {
 })
 
 describe('cardkit card operations', () => {
+  test('classifies only a real nested 300305 as component capacity', () => {
+    expect(cardkit.isElementLimitFailure(300305, { message: 'component limit' })).toBe(true)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'Failed to add element: inner code: 300305, element exceeds limit',
+    })).toBe(true)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'Duplicate ID, inner code: 300301',
+    })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'elementID format error. Only alphabets, numbers, and underscores are allowed. It must start with an alphabet and not exceed 20 characters; code: 300301',
+    })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'number of elements in a column exceeds the maximum; code: 300301',
+    })).toBe(false)
+    expect(cardkit.isElementLimitFailure(200570, { message: 'invalid image keys' })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300308, { message: 'server internal error' })).toBe(false)
+    expect(cardkit.isDuplicateElementFailure(300315, { message: 'Duplicate ID; code: 300301' })).toBe(true)
+    expect(cardkit.isDuplicateElementFailure(300315, { message: 'elementID format error; code: 300301' })).toBe(false)
+  })
+
+  test('reports the failing card, operation, element, target and Feishu log id', async () => {
+    const cardId = 'card_failure_context'
+    let capturedCode: number | undefined
+    let captured: any = null
+    cardkit.recordCardCreated(cardId, 1, (code, failure) => {
+      capturedCode = code
+      captured = failure
+    })
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 300315,
+      msg: 'Duplicate ID; inner code: 300301',
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-tt-logid': 'log_card_failure_context',
+      },
+    })) as unknown as typeof fetch
+
+    await cardkit.addElement(cardId, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    }, {
+      type: 'insert_before', targetElementId: 'footer',
+    })
+
+    expect(capturedCode).toBe(300315)
+    expect(captured).toMatchObject({
+      cardId,
+      operation: 'addElement',
+      elementId: 'assistant_0',
+      targetElementId: 'footer',
+      code: 300315,
+      httpStatus: 200,
+      logId: 'log_card_failure_context',
+    })
+    expect(captured.message).toContain('Duplicate ID')
+    await cardkit.dispose(cardId)
+  })
+
+  test('serializes safe markdown while preserving structured image components', async () => {
+    const cardId = 'card_markdown_image_boundary'
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.addElement(cardId, {
+      tag: 'column_set',
+      element_id: 'assistant_0',
+      columns: [{
+        tag: 'column',
+        elements: [
+          { tag: 'markdown', content: 'bad ![x](img_key)' },
+          { tag: 'img', img_key: 'img_v2_uploaded' },
+        ],
+      }],
+    })
+
+    const add = calls.find(call =>
+      call.method === 'POST' && call.path === `/cards/${cardId}/elements`
+    )
+    const sent = JSON.parse(add?.body.elements ?? '[]')[0]
+    expect(sent.columns[0].elements[0].content).not.toContain('![')
+    expect(sent.columns[0].elements[0].content).toContain('img_key')
+    expect(sent.columns[0].elements[1]).toEqual({ tag: 'img', img_key: 'img_v2_uploaded' })
+    await cardkit.dispose(cardId)
+  })
+
   test('retries id_convert when Feishu has not indexed the just-sent message yet', async () => {
     let attempt = 0
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

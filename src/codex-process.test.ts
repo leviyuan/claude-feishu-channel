@@ -18,6 +18,11 @@ function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {})
   const proc = Object.create(CodexProcess.prototype) as any
   proc.alive = true
   proc.expectedExit = false
+  proc.exitEventEmitted = false
+  proc.stdoutBuf = ''
+  proc.stderrBuf = ''
+  proc.childExitCode = null
+  proc.childExitSignal = null
   proc.requestCounter = 0
   proc.pending = new Map()
   proc.serverRequests = new Map()
@@ -48,6 +53,8 @@ function makeCodexProtocolHarness(
   proc.opts = { workDir: '/repo', ...opts }
   proc.readyPromise = null
   proc.initializePromise = null
+  proc.conversationResumable = false
+  proc.conversationRolloutPath = null
   proc.currentTurnId = null
   proc.sessionId = null
   proc.lastCompletedTurnId = null
@@ -67,16 +74,33 @@ function makeCodexProtocolHarness(
   }
   proc.request = async (method: string, params: any) => {
     calls.push({ method, params })
-    if (respond) return respond(method, params)
-    if (method === 'initialize') return {}
-    if (method === 'thread/start') return { thread: { id: 'fresh-thread', cwd: '/repo' } }
-    if (method === 'thread/resume') return { thread: { id: params.threadId, cwd: '/repo' } }
-    if (method === 'thread/fork') return { thread: { id: 'forked-thread', cwd: '/repo' } }
-    if (method === 'model/list' || method === 'thread/list') return { data: [], nextCursor: null }
-    throw new Error(`unexpected request ${method}`)
+    let result: any
+    if (respond) result = await respond(method, params)
+    else if (method === 'initialize') result = {}
+    else if (method === 'thread/start') result = { thread: { id: 'fresh-thread', cwd: '/repo' } }
+    else if (method === 'thread/resume') result = { thread: { id: params.threadId, cwd: '/repo' } }
+    else if (method === 'thread/fork') result = { thread: { id: 'forked-thread', cwd: '/repo' } }
+    else if (method === 'model/list' || method === 'thread/list') result = { data: [], nextCursor: null }
+    else throw new Error(`unexpected request ${method}`)
+    if (
+      method.startsWith('thread/')
+      && typeof result?.thread?.id === 'string'
+      && !Object.prototype.hasOwnProperty.call(result.thread, 'path')
+    ) {
+      result = {
+        ...result,
+        thread: {
+          ...result.thread,
+          path: `/rollouts/rollout-${result.thread.id}.jsonl`,
+        },
+      }
+    }
+    return result
   }
   proc.primeRolloutImageGenerationScan = () => {}
   proc.flushRolloutImageGenerations = () => {}
+  proc.assertConversationRolloutMaterialized = () => {}
+  proc.verifyConversationMaterialized = async () => {}
   proc.emit = (event: string, payload: any) => {
     events.push([event, payload])
     return true
@@ -101,6 +125,29 @@ describe('codex JSON-RPC lifecycle reliability', () => {
     expect(proc.pending.size).toBe(0)
   })
 
+  test('JSON-RPC response errors retain the pending method in diagnostics', async () => {
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        const id = JSON.parse(chunk).id
+        queueMicrotask(() => proc.handleMessage({
+          id,
+          error: { code: -32000, message: 'no rollout found for thread id ghost-thread' },
+        }))
+        return true
+      },
+    })
+
+    const request = proc.request('thread/resume', {}, 20)
+    await expect(request).rejects.toThrow('codex app-server thread/resume failed')
+    await expect(request).rejects.toMatchObject({
+      method: 'thread/resume',
+      requestId: 1,
+      serverCode: -32000,
+      serverMessage: 'no rollout found for thread id ghost-thread',
+    })
+    expect(proc.pending.size).toBe(0)
+  })
+
   test('rejects dead stdin writes without leaving a pending request', async () => {
     const proc = makeCodexLifecycleHarness({ writable: false })
 
@@ -120,6 +167,84 @@ describe('codex JSON-RPC lifecycle reliability', () => {
     expect(proc.pending.size).toBe(0)
   })
 
+  test('a spawn error without a pid terminalizes lifecycle instead of leaving a ghost alive process', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const exits: any[] = []
+    proc.on('error', () => {})
+    proc.on('exit', (event: any) => exits.push(event))
+    const pending = proc.request('initialize', {}, 100)
+
+    proc.handleChildProcessError(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))
+
+    await expect(pending).rejects.toThrow('process failed before initialize response')
+    expect(proc.isAlive()).toBe(false)
+    await expect(proc.kill(1)).resolves.toBeUndefined()
+    expect(exits).toEqual([{ code: null, signal: null, expected: false }])
+  })
+
+  test('OS exit keeps pending RPCs alive until a final stdout response is drained on close', async () => {
+    let requestId = 0
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        requestId = JSON.parse(chunk).id
+        return true
+      },
+    })
+    const pending = proc.request('thread/read', {}, 100)
+    proc.stdoutBuf = JSON.stringify({ id: requestId, result: { thread: { id: 'thread-1' } } })
+
+    proc.handleChildExit(0, null)
+    expect(proc.pending.size).toBe(1)
+    proc.handleChildClose(0, null)
+
+    await expect(pending).resolves.toEqual({ thread: { id: 'thread-1' } })
+    expect(proc.pending.size).toBe(0)
+    expect(proc.isAlive()).toBe(false)
+  })
+
+  test('stdin EPIPE does not reject an already-sent RPC whose response is in the stdout tail', async () => {
+    let requestId = 0
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        requestId = JSON.parse(chunk).id
+        return true
+      },
+    })
+    proc.expectedExit = true
+    const pending = proc.request('thread/read', {}, 100)
+
+    proc.handleStdinError(new Error('EPIPE'))
+    expect(proc.pending.size).toBe(1)
+    proc.stdoutBuf = JSON.stringify({ id: requestId, result: { thread: { id: 'thread-1' } } })
+    proc.handleChildClose(0, null)
+
+    await expect(pending).resolves.toEqual({ thread: { id: 'thread-1' } })
+  })
+
+  test('public exit waits for tail materialization continuations before Session cleanup', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const exits: any[] = []
+    proc.on('exit', (event: any) => exits.push(event))
+    let releaseMaterialization: () => void = () => {}
+    const materialization = new Promise<void>(resolve => {
+      releaseMaterialization = resolve
+    })
+    proc.conversationMaterializationVerification = materialization
+    void materialization.then(() => {
+      proc.conversationMaterializationVerification = null
+    })
+
+    proc.handleChildExit(0, null)
+    proc.handleChildClose(0, null)
+    expect(exits).toEqual([])
+    expect(proc.isAlive()).toBe(true)
+
+    releaseMaterialization()
+    await proc.exitPromise
+    expect(exits).toEqual([{ code: 0, signal: null, expected: false }])
+    expect(proc.isAlive()).toBe(false)
+  })
+
   test('times out unanswered requests and removes them from pending', async () => {
     const proc = makeCodexLifecycleHarness()
 
@@ -135,6 +260,7 @@ describe('codex JSON-RPC lifecycle reliability', () => {
       if (signal === 'SIGKILL') {
         queueMicrotask(() => {
           proc.alive = false
+          proc.exitEventEmitted = true
           proc.resolveExit()
         })
       }
@@ -206,6 +332,7 @@ describe('codex app-server conversation protocol', () => {
     expect(launches[0].method).toBe('thread/start')
     expect(launches[0].params).not.toHaveProperty('threadId')
     expect(proc.sessionId).toBe('fresh-thread')
+    expect(proc.isConversationResumable()).toBe(false)
   })
 
   test('maps explicit resume to thread/resume', async () => {
@@ -216,6 +343,7 @@ describe('codex app-server conversation protocol', () => {
     expect(calls.find(c => c.method === 'thread/resume')?.params).toMatchObject({
       threadId: 'explicit-thread', cwd: '/repo', excludeTurns: true,
     })
+    expect(proc.isConversationResumable()).toBe(true)
   })
 
   test('maps a Codex turn checkpoint to thread/fork lastTurnId', async () => {
@@ -236,6 +364,28 @@ describe('codex app-server conversation protocol', () => {
       excludeTurns: true,
     })
     expect(proc.sessionId).toBe('forked-thread')
+    expect(proc.isConversationResumable()).toBe(true)
+  })
+
+  test('sendInitialize returns the same exact readiness transaction to every caller', async () => {
+    let releaseStart!: () => void
+    const startGate = new Promise<void>(resolve => { releaseStart = resolve })
+    const { proc } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') {
+        await startGate
+        return { thread: { id: 'fresh-thread', cwd: '/repo' } }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    proc.sendInitialize()
+    const first = proc.initializationPromise()
+    proc.sendInitialize()
+    const second = proc.initializationPromise()
+    expect(second).toBe(first)
+    releaseStart()
+    await expect(first).resolves.toBeUndefined()
   })
 
   test('rejects a non-turn fork checkpoint before sending thread/fork', async () => {
@@ -294,6 +444,37 @@ describe('codex app-server conversation protocol', () => {
     expect(proc.sessionId).toBeNull()
   })
 
+  test('rejects a launch response without an authoritative rollout path', async () => {
+    const { proc } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') {
+        return { thread: { id: 'pathless-thread', cwd: '/repo', path: null } }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('returned invalid thread.path=MISS')
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('rejects a resume response that routes to a different thread id', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'expected-thread', cwd: '/repo' }
+    const { proc } = makeCodexProtocolHarness({
+      launch: { kind: 'resume', source },
+    }, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/resume') {
+        return { thread: { id: 'wrong-thread', cwd: '/repo' } }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow(
+      'thread/resume returned thread id wrong-thread, expected expected-thread',
+    )
+    expect(proc.sessionId).toBeNull()
+  })
+
   test('turn/start response and notification share one canonical transition', async () => {
     const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
       if (method === 'turn/start') return { turn: { id: 'turn-response' } }
@@ -301,17 +482,137 @@ describe('codex app-server conversation protocol', () => {
     })
     proc.readyPromise = Promise.resolve()
     proc.sessionId = 'main-thread'
+    proc.conversationResumable = false
 
     await proc.startTurn('hello')
+    expect(proc.isConversationResumable()).toBe(false)
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([])
     proc.handleNotification('turn/started', {
       threadId: 'main-thread',
       turn: { id: 'turn-response' },
     })
+    await Promise.resolve()
 
     expect(proc.currentTurnId).toBe('turn-response')
     expect(events.filter(([event]) => event === 'turn_started')).toEqual([
       ['turn_started', { turn_id: 'turn-response', thread_id: 'main-thread' }],
     ])
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([
+      ['conversation_materialized', {
+        session_id: 'main-thread',
+        source: 'turn/started notification',
+      }],
+    ])
+    expect(proc.isConversationResumable()).toBe(true)
+  })
+
+  test('malformed turn/started cannot mark a fresh conversation resumable', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.conversationResumable = false
+
+    expect(() => proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: {},
+    })).toThrow('returned no turn.id')
+
+    expect(proc.isConversationResumable()).toBe(false)
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([])
+  })
+
+  test('turn lifecycle notifications without the exact main thread id fail closed', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-current'
+
+    proc.handleNotification('turn/started', { turn: { id: 'turn-missing-thread' } })
+    proc.handleNotification('turn/completed', {
+      turn: { id: 'turn-current', status: 'completed' },
+    })
+
+    expect(proc.currentTurnId).toBe('turn-current')
+    expect(events.filter(([event]) => event === 'turn_started' || event === 'result')).toEqual([])
+  })
+
+  test('turn/started without authoritative thread/read acknowledgement emits failure and stays unbound', async () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.conversationRolloutPath = '/rollouts/rollout-main-thread.jsonl'
+    proc.conversationResumable = false
+    proc.verifyConversationMaterialized = async () => {
+      throw new Error('rollout stat EACCES')
+    }
+
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-1' },
+    })
+    await Promise.resolve()
+
+    expect(proc.isConversationResumable()).toBe(false)
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([])
+    expect(events.filter(([event]) => event === 'conversation_materialization_failed')).toEqual([
+      ['conversation_materialization_failed', {
+        session_id: 'main-thread',
+        path: '/rollouts/rollout-main-thread.jsonl',
+        source: 'turn/started notification',
+        error: expect.any(Error),
+      }],
+    ])
+  })
+
+  test('materialization verification requires thread/read includeTurns and exact id cwd path', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: params.threadId,
+            cwd: '/repo',
+            path: '/rollouts/rollout-main-thread.jsonl',
+            turns: [{ id: 'turn-1' }],
+          },
+        }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+    delete proc.verifyConversationMaterialized
+    proc.sessionId = 'main-thread'
+    proc.conversationRolloutPath = '/rollouts/rollout-main-thread.jsonl'
+
+    await expect(proc.verifyConversationMaterialized('turn/started notification')).resolves.toBeUndefined()
+    expect(calls).toContainEqual({
+      method: 'thread/read',
+      params: { threadId: 'main-thread', includeTurns: true },
+    })
+  })
+
+  test('materialization barrier drains a completion-triggered retry before settling', async () => {
+    const { proc } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.conversationRolloutPath = '/rollouts/rollout-main-thread.jsonl'
+    proc.conversationResumable = false
+    let attempts = 0
+    let releaseRetry: () => void = () => {}
+    const retryGate = new Promise<void>(resolve => { releaseRetry = resolve })
+    proc.verifyConversationMaterialized = async () => {
+      attempts++
+      if (attempts === 1) throw new Error('first verification raced persistence')
+      await retryGate
+    }
+
+    proc.markConversationMaterialized('turn/started notification')
+    proc.markConversationMaterialized('turn/completed notification')
+    const barrier = proc.conversationMaterializationBarrier()
+    expect(barrier).not.toBeNull()
+    let settled = false
+    void barrier!.then(() => { settled = true })
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+
+    expect(attempts).toBe(2)
+    expect(settled).toBe(false)
+    releaseRetry()
+    await expect(barrier!).resolves.toBeUndefined()
+    expect(proc.isConversationResumable()).toBe(true)
   })
 
   test('does not revive a completed turn when its turn/start response arrives late', async () => {
@@ -342,6 +643,68 @@ describe('codex app-server conversation protocol', () => {
     expect(proc.currentTurnId).toBeNull()
     expect(proc.lastCompletedTurnId).toBe('fast-turn')
     expect(events.filter(([event]) => event === 'turn_started')).toHaveLength(1)
+  })
+
+  test('late turn/started for a finished id cannot capture the next turn owner', () => {
+    const { proc } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.finishedTurnIds = new Set(['turn-old'])
+    const nextAttempt = proc.beginTurnStart()
+
+    proc.recordTurnStarted(
+      { id: 'turn-old' },
+      'main-thread',
+      'late turn/started notification',
+    )
+
+    expect(nextAttempt.turnId).toBeNull()
+    expect(() => proc.recordTurnStarted(
+      { id: 'turn-new' },
+      'main-thread',
+      'turn/start response',
+      nextAttempt,
+    )).not.toThrow()
+    expect(nextAttempt.turnId).toBe('turn-new')
+  })
+
+  test('late or duplicate turn/completed cannot clear a newer active turn or emit a second result', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-new'
+    proc.lastCompletedTurnId = 'checkpoint-newer'
+    proc.finishedTurnIds = new Set(['turn-finished'])
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-finished', status: 'completed' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-old-first-terminal', status: 'completed' },
+    })
+
+    expect(proc.currentTurnId).toBe('turn-new')
+    expect(proc.lastCompletedTurnId).toBe('checkpoint-newer')
+    expect(events.filter(([event]) => event === 'result')).toEqual([])
+    expect(proc.finishedTurnIds.has('turn-old-first-terminal')).toBe(true)
+  })
+
+  test('a duplicate completion for the current turn emits exactly one terminal result', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-1'
+    proc.conversationResumable = true
+    proc.finishedTurnIds = new Set()
+    const notification = {
+      threadId: 'main-thread',
+      turn: { id: 'turn-1', status: 'completed' },
+    }
+
+    proc.handleNotification('turn/completed', notification)
+    proc.handleNotification('turn/completed', notification)
+
+    expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    expect(proc.currentTurnId).toBeNull()
   })
 
   test('ignores an old request timeout after its turn completed and the next turn started', async () => {
@@ -536,6 +899,24 @@ describe('codex app-server conversation protocol', () => {
 })
 
 describe('codex rollout incremental reader', () => {
+  test('authoritative rollout checks require the exact app-server path to be a readable file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-authority-'))
+    const file = join(root, 'rollout-thread-1.jsonl')
+    const { proc } = makeCodexProtocolHarness()
+    delete proc.assertConversationRolloutMaterialized
+    proc.conversationRolloutPath = file
+
+    try {
+      expect(() => proc.assertConversationRolloutMaterialized('test notification')).toThrow(
+        'rollout is not readable',
+      )
+      writeFileSync(file, '{}\n')
+      expect(() => proc.assertConversationRolloutMaterialized('test notification')).not.toThrow()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   test('reads only appended bytes and retains an incomplete JSON line', () => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-'))
     const file = join(root, 'rollout.jsonl')
@@ -942,7 +1323,7 @@ describe('codex collab agent translation (ultra multi-agent)', () => {
     const results = events.filter(([e]) => e === 'tool_result')
     expect(results).toHaveLength(1)
     expect(results[0][1].tool_use_id).toBe('spawn-1')
-    expect(results[0][1].content).toContain('agent-th: running')
+    expect(results[0][1].content).toContain('agent-thread-2: running')
   })
 
   test('pure orchestration calls (wait/sendInput/closeAgent) emit no tool panels', () => {

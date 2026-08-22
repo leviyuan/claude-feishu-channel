@@ -73,7 +73,17 @@ export interface AgentProcess extends EventEmitter {
    * 恒 null(继续走 lastUsage.total_tokens)。 */
   lastContextTokens: number | null
 
+  /** Start backend initialization. */
   sendInitialize(): void
+  /** Codex exposes the exact readiness transaction so Session can surface
+   * method-specific RPC failures before teardown. Claude stream init is
+   * deferred until first input and therefore does not implement this hook. */
+  initializationPromise?(): Promise<void>
+  /** Codex launch/persistence metadata. Claude does not use these hooks. */
+  readonly launchKind?: 'fresh' | 'resume' | 'fork'
+  isConversationResumable?(): boolean
+  conversationMaterializationBarrier?(): Promise<void> | null
+  conversationMaterializationFailure?(): Error | null
   sendUserText(text: string, files?: string[]): void
   sendInterrupt(): void
   sendPermissionResponse(
@@ -101,6 +111,15 @@ export interface AgentProcess extends EventEmitter {
 export type AgentProcessEventMap = {
   error: Error
   init: any
+  /** The backend has durably materialized this conversation. For fresh Codex
+   * threads this is later than thread/start + init. */
+  conversation_materialized: { session_id: string; source: string }
+  conversation_materialization_failed: {
+    session_id: string
+    path: string | null
+    source: string
+    error: Error
+  }
   turn_started: { turn_id?: string | null; thread_id?: string | null }
   token_usage: TokenUsageUpdated
   turn_plan_updated: TurnPlanUpdated

@@ -1,7 +1,7 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
 import { log } from './log'
-import { messageOf } from './session-util'
+import { diagnosticIdLabel, messageOf } from './session-util'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
 
@@ -235,12 +235,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // 进行中 / codex 空闲:resume the prior conversation — kills the current proc and
       // spawns a new one with `--resume <lastSessionId>`(放弃后台进程)。
       {
-        const resumeThreadLabel = s.lastSessionId ? s.lastSessionId.slice(0, 8) : ''
+        const resumeThreadLabel = s.lastSessionId ? diagnosticIdLabel(s.lastSessionId) : ''
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = s.isRunning()
           ? s.withModel(`🔁 重启 ${backend}`)
           : resumeThreadLabel
-            ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
+            ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}`)
             : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
         if (s.runningAgy) {

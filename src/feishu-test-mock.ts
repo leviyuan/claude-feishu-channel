@@ -123,6 +123,7 @@ mock.module('./feishu', () => ({
     resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized as any)
   },
   clearSessionResumeChecked: (sessionName: string, provider?: string) => {
+    if (resumeWriteError) throw resumeWriteError
     clearedResumes.push([sessionName, provider])
     if (provider) resumeRefs.delete(`${sessionName}:${provider}`)
   },

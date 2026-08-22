@@ -27,6 +27,13 @@ export function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+/** Compact diagnostic label that keeps both the UUIDv7 time prefix and random
+ * tail. A longer timestamp-only prefix still collides for concurrently-created
+ * threads, while first-8 + last-4 remains compact and disambiguates them. */
+export function diagnosticIdLabel(id: string): string {
+  return id.length <= 16 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`
+}
+
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null
   try {

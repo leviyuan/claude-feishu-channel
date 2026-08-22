@@ -16,6 +16,7 @@
 
 import { getTenantToken } from './feishu'
 import { log } from './log'
+import { neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 const CARDKIT_FETCH_TIMEOUT_MS = 15_000
@@ -29,15 +30,15 @@ interface CardState {
    * `recordCardCreated` (session passes the body.elements.length of the
    * just-sent card), then incremented in addElement's success branch and
    * decremented in deleteElement's. Used by session to pre-empt the
-   * cardkit "element exceeds the limit" (300305/300315) ceiling — once
+   * Card Kit component-count ceiling (300305, sometimes nested in 300315)
+   * — once
    * the count climbs into the danger zone, session rotates a new card
    * mid-turn before the next addElement would 400. Approximate (a failed
    * addElement won't bump it, so the count tracks "elements Feishu
    * believes exist" not "elements we tried to create"). */
   elementCount: number
   /** element_ids that must no longer receive writes. Usually this means
-   * `addElement` was rejected by Feishu (most often `300305/300315
-   * [element exceeds the limit]`), so the element does NOT exist on Feishu's
+   * `addElement` was rejected by Feishu, so the element does NOT exist on Feishu's
    * side and every subsequent `replaceElement`/`deleteElement`
    * would 300313/300121. Per-card and dropped on `dispose`, so a rotated-to
    * fresh card starts clean. */
@@ -56,15 +57,53 @@ interface CardState {
    * reopen+retry; the session uses it to rotate onto a fresh card (see
    * Session.onCardWriteFailure). Not fired for deletes (a failed delete is
    * harmless — it doesn't block new content). */
-  onFailure?: (code?: number) => void
+  onFailure?: (code?: number, failure?: CardWriteFailure) => void
 }
 
-/** Feishu's element-ceiling rejection. `300315` wraps the inner
- * `300305 [element exceeds the limit]`; treat both as "card is full".
- * Exported so session can turn an add failure into a forced rotate
- * without re-encoding the magic numbers. */
-export function isElementLimitCode(code?: number): boolean {
-  return code === 300305 || code === 300315
+export interface CardWriteFailure {
+  cardId: string
+  operation: string
+  elementId?: string
+  targetElementId?: string
+  code?: number
+  httpStatus?: number
+  logId?: string
+  message: string
+}
+
+export interface CardWriteResult {
+  landed: boolean
+  failure?: CardWriteFailure
+}
+
+interface CardKitRequestError extends Error {
+  code?: number
+  httpStatus?: number
+  logId?: string
+}
+
+/** `300305` is the actual component-count ceiling. `300315` only means
+ * "failed to add element" and also wraps deterministic payload failures
+ * such as duplicate/invalid element IDs (`300301`). Only classify a
+ * `300315` as card-full when its nested diagnostic explicitly names
+ * `300305` or an element/component count overflow. */
+export function isElementLimitFailure(
+  code?: number,
+  failure?: Pick<CardWriteFailure, 'message'>,
+): boolean {
+  if (code === 300305) return true
+  if (code !== 300315) return false
+  const message = failure?.message ?? ''
+  return /(?:code\s*[:=]\s*300305\b|number of card components[^\n.]{0,60}exceed)/i.test(message)
+}
+
+export function isDuplicateElementFailure(
+  code?: number,
+  failure?: Pick<CardWriteFailure, 'message'>,
+): boolean {
+  if (code !== 300315) return false
+  return /(?:duplicate\s+(?:element\s*)?id|code\s*1001\s*:\s*duplicate id)/i
+    .test(failure?.message ?? '')
 }
 
 const cards = new Map<string, CardState>()
@@ -121,11 +160,11 @@ export function isDisposed(cardId: string): boolean {
  * kind). Without this, the element-count tracker only sees adds/deletes
  * that happen *after* card creation, and session can't reliably decide
  * "is this card close to the limit?" — that's the data point that
- * triggers a mid-turn rotate to dodge `code=300305/300315`. */
+ * triggers a mid-turn rotate before a confirmed `300305` capacity error. */
 export function recordCardCreated(
   cardId: string,
   initialElementCount: number,
-  onFailure?: (code?: number) => void,
+  onFailure?: (code?: number, failure?: CardWriteFailure) => void,
 ): void {
   // 新生命周期开始:同 id 重建(测试复用固定 card id / 飞书同 id 再开卡)
   // 时清除 disposed 标记,恢复可写。
@@ -151,6 +190,12 @@ export function getElementCount(cardId: string): number {
  * the old card. */
 export function isDeadElement(cardId: string, elementId: string): boolean {
   return cards.get(cardId)?.deadElements.has(elementId) ?? false
+}
+
+/** A duplicate-id add may mean the element landed but the acknowledgement
+ * was lost/raced. Allow one checked PUT reconciliation against that id. */
+export function clearDeadElementForReconcile(cardId: string, elementId: string): void {
+  cards.get(cardId)?.deadElements.delete(elementId)
 }
 
 /** Stop all future writes to this card. Idempotent; cleared only by
@@ -186,8 +231,13 @@ async function call(method: string, path: string, body?: object): Promise<any> {
   const json = await res.json() as any
   if (!res.ok || json?.code !== 0) {
     const code = typeof json?.code === 'number' ? json.code : res.status
-    const e = new Error(`cardkit ${method} ${path}: HTTP ${res.status} code=${String(json?.code ?? 'MISS')} msg=${json?.msg ?? 'MISS'}`) as Error & { code: number }
+    const logId = res.headers.get('x-tt-logid') ?? res.headers.get('x-request-id') ?? res.headers.get('request-id') ?? undefined
+    const e = new Error(
+      `cardkit ${method} ${path}: HTTP ${res.status} code=${String(json?.code ?? 'MISS')} msg=${json?.msg ?? 'MISS'}${logId ? ` log_id=${logId}` : ''}`,
+    ) as CardKitRequestError
     e.code = code
+    e.httpStatus = res.status
+    e.logId = logId
     throw e
   }
   return json?.data
@@ -229,22 +279,35 @@ async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
   op: () => Promise<void>,
-  onFailure?: (code?: number) => void,
+  onFailure?: (failure: CardWriteFailure) => void,
   silent = false,
+  meta: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> = {},
 ): Promise<void> {
   // 失败统一出口:card-level handler 先(它同步快照当前段/tool 后再异步
   // 换卡),per-call onFailure 后(addElement 的 deadElements.add + session
   // 段游标 reset)。顺序要紧 —— 换卡的同步快照必须在 reset 把
   // currentAssistant* 清空之前跑。silent(deleteElement)跳过 card-level:
   // 删不掉一个元素不影响新内容,不值得为它换卡。
-  const fail = (code?: number): void => {
+  const fail = (error: unknown): void => {
+    const requestError = typeof error === 'object' && error !== null
+      ? error as CardKitRequestError
+      : null
+    const failure: CardWriteFailure = {
+      cardId,
+      operation: label,
+      ...meta,
+      code: requestError?.code,
+      httpStatus: requestError?.httpStatus,
+      logId: requestError?.logId,
+      message: error instanceof Error ? error.message : String(error),
+    }
     try {
-      if (!silent) state(cardId).onFailure?.(code)
+      if (!silent) state(cardId).onFailure?.(failure.code, failure)
     } catch (error) {
       log(`cardkit failure callback ${cardId}: ${error}`)
     }
     try {
-      onFailure?.(code)
+      onFailure?.(failure)
     } catch (error) {
       log(`cardkit per-call failure callback ${cardId}: ${error}`)
     }
@@ -255,7 +318,7 @@ async function withReopenOnStreamingClosed(
   } catch (e) {
     if (!isStreamingClosed(e)) {
       log(`cardkit ${label} ${cardId}: ${e}`)
-      fail((e as any)?.code)
+      fail(e)
       return
     }
     log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
@@ -264,14 +327,14 @@ async function withReopenOnStreamingClosed(
     await reopenStreaming(cardId)
   } catch (re) {
     log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
-    fail((re as any)?.code)
+    fail(re)
     return
   }
   try {
     await op()
   } catch (e2) {
     log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
-    fail((e2 as any)?.code)
+    fail(e2)
   }
 }
 
@@ -311,9 +374,10 @@ export async function convertMessageToCard(
 
 /** Create a card entity from raw schema-2.0 card JSON. */
 export async function createCardEntity(card: object): Promise<string> {
+  const safeCard = neutralizeMarkdownImagesInCard(card)
   const data = await call('POST', '/cards', {
     type: 'card_json',
-    data: JSON.stringify(card),
+    data: JSON.stringify(safeCard),
   })
   return data.card_id
 }
@@ -338,12 +402,13 @@ export function addElement(
   cardId: string,
   element: object,
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
-  onFailure?: (code?: number) => void,
+  onFailure?: (code?: number, failure?: CardWriteFailure) => void,
 ): Promise<void> {
   if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
   if (s.closing || s.writeDead) return Promise.resolve()
-  const elementId = (element as { element_id?: string }).element_id
+  const safeElement = neutralizeMarkdownImagesInCard(element)
+  const elementId = (safeElement as { element_id?: string }).element_id
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
@@ -353,25 +418,27 @@ export function addElement(
       await call('POST', `/cards/${cardId}/elements`, {
         type: opts.type ?? 'append',
         ...(opts.targetElementId ? { target_element_id: opts.targetElementId } : {}),
-        elements: JSON.stringify([element]),
+        elements: JSON.stringify([safeElement]),
         sequence: seq,
       })
-      // Only bump after the API returns 0 — a 300305/300315 throw will
+      // Only bump after the API returns 0 — any rejected add will
       // bypass this line, so the count tracks "elements Feishu actually
       // accepted" not "elements we tried to push".
       s.elementCount += 1
+      if (elementId) s.deadElements.delete(elementId)
     },
-    (code) => {
+    (failure) => {
       // Add rejected ⇒ this element_id does not exist on Feishu's side.
       // Mark it dead so subsequent replace/delete aimed at it
       // short-circuit instead of spraying 300313/300121. Then forward the
-      // code: session turns an element-limit code into a forced mid-turn
-      // rotate (the local counter can't be trusted here — a failed add
-      // doesn't bump it, so it never reaches the rotate threshold on its
-      // own).
+      // structured failure: session rotates only a confirmed 300305 capacity
+      // error. Validation/content failures keep the current card and preserve
+      // this element as dead.
       if (elementId) markElementDead(s, elementId)
-      onFailure?.(code)
+      onFailure?.(failure.code, failure)
     },
+    false,
+    { elementId, targetElementId: opts.targetElementId },
   ))
   return s.queue
 }
@@ -381,12 +448,13 @@ export function replaceElement(
   cardId: string,
   elementId: string,
   element: object,
-  onFailure?: (code?: number) => void,
+  onFailure?: (code?: number, failure?: CardWriteFailure) => void,
   notifyCardFailure = true,
 ): Promise<void> {
   if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
   if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  const safeElement = neutralizeMarkdownImagesInCard(element)
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
@@ -394,12 +462,13 @@ export function replaceElement(
       if (s.writeDead || s.deadElements.has(elementId)) return
       const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
-        element: JSON.stringify(element),
+        element: JSON.stringify(safeElement),
         sequence: seq,
       })
     },
-    onFailure,
+    failure => onFailure?.(failure.code, failure),
     !notifyCardFailure,
+    { elementId },
   ))
   return s.queue
 }
@@ -434,20 +503,31 @@ export async function addElementChecked(
   element: object,
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
 ): Promise<boolean> {
-  if (disposedCards.has(cardId)) return false
+  return (await addElementResult(cardId, element, opts)).landed
+}
+
+export async function addElementResult(
+  cardId: string,
+  element: object,
+  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+): Promise<CardWriteResult> {
+  if (disposedCards.has(cardId)) return { landed: false }
   const s = state(cardId)
-  if (s.closing || s.writeDead) return false
+  if (s.closing || s.writeDead) return { landed: false }
   const elementId = (element as { element_id?: string }).element_id
-  let failed = false
-  await addElement(cardId, element, opts, () => { failed = true })
-  return !failed && !s.writeDead && !(elementId && s.deadElements.has(elementId))
+  let failure: CardWriteFailure | undefined
+  await addElement(cardId, element, opts, (_code, detail) => { failure = detail })
+  return {
+    landed: !failure && !s.writeDead && !(elementId && s.deadElements.has(elementId)),
+    ...(failure ? { failure } : {}),
+  }
 }
 
 /** Delete an element by id. */
 export function deleteElement(
   cardId: string,
   elementId: string,
-  onFailure?: (code?: number) => void,
+  onFailure?: (code?: number, failure?: CardWriteFailure) => void,
 ): Promise<void> {
   if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
@@ -464,8 +544,9 @@ export function deleteElement(
       s.elementCount = Math.max(0, s.elementCount - 1)
       markElementDead(s, elementId)
     },
-    onFailure,
+    failure => onFailure?.(failure.code, failure),
     true,
+    { elementId },
   ))
   return s.queue
 }

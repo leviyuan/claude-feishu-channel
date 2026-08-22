@@ -53,7 +53,27 @@ export interface TurnState {
   planUpdateCount: number
   goalUpdateCount: number
   contextCompactCount: number
-  contextCompactionPending: Map<string, { i: number; cardId: string; notice: any }>
+  contextCompactionPending: Map<string, {
+    i: number
+    cardId: string
+    notice: any
+    created: boolean
+    createFailure?: import('./cardkit').CardWriteFailure
+    createPromise: Promise<boolean>
+  }>
+  /** Stable compaction identities already rendered to completion. Codex can
+   * report the same physical compaction through item/completed and another
+   * protocol surface; duplicates must not create a second timeline panel. */
+  contextCompactionCompleted: Set<string>
+  /** Completion mutations currently awaiting Card Kit confirmation. */
+  contextCompactionCompleting: Set<string>
+  /** Stable element indexes for end/event notices that had no start panel;
+   * retained across a failed add so a duplicate can retry the same element. */
+  contextCompactionEndOnly: Map<string, number>
+  /** Last successfully observed completion time, used only to coalesce an
+   * immediate anonymous duplicate from a second protocol surface. */
+  lastContextCompactionCompletedAt: number
+  lastContextCompactionWasAnonymous: boolean
   /** Consecutive file-tool calls collapse into a single panel: `Read` runs
    * render via `cards.readBatchElement`, `Edit`/`MultiEdit`/`NotebookEdit`
    * runs via `cards.editBatchElement`. Keyed by element index `i` so
@@ -135,10 +155,11 @@ export interface TurnState {
    * reactive combined. Informational (logging) — NOT what the cap reads.
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
-  /** Rotations triggered by the reactive failure path only
-   * (onCardWriteFailure). This is the counter MAX_MIDTURN_ROTATES caps —
-   * the failure path is the only one that can run away (Feishu outage, or
-   * a poisoned element that fails on every card). The proactive path
+  /** Rotations triggered by confirmed card-capacity failures only
+   * (onCardWriteFailure). This is the counter MAX_MIDTURN_ROTATES caps.
+   * Deterministic payload/schema errors and network failures must not consume
+   * it because replaying the same mutation on a fresh card cannot repair
+   * them. The proactive path
    * (maybeMidTurnRotate) deliberately does NOT consume this budget: it
    * needs ~50 genuinely-successful elements per card to fire again, so
    * it's naturally throttled by real output. Sharing one counter was the
@@ -146,6 +167,10 @@ export interface TurnState {
    * exhausted the cap, and the next transient 300308 flipped the turn to
    * log-only. */
   failureRotateCount: number
+  /** A non-capacity write failure is surfaced once per turn while the exact
+   * failed element remains dead/checked-false. Prevents footer/tool refreshes
+   * from flooding the chat with duplicate diagnostics. */
+  cardWriteFailureNotified: boolean
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean

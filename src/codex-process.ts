@@ -28,6 +28,7 @@ import {
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 import { shellCommandDescription } from './cards/shell-command'
 import type { AgentReasoningEffort } from './agent-process'
+import { diagnosticIdLabel } from './session-util'
 import {
   validateConversationLaunch,
   type ConversationLaunch,
@@ -82,6 +83,7 @@ const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
 // app-server control requests return an acknowledgement, not the whole model
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
+const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 5_000
 
 export interface SpawnOpts {
   workDir: string
@@ -236,6 +238,22 @@ type PendingRequest = {
   timeout: ReturnType<typeof setTimeout>
 }
 
+/** Structured JSON-RPC response failure. Lifecycle code must classify on
+ * these fields rather than parsing a rendered Error string. */
+export class CodexRpcResponseError extends Error {
+  constructor(
+    readonly method: string,
+    readonly requestId: string | number,
+    readonly serverCode: number | null,
+    readonly serverMessage: string,
+  ) {
+    super(
+      `codex app-server ${method} failed (id=${requestId}, code=${serverCode ?? 'MISS'}): ${serverMessage}`,
+    )
+    this.name = 'CodexRpcResponseError'
+  }
+}
+
 type ServerRequestState = {
   id: string | number
   method: string
@@ -252,6 +270,7 @@ type TurnStartAttempt = {
 export class CodexProcess extends EventEmitter {
   readonly provider = 'codex' as const
   readonly tokenSourceId: string | null
+  readonly launchKind: ConversationLaunch['kind']
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private stdoutBuf = ''
   private stderrBuf = ''
@@ -260,11 +279,25 @@ export class CodexProcess extends EventEmitter {
   private serverRequests = new Map<string | number, ServerRequestState>()
   private alive = true
   private expectedExit = false
+  private exitEventEmitted = false
+  private childExitCode: number | null = null
+  private childExitSignal: NodeJS.Signals | null = null
   private readonly exitPromise: Promise<void>
   private resolveExit!: () => void
   private opts: SpawnOpts
   private readyPromise: Promise<void> | null = null
   private initializePromise: Promise<void> | null = null
+  /** Fresh thread/start returns an id before Codex creates its rollout. A
+   * resume/fork is already file-backed; a fresh thread becomes resumable only
+   * after the persisted turn/started notification arrives. */
+  private conversationResumable = false
+  /** Exact rollout path returned by app-server for this thread. This is the
+   * authority used for persistence checks; Lodestar never scans a second
+   * index to decide whether a resume id is safe. */
+  private conversationRolloutPath: string | null = null
+  private conversationMaterializationVerification: Promise<void> | null = null
+  private conversationMaterializationRetrySource: string | null = null
+  private lastConversationMaterializationFailure: Error | null = null
   private currentTurnId: string | null = null
   private turnStartGeneration = 0
   private turnStartOwner: TurnStartAttempt | null = null
@@ -314,6 +347,7 @@ export class CodexProcess extends EventEmitter {
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
     this.tokenSourceId = opts.tokenSourceId ?? null
+    this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
     const args = ['app-server', '--listen', 'stdio://']
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
@@ -332,33 +366,91 @@ export class CodexProcess extends EventEmitter {
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
     this.proc.stderr.on('data', (chunk: Buffer) => this.onStderr(chunk))
-    this.proc.stdin.on('error', err => {
-      const error = err instanceof Error ? err : new Error(String(err))
-      log(`codex-process: stdin failed: ${error.message}`)
-      this.rejectPendingRequests((id, pending) => new Error(
-        `codex app-server stdin failed before ${pending.method} response (id=${id}): ${error.message}`,
-        { cause: error },
-      ))
-      if (!this.expectedExit) this.emit('error', error)
-    })
-    this.proc.on('exit', (code, signal) => {
+    this.proc.stdin.on('error', err => this.handleStdinError(err))
+    this.proc.on('exit', (code, signal) => this.handleChildExit(code, signal))
+    this.proc.on('close', (code, signal) => this.handleChildClose(code, signal))
+    this.proc.on('error', err => this.handleChildProcessError(err))
+  }
+
+  private handleStdinError(reason: unknown): void {
+    const error = reason instanceof Error ? reason : new Error(String(reason))
+    log(`codex-process: stdin failed: ${error.message}`)
+    // Per-write callbacks reject the request whose bytes failed. Do not
+    // blanket-reject every already-sent RPC here: an EPIPE during shutdown
+    // can race valid responses still buffered in stdout, which close drains
+    // before rejecting any genuinely unanswered request.
+    if (!this.expectedExit) this.emit('error', error)
+  }
+
+  private handleChildExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (!this.alive) {
+      log(`codex-process: duplicate exit ignored code=${code} signal=${signal}`)
+      return
+    }
+    this.alive = false
+    this.childExitCode = code
+    this.childExitSignal = signal
+    // Do not reject pending RPCs here: Node's `exit` precedes stdio `close`,
+    // and a final response may still be buffered in stdout. close drains that
+    // tail first, then rejects only requests that truly received no response.
+    log(`codex-process: OS exit code=${code} signal=${signal}; awaiting stdio close`)
+  }
+
+  private handleChildClose(code: number | null, signal: NodeJS.Signals | null): void {
+    this.alive = false
+    this.flushStdoutTail()
+    this.flushStderrTail()
+    this.rejectPendingRequests((id, pending) => (
+      new Error(`codex app-server closed before ${pending.method} response (id=${id})`)
+    ))
+    this.serverRequests.clear()
+    const finalCode = code ?? this.childExitCode
+    const finalSignal = signal ?? this.childExitSignal
+    const materializationBarrier = this.conversationMaterializationBarrier()
+    if (materializationBarrier) {
+      // A tail thread/read response resolves its Promise in flushStdoutTail,
+      // but the verification/materialized continuations run as microtasks.
+      // Delay public exit so Session can commit deferred anchors before its
+      // exit handler drops process-owned pending state.
+      void materializationBarrier.then(
+        () => this.emitProcessExit(finalCode, finalSignal),
+        () => this.emitProcessExit(finalCode, finalSignal),
+      )
+      return
+    }
+    this.emitProcessExit(finalCode, finalSignal)
+  }
+
+  private handleChildProcessError(err: Error): void {
+    log(`codex-process: child process error: ${err}`)
+    this.rejectPendingRequests((id, pending) => new Error(
+      `codex app-server process failed before ${pending.method} response (id=${id}): ${err.message}`,
+      { cause: err },
+    ))
+    // A spawn failure normally emits `error` without `exit`; leaving alive=true
+    // would make Session's precise cleanup block forever on an OS process that
+    // never existed. Other ChildProcess errors may still have a real PID and
+    // must keep the ordinary exit/kill confirmation path.
+    const spawnFailed = typeof this.proc.pid !== 'number'
+    let terminalized = false
+    if (spawnFailed && this.alive) {
       this.alive = false
-      this.resolveExit()
-      this.rejectPendingRequests((id, pending) => (
-        new Error(`codex app-server exited before ${pending.method} response (id=${id})`)
-      ))
       this.serverRequests.clear()
-      log(`codex-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
-      this.emit('exit', { code, signal, expected: this.expectedExit })
-    })
-    this.proc.on('error', err => {
-      log(`codex-process: spawn error: ${err}`)
-      this.rejectPendingRequests((id, pending) => new Error(
-        `codex app-server process failed before ${pending.method} response (id=${id}): ${err.message}`,
-        { cause: err },
-      ))
-      this.emit('error', err)
-    })
+      terminalized = true
+    }
+    this.emit('error', err)
+    if (terminalized) {
+      log(`codex-process: spawn failed before pid assignment expected=${this.expectedExit}`)
+      this.emitProcessExit(null, null)
+    }
+  }
+
+  private emitProcessExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.exitEventEmitted) return
+    this.exitEventEmitted = true
+    this.resolveExit()
+    log(`codex-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
+    this.emit('exit', { code, signal, expected: this.expectedExit })
   }
 
   private onStdout(chunk: Buffer): void {
@@ -388,6 +480,14 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
+  /** Child `close` guarantees stdio has drained, but the final JSON record is
+   * not required to end with a newline. Feed one synthetic delimiter so the
+   * ordinary parser handles that last record before public exit/detach. */
+  private flushStdoutTail(): void {
+    if (!this.stdoutBuf) return
+    this.onStdout(Buffer.from('\n'))
+  }
+
   private onStderr(chunk: Buffer): void {
     this.stderrBuf += chunk.toString()
     let nl: number
@@ -396,6 +496,12 @@ export class CodexProcess extends EventEmitter {
       this.stderrBuf = this.stderrBuf.slice(nl + 1)
       if (line.trim()) log(`codex-process[stderr]: ${line}`)
     }
+  }
+
+  private flushStderrTail(): void {
+    const line = this.stderrBuf
+    this.stderrBuf = ''
+    if (line.trim()) log(`codex-process[stderr]: ${line}`)
   }
 
   private handleMessage(msg: any): void {
@@ -408,7 +514,18 @@ export class CodexProcess extends EventEmitter {
       this.pending.delete(msg.id)
       clearTimeout(pending.timeout)
       if (msg.error) {
-        pending.reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)))
+        const serverCode = typeof msg.error?.code === 'number' ? msg.error.code : null
+        const serverMessage = typeof msg.error === 'string'
+          ? msg.error
+          : typeof msg.error?.message === 'string'
+            ? msg.error.message
+            : JSON.stringify(msg.error)
+        pending.reject(new CodexRpcResponseError(
+          pending.method,
+          msg.id,
+          serverCode,
+          serverMessage,
+        ))
       } else {
         pending.resolve(msg.result)
       }
@@ -495,14 +612,37 @@ export class CodexProcess extends EventEmitter {
         return
       }
       case 'turn/started': {
-        this.recordTurnStarted(params.turn, params.threadId ?? this.sessionId, 'turn/started notification')
+        if (typeof params.threadId !== 'string' || params.threadId !== this.sessionId) {
+          logUnhandledAppServerPayload('TURN_STARTED_THREAD_MISMATCH', { method, params })
+          return
+        }
+        this.recordTurnStarted(params.turn, params.threadId, 'turn/started notification')
+        this.markConversationMaterialized('turn/started notification')
         return
       }
       case 'turn/completed': {
-        this.flushRolloutImageGenerations()
+        if (typeof params.threadId !== 'string' || params.threadId !== this.sessionId) {
+          logUnhandledAppServerPayload('TURN_COMPLETED_THREAD_MISMATCH', { method, params })
+          return
+        }
         const turn = params.turn ?? {}
         const completedTurnId = typeof turn.id === 'string' && turn.id ? turn.id : null
         if (completedTurnId) {
+          if (this.finishedTurnIds?.has(completedTurnId)) {
+            log(`codex-process: duplicate turn/completed ignored turn=${completedTurnId}`)
+            return
+          }
+          if (this.currentTurnId && this.currentTurnId !== completedTurnId) {
+            // A late terminal notification for the prior turn must never clear
+            // or close the newer active turn. Retire only the matching old
+            // attempt and remember the id so further duplicates stay inert.
+            this.markTurnStartTerminal(completedTurnId)
+            this.rememberFinishedTurn(completedTurnId)
+            log(`codex-process: stale turn/completed ignored turn=${completedTurnId} current=${this.currentTurnId}`)
+            return
+          }
+          this.flushRolloutImageGenerations()
+          this.markConversationMaterialized('turn/completed notification')
           this.markTurnStartTerminal(completedTurnId)
           this.rememberFinishedTurn(completedTurnId)
         } else {
@@ -717,7 +857,7 @@ export class CodexProcess extends EventEmitter {
         this.emit('bg_task_started', {
           task_id: threadId,
           task_type: 'local_agent',
-          description: this.collabAgentNames.get(threadId) ?? threadId.slice(0, 8),
+          description: this.collabAgentNames.get(threadId) ?? diagnosticIdLabel(threadId),
         } satisfies BgTaskStartedEvent)
         this.emit('bg_task_updated', {
           task_id: threadId,
@@ -1190,12 +1330,44 @@ export class CodexProcess extends EventEmitter {
 
   sendInitialize(): void {
     if (!this.readyPromise) {
-      const ready = this.initializeAndStartThread()
-      ready.catch(e => {
+      this.readyPromise = this.initializeAndStartThread()
+      void this.readyPromise.catch(e => {
         log(`codex-process: initialize failed: ${e}`)
         this.emit('error', e)
       })
-      this.readyPromise = ready
+    }
+  }
+
+  initializationPromise(): Promise<void> {
+    if (!this.readyPromise) this.sendInitialize()
+    return this.readyPromise!
+  }
+
+  isConversationResumable(): boolean {
+    return this.conversationResumable
+  }
+
+  conversationMaterializationBarrier(): Promise<void> | null {
+    return this.conversationMaterializationVerification
+      ? this.drainConversationMaterialization()
+      : null
+  }
+
+  conversationMaterializationFailure(): Error | null {
+    return this.lastConversationMaterializationFailure
+  }
+
+  private async drainConversationMaterialization(): Promise<void> {
+    while (this.conversationMaterializationVerification) {
+      const active = this.conversationMaterializationVerification
+      try { await active } catch { /* latest typed failure is stored by the owner */ }
+      // The owner clears `active` and can install a queued completion retry in
+      // its derived `finally` microtask. Yield so this loop observes the retry
+      // rather than treating the first failed attempt as the final barrier.
+      await Promise.resolve()
+    }
+    if (!this.conversationResumable && this.lastConversationMaterializationFailure) {
+      throw this.lastConversationMaterializationFailure
     }
   }
 
@@ -1274,13 +1446,105 @@ export class CodexProcess extends EventEmitter {
     if (launch.kind === 'fork' && thread.id === launch.source.sessionId) {
       throw new Error(`codex app-server thread/fork returned source thread id ${thread.id}`)
     }
+    if (launch.kind === 'resume' && thread.id !== launch.source.sessionId) {
+      throw new Error(`codex app-server thread/resume returned thread id ${thread.id}, expected ${launch.source.sessionId}`)
+    }
+    const rolloutPath = typeof thread.path === 'string' && thread.path ? thread.path : null
+    if (!rolloutPath || !isAbsolute(rolloutPath) || !rolloutPath.endsWith(`${thread.id}.jsonl`)) {
+      throw new Error(`codex app-server ${method} returned invalid thread.path=${rolloutPath ?? 'MISS'}`)
+    }
     this.sessionId = thread.id
+    this.conversationRolloutPath = rolloutPath
+    // Resume requires an existing rollout and fork materializes its own rollout
+    // before the RPC returns. Only fresh thread/start is still an in-memory id.
+    this.conversationResumable = false
+    if (launch.kind !== 'fresh') {
+      await this.verifyConversationMaterialized(`${method} response`)
+      this.conversationResumable = true
+    }
     if (res?.model) this.lastModel = res.model
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort ?? null
     log(`codex-process: thread=${this.sessionId}`)
     this.primeRolloutImageGenerationScan()
     this.emit('init', { session_id: this.sessionId, thread })
+  }
+
+  private markConversationMaterialized(source: string): void {
+    if (this.conversationResumable) return
+    if (!this.sessionId) {
+      throw new Error(`codex ${source} arrived before thread initialization`)
+    }
+    if (this.conversationMaterializationVerification) {
+      this.conversationMaterializationRetrySource = source
+      return
+    }
+    const sessionId = this.sessionId
+    const verification = this.verifyConversationMaterialized(source)
+    this.conversationMaterializationVerification = verification
+    void verification.then(() => {
+      if (this.sessionId !== sessionId || this.conversationResumable) return
+      this.lastConversationMaterializationFailure = null
+      this.conversationResumable = true
+      log(`codex-process: conversation materialized thread=${sessionId} source=${source}`)
+      this.emit('conversation_materialized', { session_id: sessionId, source })
+    }, cause => {
+      const error = cause instanceof Error ? cause : new Error(String(cause))
+      this.lastConversationMaterializationFailure = error
+      log(`codex-process: conversation materialization check failed thread=${sessionId} source=${source}: ${error.message}`)
+      this.emit('conversation_materialization_failed', {
+        session_id: sessionId,
+        path: this.conversationRolloutPath,
+        source,
+        error,
+      })
+    }).finally(() => {
+      if (this.conversationMaterializationVerification === verification) {
+        this.conversationMaterializationVerification = null
+      }
+      const retrySource = this.conversationMaterializationRetrySource
+      this.conversationMaterializationRetrySource = null
+      if (!this.conversationResumable && retrySource) {
+        this.markConversationMaterialized(retrySource)
+      }
+    })
+  }
+
+  private async verifyConversationMaterialized(source: string): Promise<void> {
+    const sessionId = this.sessionId
+    const path = this.conversationRolloutPath
+    if (!sessionId || !path) throw new Error(`codex ${source} has no initialized rollout identity`)
+    // On Codex 0.149 thread/read(includeTurns=true) explicitly rejects a fresh
+    // in-memory thread as "not materialized yet". A successful read is the
+    // app-server's authoritative persistence acknowledgement; the exact path
+    // check then prevents a mismatched/foreign thread from being bound.
+    const res = await this.request('thread/read', {
+      threadId: sessionId,
+      includeTurns: true,
+    }, CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS)
+    const thread = res?.thread
+    if (
+      thread?.id !== sessionId
+      || thread.cwd !== this.opts.workDir
+      || thread.path !== path
+      || !Array.isArray(thread.turns)
+    ) {
+      throw new Error(`codex ${source} thread/read returned an invalid materialized thread`)
+    }
+    this.assertConversationRolloutMaterialized(source)
+  }
+
+  private assertConversationRolloutMaterialized(source: string): void {
+    const path = this.conversationRolloutPath
+    if (!path) throw new Error(`codex ${source} has no authoritative rollout path`)
+    let stat: ReturnType<typeof statSync>
+    try { stat = statSync(path) }
+    catch (cause) {
+      throw new Error(`codex ${source} rollout is not readable at ${path}: ${cause instanceof Error ? cause.message : cause}`, {
+        cause,
+      })
+    }
+    if (!stat.isFile()) throw new Error(`codex ${source} rollout path is not a file: ${path}`)
   }
 
   private conversationLaunch(): ConversationLaunch {
@@ -1505,8 +1769,8 @@ export class CodexProcess extends EventEmitter {
     if (!turnId) {
       throw new Error(`codex app-server ${source} returned no turn.id`)
     }
-    this.confirmTurnStart(turnId, attempt)
     if (this.finishedTurnIds?.has(turnId)) return
+    this.confirmTurnStart(turnId, attempt)
     // turn/start response and turn/started notification describe the same
     // transition. Whichever arrives first owns the event; the duplicate only
     // confirms the canonical id.
@@ -1671,18 +1935,23 @@ export class CodexProcess extends EventEmitter {
     this.respond(requestId, output)
   }
 
-  isAlive(): boolean { return this.alive }
+  /** Session ownership remains live through child `close`, even after the OS
+   * `exit` event, so no caller can detach while final stdout is still draining. */
+  isAlive(): boolean { return !this.exitEventEmitted }
 
   async kill(timeoutMs = 5000): Promise<void> {
-    if (!this.alive) return
+    if (!this.alive) {
+      if (await this.waitForExit(timeoutMs)) return
+      throw new Error(`codex app-server exited but stdio did not close within ${timeoutMs}ms`)
+    }
     this.expectedExit = true
     log(`codex-process: SIGTERM (timeout=${timeoutMs}ms)`)
     const signalErrors: string[] = []
     this.sendSignal('SIGTERM', signalErrors)
     if (await this.waitForExit(timeoutMs)) return
 
-    log(`codex-process: SIGKILL (process still alive after ${timeoutMs}ms)`)
-    this.sendSignal('SIGKILL', signalErrors)
+    log(`codex-process: SIGKILL (lifecycle not closed after ${timeoutMs}ms)`)
+    if (this.alive) this.sendSignal('SIGKILL', signalErrors)
     if (await this.waitForExit(timeoutMs)) return
 
     const details = signalErrors.length ? `; ${signalErrors.join('; ')}` : ''
@@ -1700,7 +1969,7 @@ export class CodexProcess extends EventEmitter {
   }
 
   private async waitForExit(timeoutMs: number): Promise<boolean> {
-    if (!this.alive) return true
+    if (this.exitEventEmitted) return true
     return new Promise(resolve => {
       let settled = false
       const finish = (exited: boolean) => {
@@ -1709,7 +1978,7 @@ export class CodexProcess extends EventEmitter {
         clearTimeout(timeout)
         resolve(exited)
       }
-      const timeout = setTimeout(() => finish(!this.alive), Math.max(0, timeoutMs))
+      const timeout = setTimeout(() => finish(false), Math.max(0, timeoutMs))
       void this.exitPromise.then(() => finish(true))
     })
   }
@@ -1922,13 +2191,13 @@ function mapCompletedItem(
 // ── 多 agent 编排 item 的展示辅助 ───────────────────────────────────
 
 /** agentPath(如 "/root/order_schema/official_history_orders")末段作展示名;
- *  无 path 时退回 threadId 前 8 位。 */
+ *  无 path 时退回 threadId 的诊断前缀。 */
 function collabAgentDisplayName(agentPath: unknown, threadId: string): string {
   if (typeof agentPath === 'string' && agentPath) {
     const last = agentPath.split('/').filter(Boolean).pop()
     if (last) return last
   }
-  return threadId.slice(0, 8)
+  return diagnosticIdLabel(threadId)
 }
 
 /** spawn/followup 的 prompt 文本:fork_turns=all 时是服务端 Fernet 密文
@@ -1988,7 +2257,7 @@ function collabSpawnDescription(item: any): string {
 
 /** spawn 面板完成态输出:agentsStates 的可读摘要(每 agent 一行「线程:状态」),
  *  替代旧的 agentsStates JSON dump。真名由后台卡(subAgentActivity agentPath)
- *  承载,这里只有线程 id 前 8 位。 */
+ *  承载,这里只有线程 id 的诊断前缀。 */
 function collabSpawnResult(item: any): string {
   const states = item.agentsStates
   if (!states || typeof states !== 'object') return ''
@@ -1996,7 +2265,7 @@ function collabSpawnResult(item: any): string {
   for (const [threadId, state] of Object.entries(states)) {
     const s = state as any
     const status = typeof s?.status === 'string' ? s.status : 'unknown'
-    lines.push(`${threadId.slice(0, 8)}: ${status}`)
+    lines.push(`${diagnosticIdLabel(threadId)}: ${status}`)
   }
   return lines.join('\n')
 }

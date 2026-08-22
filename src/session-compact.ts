@@ -14,7 +14,7 @@ import {
   contextTokensFromUsage,
   rawContextPercentLabel,
 } from './context-window'
-import { messageOf } from './session-util'
+import { diagnosticIdLabel, messageOf } from './session-util'
 
 // 10min:claude 大上下文压缩实测 5min+(user-reported 2026-08-04)。codex 正常压缩
 // 快得多,设大对 codex 无害 —— timeout 只在压缩完成 notification 不到时兜底触发。
@@ -188,8 +188,8 @@ export async function runCompactCommand(s: Session): Promise<void> {
   }
 
   const proc = s.proc
-  const threadLabel = proc.sessionId ? proc.sessionId.slice(0, 8) : ''
-  const initialStatus = s.withModel(threadLabel ? `🧠 压缩上下文 thread=${threadLabel}…` : '🧠 压缩上下文…')
+  const threadLabel = proc.sessionId ? diagnosticIdLabel(proc.sessionId) : ''
+  const initialStatus = s.withModel(threadLabel ? `🧠 压缩上下文 thread=${threadLabel}` : '🧠 压缩上下文…')
   const statusCard = await s.openStatusCard('compact', initialStatus, 'orange')
   const finishStatus = async (status: string) => {
     if (statusCard) await s.closeStatusCard(statusCard, status)
@@ -204,7 +204,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
     s.setStatusCard(statusCard, s.withModel('⏳ 等待压缩完成事件'))
     const notice = await watch.promise
     const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
-    const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
+    const doneThread = notice.threadId ? ` thread=${diagnosticIdLabel(notice.threadId)}` : ''
     await finishStatus(s.withModel(`✅ 上下文已压缩${doneThread}${compactContextWindowLabel(contextSnapshot)}`))
   } catch (e) {
     watch.cancel()

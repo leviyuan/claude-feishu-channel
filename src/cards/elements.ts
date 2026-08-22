@@ -67,22 +67,45 @@ function escapeHtmlEntities(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
-/** 降级 prose 里的外链图片 ![alt](url) 为纯文本标记。url 捕获到 `)` 前
- *  (含空格也完整保留,trim 首尾空白)——Card Kit 把 ![alt](url) 解析成
- *  image 并拿 url 当 img_key,外链 URL 会被服务端拒(ErrCode 200570),
- *  导致整张卡 create / 元素 update 失败;降级既不触发 image 解析,又保留
- *  原图地址。已上传的合法 image_key(img_v2_… 等飞书 key 格式)除外 ——
- *  那是 math-render 回填的公式图,原样保留让卡片渲染成图。 */
-const FEISHU_IMG_KEY_RE = /^img_v[12]_[A-Za-z0-9]+$|^img_[a-z0-9_.-]+$/i
+/** 降级不可信 prose 里的 Markdown 图片为纯文本标记。Card Kit 会把目标
+ * 字符串直接当 img_key；按 `img_...` 外形放行并不能证明它来自飞书上传，
+ * 线上已出现占位符 `img_key` 被误放行后触发 200570 invalid image key。
+ * 公式/通知图片均由本地 uploader 生成并作为结构化 `tag: 'img'` 组件插入，
+ * 不经过这条 Markdown 清洗路径，因此这里必须一律降级。 */
 function downgradeExternalImagesInProse(s: string): string {
-  return s.replace(
+  const downgraded = s.replace(
     /!\[([^\]]*)\]\(([^)]*)\)/g,
     (m, alt: string, url: string) => {
       const u = url.trim()
-      if (FEISHU_IMG_KEY_RE.test(u)) return m
       return alt.trim() ? `🖼️ ${alt.trim()} (${u})` : `🖼️ ${u}`
     },
   )
+  // The readable pass above intentionally handles the common shape, but a
+  // regex cannot balance nested brackets/parentheses. Neutralize every
+  // residual image opener so crafted/nested Markdown can never reach Card
+  // Kit as an img_key lookup.
+  return downgraded.replace(/!\[/g, '🖼️ [')
+}
+
+/** Final Card JSON safety boundary. Templates have many Markdown sinks
+ * (plan/goal/task/Ask/tool fields); recursively neutralize images in every
+ * markdown element while preserving intentional Card Kit HTML such as
+ * `<font>`. Formula and notification images use structured `tag: 'img'`
+ * elements and are untouched. */
+export function neutralizeMarkdownImagesInCard<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(item => neutralizeMarkdownImagesInCard(item)) as T
+  }
+  if (value == null || typeof value !== 'object') return value
+  const source = value as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(source)) {
+    out[key] = neutralizeMarkdownImagesInCard(child)
+  }
+  if (source.tag === 'markdown' && typeof source.content === 'string') {
+    out.content = downgradeExternalImagesForCardKit(source.content)
+  }
+  return out as T
 }
 
 /** 把不可信文本(用户消息 / LLM 正文 / 工具输出 / SDK 结构化字段)规范化成

@@ -1,13 +1,14 @@
 import { EventEmitter } from 'node:events'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
-  boundResumes, branchBaseBySession, deletedReactions, projectProfiles, resetFeishuMock,
+  boundResumes, branchBaseBySession, clearedResumes, deletedReactions, projectProfiles, resetFeishuMock,
   modelSelections, sentCards, sentRawTexts, sentTexts, urgentPushes,
   setResumeWriteError, setTurnAnchorWriteError,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
+const { CodexRpcResponseError } = await import('./codex-process')
 const cardkit = await import('./cardkit')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
@@ -67,6 +68,10 @@ class FakeAgentProc extends EventEmitter {
   killCalls = 0
   setModelSettingsCalls: Array<[string, string]> = []
   alive = true
+  launchKind: 'fresh' | 'resume' | 'fork' | undefined
+  conversationResumable = true
+  initialization: Promise<void> = Promise.resolve()
+  materializationBarrier: Promise<void> | null = null
 
   constructor(
     readonly provider: 'codex' | 'claude',
@@ -77,6 +82,18 @@ class FakeAgentProc extends EventEmitter {
   }
 
   sendInitialize(): void {}
+
+  initializationPromise(): Promise<void> {
+    return this.initialization
+  }
+
+  isConversationResumable(): boolean {
+    return this.conversationResumable
+  }
+
+  conversationMaterializationBarrier(): Promise<void> | null {
+    return this.materializationBarrier
+  }
 
   sendUserText(text: string): void {
     this.sentTexts.push(text)
@@ -130,6 +147,11 @@ function turnState(cardId = 'card_session_turn'): any {
     goalUpdateCount: 0,
     contextCompactCount: 0,
     contextCompactionPending: new Map(),
+    contextCompactionCompleted: new Set(),
+    contextCompactionCompleting: new Set(),
+    contextCompactionEndOnly: new Map(),
+    lastContextCompactionCompletedAt: 0,
+    lastContextCompactionWasAnonymous: false,
     toolBatches: new Map(),
     openBatchI: null,
     taskCreateI: null,
@@ -148,6 +170,7 @@ function turnState(cardId = 'card_session_turn'): any {
     rotating: null,
     rotateCount: 0,
     failureRotateCount: 0,
+    cardWriteFailureNotified: false,
     rotateGivenUp: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
@@ -477,6 +500,555 @@ describe('Session compact command', () => {
   })
 })
 
+describe('Session automatic context compaction events', () => {
+  test('deduplicates repeated completion for the same compaction item', async () => {
+    const session = new Session('compact-dedupe', 'chat_id') as any
+    const turn = turnState('card_compact_dedupe')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const start = {
+      phase: 'start', threadId: 'thread_1', turnId: 'turn_1', itemId: 'compact_1',
+    }
+    const end = {
+      phase: 'end', threadId: 'thread_1', turnId: 'turn_1', itemId: 'compact_1',
+    }
+
+    try {
+      session.handleContextCompacted(start)
+      session.handleContextCompacted(end)
+      session.handleContextCompacted({ ...end, sourceMethod: 'rawResponseItem/completed' })
+      // Same physical completion through a turn-only surface, then an
+      // anonymous legacy surface, must both be coalesced even before the
+      // first Card Kit write has landed.
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_1', turnId: 'turn_1',
+      })
+      session.handleContextCompacted({ phase: 'event' })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_1'))
+
+      expect(turn.contextCompactCount).toBe(1)
+      expect(turn.contextCompactionPending.size).toBe(0)
+      expect(turn.contextCompactionCompleted.has('compact_1')).toBe(true)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'context_compact_0'
+      )
+      const compactReplaces = calls.filter(call =>
+        call.method === 'PUT' &&
+        call.path === `/cards/${turn.cardId}/elements/context_compact_0`
+      )
+      expect(compactAdds).toHaveLength(1)
+      expect(compactReplaces).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('treats a completion delivered after card close as a logged lifecycle event', () => {
+    const session = new Session('compact-after-close', 'chat_id') as any
+
+    session.handleContextCompacted({
+      phase: 'end', threadId: 'thread_closed', turnId: 'turn_closed', itemId: 'compact_closed',
+    })
+
+    expect(sentRawTexts).toHaveLength(0)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('deduplicates generic-turn completion followed by an item completion', async () => {
+    const session = new Session('compact-alias-order', 'chat_id') as any
+    const turn = turnState('card_compact_alias_order')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias', itemId: 'compact_alias',
+      })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.contextCompactionCompleted.has('turn_alias'))
+
+      expect(turn.contextCompactCount).toBe(1)
+      let compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(1)
+      // Once compact_alias claimed the generic turn receipt, a different
+      // explicit item in the same turn must remain a new compaction.
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias', itemId: 'compact_alias_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_alias_b'))
+      compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('deduplicates an anonymous completion followed by an identified alias', async () => {
+    const session = new Session('compact-anonymous-alias', 'chat_id') as any
+    const turn = turnState('card_compact_anonymous_alias')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({ phase: 'event' })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_anon', turnId: 'turn_anon', itemId: 'compact_anon',
+      })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.lastContextCompactionWasAnonymous)
+
+      expect(turn.contextCompactCount).toBe(1)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(1)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a distinct explicit item in the same backend turn is not swallowed by the turn alias', async () => {
+    const session = new Session('compact-distinct-items', 'chat_id') as any
+    const turn = turnState('card_compact_distinct_items')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_shared', turnId: 'turn_shared', itemId: 'compact_item_a',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_item_a'))
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_shared', turnId: 'turn_shared', itemId: 'compact_item_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_item_b'))
+
+      expect(turn.contextCompactCount).toBe(2)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an explicit unmatched item completion does not consume another pending item', async () => {
+    const session = new Session('compact-item-owner', 'chat_id') as any
+    const turn = turnState('card_compact_item_owner')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_a',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_b'))
+
+      expect(turn.contextCompactionPending.has('compact_a')).toBe(true)
+      expect(turn.contextCompactCount).toBe(2)
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_a',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_a'))
+      expect(turn.contextCompactionPending.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('does not attach an old turn compaction completion to a newer turn', async () => {
+    const session = new Session('compact-owner', 'chat_id') as any
+    const oldTurn = turnState('card_compact_owner_old')
+    oldTurn.userOpenId = ''
+    session.currentTurn = oldTurn
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+    session.handleContextCompacted({
+      phase: 'start', threadId: 'thread_owner', turnId: 'turn_old', itemId: 'compact_owner',
+    })
+    await cardkit.flush(oldTurn.cardId)
+
+    const newTurn = turnState('card_compact_owner_new')
+    newTurn.userOpenId = ''
+    session.currentTurn = newTurn
+    cardkit.recordCardCreated(newTurn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_owner', turnId: 'turn_old', itemId: 'compact_owner',
+      })
+      await cardkit.flush(newTurn.cardId)
+
+      expect(newTurn.contextCompactCount).toBe(0)
+      expect(newTurn.contextCompactionPending.size).toBe(0)
+      expect(calls.some(call =>
+        call.path === `/cards/${newTurn.cardId}/elements` &&
+        call.method === 'POST' &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )).toBe(false)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(oldTurn)
+      session.stopFooterStatus(newTurn)
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(newTurn.cardId)
+    }
+  })
+
+  test('buffers compaction events while the conversation card is opening', async () => {
+    const session = new Session('compact-open-window', 'chat_id') as any
+    session.pendingTurnInputs = ['hello']
+    const owner = session.beginTurnOpen(null, 0, true)
+    let signalConvertStarted: () => void = () => {}
+    const convertStarted = new Promise<void>(resolve => { signalConvertStarted = resolve })
+    let releaseConvert: () => void = () => {}
+    const convertGate = new Promise<void>(resolve => { releaseConvert = resolve })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        signalConvertStarted()
+        await convertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_compact_opened' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const opening = session.openTurnCard(owner, '', 'user_message')
+    await convertStarted
+    session.handleContextCompacted({
+      phase: 'start', threadId: 'thread_open', turnId: 'turn_open', itemId: 'compact_open',
+    })
+    session.handleContextCompacted({
+      phase: 'end', threadId: 'thread_open', turnId: 'turn_open', itemId: 'compact_open',
+    })
+    expect(owner.pendingCompactions).toHaveLength(2)
+
+    let turn: any = null
+    try {
+      releaseConvert()
+      turn = await opening
+      expect(turn?.cardId).toBe('card_compact_opened')
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_open'))
+      expect(turn.contextCompactCount).toBe(1)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      releaseConvert()
+      session.releaseTurnOpen(owner)
+      if (turn) {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    }
+  })
+
+  test('an eager pre-input card open does not claim a late prior-turn compaction', () => {
+    const session = new Session('compact-eager-open', 'chat_id') as any
+    const owner = session.beginTurnOpen(null, 0, false)
+
+    session.handleContextCompacted({
+      phase: 'end', threadId: 'thread_prior', turnId: 'turn_prior', itemId: 'compact_prior',
+    })
+
+    expect(owner.pendingCompactions).toHaveLength(0)
+    expect(sentRawTexts).toHaveLength(0)
+    session.releaseTurnOpen(owner)
+  })
+
+  test('manual compact completion never leaks into a newly opened turn', async () => {
+    const session = new Session('compact-manual-owner', 'chat_id') as any
+    const turn = turnState('card_compact_manual_owner')
+    session.currentTurn = turn
+    session.manualContextCompactionPending = true
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_manual', turnId: 'turn_manual', itemId: 'compact_manual',
+      })
+      session.manualContextCompactionPending = false
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_manual', turnId: 'turn_manual',
+      })
+      session.handleContextCompacted({ phase: 'event' })
+
+      expect(turn.contextCompactCount).toBe(0)
+      expect(turn.contextCompactionPending.size).toBe(0)
+      expect(calls).toHaveLength(0)
+    } finally {
+      session.manualContextCompactionPending = false
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an anonymous manual completion tombstones an immediate identified alias', async () => {
+    const session = new Session('compact-manual-anonymous', 'chat_id') as any
+    const turn = turnState('card_compact_manual_anonymous')
+    session.currentTurn = turn
+    session.manualContextCompactionPending = true
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({ phase: 'event' })
+      session.manualContextCompactionPending = false
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_manual_alias', turnId: 'turn_manual_alias', itemId: 'compact_manual_alias',
+      })
+      expect(turn.contextCompactCount).toBe(0)
+      expect(calls).toHaveLength(0)
+    } finally {
+      session.manualContextCompactionPending = false
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('moves an in-progress compaction panel to the replacement card', async () => {
+    const session = new Session('compact-rotate', 'chat_id') as any
+    const turn = turnState('card_compact_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const data = path === '/cards/id_convert' ? { card_id: 'card_compact_new' } : {}
+      return new Response(JSON.stringify({ code: 0, data }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_2', turnId: 'turn_2', itemId: 'compact_2',
+      })
+      await cardkit.flush(turn.cardId)
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+
+      expect(turn.cardId).toBe('card_compact_new')
+      expect(turn.contextCompactionPending.get('compact_2')?.cardId).toBe('card_compact_new')
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_2', turnId: 'turn_2', itemId: 'compact_2',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_2'))
+      await cardkit.flush(turn.cardId)
+
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_compact_new/elements' &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'context_compact_0'
+      )).toBe(true)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path === '/cards/card_compact_new/elements/context_compact_0'
+      )).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('commits completion receipts only after Card Kit lands and allows retry after MISS', async () => {
+    const session = new Session('compact-write-retry', 'chat_id') as any
+    const turn = turnState('card_compact_write_retry')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, turn.cardId, code, failure)
+    })
+    let rejectCompletion = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (
+        rejectCompletion &&
+        method === 'PUT' &&
+        path === `/cards/${turn.cardId}/elements/context_compact_0`
+      ) {
+        return new Response(JSON.stringify({ code: 300308, msg: 'temporary replace reject' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+    const start = {
+      phase: 'start', threadId: 'thread_retry', turnId: 'turn_retry', itemId: 'compact_retry',
+    }
+    const end = {
+      phase: 'end', threadId: 'thread_retry', turnId: 'turn_retry', itemId: 'compact_retry',
+    }
+
+    try {
+      session.handleContextCompacted(start)
+      session.handleContextCompacted(end)
+      await waitUntil(() => !turn.contextCompactionCompleting.has('compact_retry'))
+      expect(turn.contextCompactionPending.has('compact_retry')).toBe(true)
+      expect(turn.contextCompactionCompleted.has('compact_retry')).toBe(false)
+
+      rejectCompletion = false
+      session.handleContextCompacted(end)
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_retry'))
+      expect(turn.contextCompactionPending.size).toBe(0)
+      const completionPuts = calls.filter(call =>
+        call.method === 'PUT' &&
+        call.path === `/cards/${turn.cardId}/elements/context_compact_0`
+      )
+      expect(completionPuts).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a capacity failure while completing automatically retries on the replacement card', async () => {
+    const session = new Session('compact-capacity-rotate', 'chat_id') as any
+    const turn = turnState('card_compact_capacity_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, turn.cardId, code, failure)
+    })
+    let rejectOldCompletion = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_compact_capacity_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (
+        rejectOldCompletion &&
+        method === 'PUT' &&
+        path === '/cards/card_compact_capacity_old/elements/context_compact_0'
+      ) {
+        rejectOldCompletion = false
+        return new Response(JSON.stringify({ code: 300305, msg: 'number of card components exceeds 200' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_capacity', turnId: 'turn_capacity', itemId: 'compact_capacity',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_capacity', turnId: 'turn_capacity', itemId: 'compact_capacity',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_capacity'))
+
+      expect(turn.cardId).toBe('card_compact_capacity_new')
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path === '/cards/card_compact_capacity_new/elements/context_compact_0'
+      )).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a duplicate start-panel add reconciles with a terminal replace', async () => {
+    const session = new Session('compact-start-add-retry', 'chat_id') as any
+    const turn = turnState('card_compact_start_add_retry')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, turn.cardId, code, failure)
+    })
+    let compactAddAttempt = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const addedElement = method === 'POST' && path === `/cards/${turn.cardId}/elements`
+        ? JSON.parse(calls.at(-1)?.body.elements ?? '[]')[0]
+        : null
+      if (addedElement?.element_id === 'context_compact_0' && ++compactAddAttempt === 1) {
+        return new Response(JSON.stringify({ code: 300315, msg: 'Duplicate ID; code: 300301' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_add_retry', turnId: 'turn_add_retry', itemId: 'compact_add_retry',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_add_retry', turnId: 'turn_add_retry', itemId: 'compact_add_retry',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_add_retry'))
+
+      expect(compactAddAttempt).toBe(1)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path.endsWith('/elements/context_compact_0')
+      )).toBe(true)
+      expect(turn.contextCompactionPending.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
 describe('Session provider switching', () => {
   beforeAll(() => buildTokenSourcesFromConfig())
   afterAll(() => resetTokenSourceRegistry())
@@ -504,6 +1076,154 @@ describe('Session provider switching', () => {
 
     expect(boundResumes).toEqual([['probe', 'codex-thread-1', 'codex']])
     expect(session.lastSessionId).toBe('claude-session-1')
+  })
+
+  test('fresh Codex init clears the old binding but never persists its unmaterialized thread id', () => {
+    const session = new Session('codex-fresh-init', 'chat_id') as any
+    const oldRef = { provider: 'codex' as const, sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, oldRef)
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = oldRef
+    session.lastSessionId = oldRef.sessionId
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+
+    session.wireProc(proc)
+    proc.emit('init', { session_id: proc.sessionId })
+
+    expect(boundResumes).toEqual([])
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+  })
+
+  test('fresh Codex response-level turn_started stays unbound until materialization is confirmed', () => {
+    const session = new Session('codex-materialized', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: proc.sessionId })
+    proc.emit('turn_started', { turn_id: 'turn-1', thread_id: proc.sessionId })
+    expect(boundResumes).toEqual([])
+
+    proc.conversationResumable = true
+    proc.emit('conversation_materialized', {
+      session_id: proc.sessionId,
+      source: 'turn/started notification',
+    })
+    expect(boundResumes).toEqual([[session.sessionName, 'fresh-thread', 'codex']])
+    expect(session.lastSessionId).toBe('fresh-thread')
+  })
+
+  test('failed Codex materialization verification is visible and never writes a resume point', () => {
+    const session = new Session('codex-materialize-fails', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    proc.emit('init', { session_id: proc.sessionId })
+
+    proc.emit('conversation_materialization_failed', {
+      session_id: proc.sessionId,
+      path: '/rollouts/rollout-fresh-thread.jsonl',
+      source: 'turn/started notification',
+      error: new Error('thread/read says not materialized'),
+    })
+
+    expect(boundResumes).toEqual([])
+    expect(session.lastSessionId).toBeNull()
+    expect(sentRawTexts.join('\n')).toContain('Codex 会话落盘确认失败，未写恢复点')
+    expect(sentRawTexts.join('\n')).toContain('thread/read says not materialized')
+  })
+
+  test('a fast Codex result defers then commits its fork checkpoint after materialization', () => {
+    const session = new Session('codex-fast-checkpoint', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    session.lastTurnUserPreview = 'fast input'
+    const checkpoint = {
+      provider: 'codex' as const,
+      kind: 'turn' as const,
+      id: 'turn-fast',
+      source: { provider: 'codex' as const, sessionId: 'fresh-thread', cwd: session.workDir },
+    }
+
+    proc.emit('result', { is_error: false, checkpoint })
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+
+    proc.conversationResumable = true
+    proc.emit('conversation_materialized', {
+      session_id: proc.sessionId,
+      source: 'turn/started notification',
+    })
+
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([{
+      checkpoint,
+      preview: 'fast input',
+      ts: expect.any(Number),
+      writes: [],
+    }])
+  })
+
+  test('resumed Codex init can persist because the source rollout already exists', () => {
+    const session = new Session('codex-resume-init', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'resumed-thread')
+    proc.launchKind = 'resume'
+    proc.conversationResumable = true
+    session.proc = proc
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: proc.sessionId })
+
+    expect(boundResumes).toEqual([[session.sessionName, 'resumed-thread', 'codex']])
+  })
+
+  test('fresh Codex init fails visibly when clearing the old resume binding cannot fsync', async () => {
+    const session = new Session('codex-fresh-clear-fails', 'chat_id') as any
+    const oldRef = { provider: 'codex' as const, sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, oldRef)
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = oldRef
+    session.lastSessionId = oldRef.sessionId
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    proc.sendInitialize = () => {
+      proc.emit('init', { session_id: proc.sessionId })
+    }
+    session.spawnAgent = () => proc
+    setResumeWriteError(new Error('resume-map clear fsync failed'))
+    const statuses: string[] = []
+
+    try {
+      const ok = await session.start({
+        announce: false,
+        onStatus: (status: string) => statuses.push(status),
+      })
+      expect(ok).toBe(false)
+      expect(proc.killCalls).toBe(1)
+      expect(statuses.join('\n')).toContain('resume-map clear fsync failed')
+      expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(oldRef)
+      expect(session.lastSessionId).toBe('old-thread')
+    } finally {
+      setResumeWriteError(null)
+    }
   })
 
   test('persists selected Claude resume id from init before a turn boundary', () => {
@@ -725,6 +1445,39 @@ describe('Session provider switching', () => {
     }
   })
 
+  test('idle provider switch settles Codex materialization and deferred checkpoint before kill', async () => {
+    const session = new Session('idle-switch-materialize', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    const checkpoint = {
+      provider: 'codex' as const,
+      kind: 'turn' as const,
+      id: 'turn-fast',
+      source: { provider: 'codex' as const, sessionId: 'fresh-thread', cwd: session.workDir },
+    }
+    proc.emit('result', { is_error: false, checkpoint })
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+    let releaseVerification: () => void = () => {}
+    proc.materializationBarrier = new Promise<void>(resolve => { releaseVerification = resolve })
+    session.selectedProvider = 'claude'
+
+    const stopping = session.stopIdleMismatchedProcess()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(proc.killCalls).toBe(0)
+    proc.conversationResumable = true
+    releaseVerification()
+    await stopping
+
+    expect(proc.killCalls).toBe(1)
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('fresh-thread')
+    expect(turnAnchorsBySession.get(session.sessionName)?.[0]?.checkpoint).toEqual(checkpoint)
+  })
+
   test('rejects non-fixed Claude model outside the two fixed choices', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -939,6 +1692,138 @@ describe('Session turn close vs mid-turn rotation race', () => {
     }
   })
 
+  test('rechecks completed tools after the old-card add queue settles', async () => {
+    const session = new Session('rotate-late-tool-add', 'chat_id') as any
+    const turn = turnState('card_tool_old')
+    turn.userOpenId = ''
+    turn.toolByUseId.set('tool_use_1', {
+      i: 0,
+      name: 'Read',
+      input: { file_path: '/tmp/a.txt' },
+      output: 'done',
+      isError: false,
+    })
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, 'card_tool_old', code, failure)
+    })
+
+    let signalOldAddStarted: () => void = () => {}
+    const oldAddStarted = new Promise<void>(resolve => { signalOldAddStarted = resolve })
+    let releaseOldAdd: () => void = () => {}
+    const oldAddGate = new Promise<void>(resolve => { releaseOldAdd = resolve })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_tool_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'POST' && path === '/cards/card_tool_old/elements') {
+        signalOldAddStarted()
+        await oldAddGate
+        return new Response(JSON.stringify({ code: 300305, msg: 'component count exceeds limit' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const oldAdd = cardkit.addElement(turn.cardId, {
+      tag: 'collapsible_panel',
+      element_id: 'tool_0',
+      header: { title: { tag: 'plain_text', content: 'done' } },
+      elements: [{ tag: 'markdown', content: 'done' }],
+    })
+    await oldAddStarted
+    let rotation: Promise<void> | null = null
+    try {
+      session.startMidTurnRotate(turn)
+      rotation = turn.rotating
+      await waitUntil(() => turn.cardId === 'card_tool_new')
+      expect(turn.toolByUseId.has('tool_use_1')).toBe(false)
+
+      releaseOldAdd()
+      await oldAdd
+      await rotation
+      await cardkit.flush('card_tool_new')
+
+      expect(turn.toolByUseId.has('tool_use_1')).toBe(true)
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_tool_new/elements' &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'tool_0'
+      )).toBe(true)
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(0)
+    } finally {
+      releaseOldAdd()
+      if (rotation) await rotation.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('the second tool rebuild pass is idempotent for unfinished regular and batch tools', async () => {
+    for (const kind of ['regular', 'batch'] as const) {
+      calls = []
+      resetFeishuMock()
+      const session = new Session(`rotate-idempotent-${kind}`, 'chat_id') as any
+      const turn = turnState(`card_${kind}_old`)
+      turn.userOpenId = ''
+      const useId = `tool_${kind}_use`
+      const input = { file_path: `/tmp/${kind}.txt` }
+      turn.toolByUseId.set(useId, {
+        i: 0,
+        name: 'Read',
+        input,
+        ...(kind === 'batch' ? { batchSlot: 0 } : {}),
+      })
+      if (kind === 'batch') {
+        turn.toolBatches.set(0, {
+          kind: 'read',
+          items: [{ toolUseId: useId, input, output: null, isError: false }],
+        })
+      }
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      const newCardId = `card_${kind}_new`
+      globalThis.fetch = (async (inputArg: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(inputArg))
+        const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+        const method = String(init?.method ?? 'GET')
+        calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+        const data = path === '/cards/id_convert' ? { card_id: newCardId } : {}
+        return new Response(JSON.stringify({ code: 0, data }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        session.startMidTurnRotate(turn)
+        await turn.rotating
+        await cardkit.flush(newCardId)
+
+        const newToolAdds = calls.filter(call =>
+          call.method === 'POST' &&
+          call.path === `/cards/${newCardId}/elements` &&
+          JSON.parse(call.body.elements)[0]?.element_id?.startsWith('tool_')
+        )
+        expect(newToolAdds).toHaveLength(1)
+        expect(turn.toolByUseId.size).toBe(1)
+        expect(turn.toolCount).toBe(1)
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    }
+  })
+
   test('waits for formula rendering registered by a successful pending raw write before closing the old card', async () => {
     const session = new Session('rotate-slow-formula', 'chat_id') as any
     const turn = turnState('card_rotate_formula_old')
@@ -1021,19 +1906,17 @@ describe('Session turn close vs mid-turn rotation race', () => {
     }
   })
 
-  test('retries on a third card when both the old raw write and first migration raw write fail', async () => {
+  test('does not replay a deterministic migration failure onto a third card', async () => {
     const session = new Session('rotate-deferred-retry', 'chat_id') as any
     const turn = turnState('card_deferred_old')
     turn.userOpenId = ''
     session.currentTurn = turn
-    cardkit.recordCardCreated(turn.cardId, 1, (code) => session.onCardWriteFailure(code))
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, 'card_deferred_old', code, failure)
+    })
 
     let signalFirstConvert: () => void = () => {}
     const firstConvertStarted = new Promise<void>(resolve => { signalFirstConvert = resolve })
-    let signalThirdConvert: () => void = () => {}
-    const thirdConvertStarted = new Promise<void>(resolve => { signalThirdConvert = resolve })
-    let releaseThirdConvert: () => void = () => {}
-    const thirdConvertGate = new Promise<void>(resolve => { releaseThirdConvert = resolve })
     let convertCount = 0
     const renderSpy = spyOn(mathRender, 'renderMathInText').mockResolvedValue(renderedFormula as any)
 
@@ -1050,62 +1933,44 @@ describe('Session turn close vs mid-turn rotation race', () => {
             headers: { 'Content-Type': 'application/json' },
           })
         }
-        signalThirdConvert()
-        await thirdConvertGate
-        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_deferred_third' } }), {
-          headers: { 'Content-Type': 'application/json' },
-        })
+        throw new Error('a deterministic payload failure must not open a third card')
       }
-      const rejectedRaw = method === 'POST' && (
-        path === '/cards/card_deferred_old/elements' ||
-        path === '/cards/card_deferred_second/elements'
-      )
-      return new Response(JSON.stringify(rejectedRaw
-        ? { code: 300308, msg: 'raw rejected' }
-        : { code: 0, data: {} }), {
+      if (method === 'POST' && path === '/cards/card_deferred_old/elements') {
+        return new Response(JSON.stringify({
+          code: 300305,
+          msg: 'The number of card components exceeds 200',
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (method === 'POST' && path === '/cards/card_deferred_second/elements') {
+        return new Response(JSON.stringify({
+          code: 300315,
+          msg: 'Duplicate ID; inner code: 300301',
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
         headers: { 'Content-Type': 'application/json' },
       })
     }) as typeof fetch
 
     let firstRotation: Promise<void> | null = null
-    let secondRotation: Promise<void> | null = null
     try {
       session.appendAssistant('前文 $$x^2$$ 后文')
       session.finalizeCurrentAssistantSegment()
       await firstConvertStarted
       firstRotation = turn.rotating
       expect(firstRotation).not.toBeNull()
-
-      await thirdConvertStarted
       await firstRotation
-      secondRotation = turn.rotating
-      expect(secondRotation).not.toBeNull()
-      expect(secondRotation).not.toBe(firstRotation)
 
-      releaseThirdConvert()
-      await secondRotation
-      const thirdInflight = turn.mathRenderInflight?.get('card_deferred_third')
-      if (thirdInflight?.size) await Promise.allSettled([...thirdInflight])
-      await cardkit.flush('card_deferred_third')
-
-      expect(convertCount).toBe(2)
-      expect(turn.rotateCount).toBe(2)
-      expect(turn.failureRotateCount).toBe(2)
-      expect(turn.cardId).toBe('card_deferred_third')
+      expect(convertCount).toBe(1)
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.cardId).toBe('card_deferred_second')
       expect(turn.rotating).toBeNull()
-      const thirdRawAdd = calls.find(call =>
-        call.method === 'POST' && call.path === '/cards/card_deferred_third/elements',
-      )
-      expect(thirdRawAdd).toBeDefined()
-      expect(JSON.stringify(JSON.parse(thirdRawAdd!.body.elements)[0])).toContain('x^2')
-      expect(calls.some(call =>
-        call.method === 'PUT' && call.path === '/cards/card_deferred_third/elements/assistant_0',
-      )).toBe(true)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
       expect(sentTexts).toEqual([])
     } finally {
-      releaseThirdConvert()
       if (firstRotation) await firstRotation.catch(() => {})
-      if (secondRotation) await secondRotation.catch(() => {})
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
       renderSpy.mockRestore()
@@ -1118,7 +1983,9 @@ describe('Session turn close vs mid-turn rotation race', () => {
     const rawReply = '前文 $$x^2$$ 后文'
     turn.userOpenId = ''
     session.currentTurn = turn
-    cardkit.recordCardCreated(turn.cardId, 1, (code) => session.onCardWriteFailure(code))
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, 'card_deferred_close_old', code, failure)
+    })
 
     let signalMigrationPost: () => void = () => {}
     const migrationPostStarted = new Promise<void>(resolve => { signalMigrationPost = resolve })
@@ -1139,14 +2006,14 @@ describe('Session turn close vs mid-turn rotation race', () => {
         })
       }
       if (method === 'POST' && path === '/cards/card_deferred_close_old/elements') {
-        return new Response(JSON.stringify({ code: 300308, msg: 'old raw rejected' }), {
+        return new Response(JSON.stringify({ code: 300305, msg: 'component count exceeds limit' }), {
           headers: { 'Content-Type': 'application/json' },
         })
       }
       if (method === 'POST' && path === '/cards/card_deferred_close_new/elements') {
         signalMigrationPost()
         await migrationPostGate
-        return new Response(JSON.stringify({ code: 300308, msg: 'migration raw rejected' }), {
+        return new Response(JSON.stringify({ code: 300315, msg: 'Duplicate ID; inner code: 300301' }), {
           headers: { 'Content-Type': 'application/json' },
         })
       }
@@ -1243,12 +2110,18 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     turn.rotateCount = 5 // 5 次主动满卡轮转已发生,但从未因写失败换过卡
 
     try {
-      session.onCardWriteFailure(300308)
+      session.onCardWriteFailure(turn, 'card_old', 300305, {
+        cardId: 'card_old',
+        operation: 'addElement',
+        code: 300305,
+        message: 'component count exceeds limit',
+      })
 
       expect(turn.rotateGivenUp).toBe(false)
       expect(turn.rotating).not.toBeNull()
       await turn.rotating
       expect(turn.cardId).not.toBe('card_old') // 真的换到了新卡
+      expect(turn.failureRotateCount).toBe(1)
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
@@ -1261,14 +2134,19 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     const turn = turnState('card_dead')
     turn.userOpenId = ''
     session.currentTurn = turn
-    cardkit.recordCardCreated('card_dead', 1)
+    cardkit.recordCardCreated('card_dead', 50)
     turn.failureRotateCount = 5 // 失败额度已耗尽
 
     try {
       session.startWritingFooter(turn)
       expect(turn.footerStatusHandle).not.toBeNull()
 
-      session.onCardWriteFailure(300308)
+      session.onCardWriteFailure(turn, 'card_dead', 300305, {
+        cardId: 'card_dead',
+        operation: 'addElement',
+        code: 300305,
+        message: 'component count exceeds limit',
+      })
 
       expect(turn.rotateGivenUp).toBe(true)
       expect(turn.rotating).toBeNull() // 不再尝试换卡
@@ -1277,6 +2155,9 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       expect(turn.footerStatusHandle).toBeNull()
       session.startWorkingFooter(turn)
       expect(turn.footerStatusHandle).toBeNull()
+      const cardsBeforeProactiveCheck = sentCards.length
+      session.maybeMidTurnRotate()
+      expect(sentCards.length).toBe(cardsBeforeProactiveCheck)
       // log-only 语义:本轮剩余对该卡的写全部短路,不再打飞书。
       const before = calls.length
       await cardkit.replaceElement('card_dead', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
@@ -1291,6 +2172,98 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       session.stopFooterStatus(turn)
       await cardkit.dispose('card_dead')
     }
+  })
+
+  test('a replacement-card send failure latches log-only and cannot retry forever', async () => {
+    const session = new Session('rotate-send-failure', 'chat_id') as any
+    const turn = turnState('card_rotate_send_failure')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 50)
+    const sendSpy = spyOn(feishu, 'sendCard').mockResolvedValue(null)
+
+    try {
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(sentRawTexts).toHaveLength(1)
+      const attempts = sendSpy.mock.calls.length
+      session.maybeMidTurnRotate()
+      expect(sendSpy.mock.calls.length).toBe(attempts)
+    } finally {
+      sendSpy.mockRestore()
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('repeated validation/content failures stay on the current card and warn once', async () => {
+    const session = new Session('validation-no-rotate', 'chat_id') as any
+    const turn = turnState('card_validation')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 2, (code, failure) => {
+      session.onCardWriteFailure(turn, turn.cardId, code, failure)
+    })
+    let attempt = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      attempt++
+      return new Response(JSON.stringify(attempt === 1
+        ? {
+            code: 300315,
+            msg: 'elementID format error. It must start with an alphabet and not exceed 20 characters; code: 300301',
+          }
+        : { code: 200570, msg: 'invalid image keys; ErrorValue: image key img_key' }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      await cardkit.addElement(turn.cardId, {
+        tag: 'markdown', element_id: 'bad_element_1', content: 'x',
+      })
+      await cardkit.addElement(turn.cardId, {
+        tag: 'markdown', element_id: 'bad_element_2', content: 'x',
+      })
+
+      expect(attempt).toBe(2)
+      expect(turn.rotating).toBeNull()
+      expect(turn.rotateCount).toBe(0)
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(sentCards).toHaveLength(0)
+      expect(calls.some(call => call.path === '/cards/id_convert')).toBe(false)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+    } finally {
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a late failure owned by an old turn cannot rotate the current turn', () => {
+    const session = new Session('stale-card-owner', 'chat_id') as any
+    const oldTurn = turnState('card_old_owner')
+    const currentTurn = turnState('card_current_owner')
+    session.currentTurn = currentTurn
+    cardkit.recordCardCreated(currentTurn.cardId, 2)
+
+    session.onCardWriteFailure(oldTurn, oldTurn.cardId, 300305, {
+      cardId: oldTurn.cardId,
+      operation: 'addElement',
+      code: 300305,
+      message: 'component count exceeds limit',
+    })
+
+    expect(session.currentTurn).toBe(currentTurn)
+    expect(currentTurn.cardId).toBe('card_current_owner')
+    expect(currentTurn.rotateCount).toBe(0)
+    expect(currentTurn.failureRotateCount).toBe(0)
+    expect(sentCards).toHaveLength(0)
+    expect(sentRawTexts).toHaveLength(0)
   })
 })
 
@@ -1957,7 +2930,7 @@ describe('Session lifecycle reliability', () => {
     const statuses: string[] = []
     session.selectedProvider = 'codex'
     session.spawnAgent = () => proc
-    session.waitForProcInit = async () => ({ state: 'timeout' })
+    session.waitForCodexInitialization = async () => ({ state: 'timeout' })
 
     const ok = await session.start({
       announce: false,
@@ -1969,7 +2942,162 @@ describe('Session lifecycle reliability', () => {
     expect(session.proc).toBeNull()
     expect(session.status).toBe('stopped')
     expect(statuses.some(status => status.includes('启动超时'))).toBe(true)
+    expect(statuses.some(status => status.includes('120 秒'))).toBe(true)
     expect(statuses.some(status => status.includes('已就绪'))).toBe(false)
+  })
+
+  test('Codex initialization rejection surfaces the method-specific error instead of the outer timeout', async () => {
+    const session = new Session('codex-init-error', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    proc.initialization = Promise.reject(new Error(
+      'codex app-server thread/start request timed out after 30000ms (id=2)',
+    ))
+    const statuses: string[] = []
+    session.selectedProvider = 'codex'
+    session.spawnAgent = () => proc
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(statuses.join('\n')).toContain('thread/start request timed out after 30000ms (id=2)')
+    expect(statuses.join('\n')).not.toContain('启动超时')
+    expect(statuses.join('\n')).not.toContain('已就绪')
+  })
+
+  test('Codex init failure also exposes an unconfirmed process termination', async () => {
+    const session = new Session('codex-init-kill-fails', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    proc.initialization = Promise.reject(new Error('thread/start transport failed'))
+    proc.kill = async () => {
+      proc.killCalls++
+      throw new Error('kill timeout')
+    }
+    session.selectedProvider = 'codex'
+    session.spawnAgent = () => proc
+    const statuses: string[] = []
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(session.blockedProc).toBe(proc)
+    expect(statuses.join('\n')).toContain('thread/start transport failed')
+    expect(statuses.join('\n')).toContain('进程终止未确认: kill timeout')
+
+    proc.alive = false
+    proc.emit('exit', { code: null, signal: 'SIGKILL', expected: true })
+  })
+
+  test('confirmed no-rollout resume failure invalidates only the matching legacy ghost binding', async () => {
+    const session = new Session('codex-ghost-resume', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000001'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ghostRef
+    session.lastSessionId = ghostRef.sessionId
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    const proc = new FakeAgentProc('codex', null)
+    proc.launchKind = 'resume'
+    proc.initialization = Promise.reject(new CodexRpcResponseError(
+      'thread/resume', 2, -32600, `no rollout found for thread id ${ghostId}`,
+    ))
+    session.spawnAgent = () => proc
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+    expect(statuses.join('\n')).toContain(`no rollout found for thread id ${ghostId}`)
+    expect(statuses.join('\n')).toContain('已作废无 rollout 的恢复点')
+  })
+
+  test('unrelated or mismatched Codex resume errors never clear a binding', () => {
+    const session = new Session('codex-resume-keep', 'chat_id') as any
+    const currentId = '0198d6fa-1234-7000-8000-000000000010'
+    const olderId = '0198d6fa-1234-7000-8000-000000000011'
+    const ref = { provider: 'codex' as const, sessionId: currentId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    resumeRefs.set(`${session.sessionName}:codex`, ref)
+
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new Error('codex app-server thread/resume failed: account unavailable'),
+    )).toBeNull()
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new CodexRpcResponseError(
+        'thread/resume', 2, -32600, `no rollout found for thread id ${olderId}`,
+      ),
+    )).toBeNull()
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new CodexRpcResponseError(
+        'thread/resume', 3, -32000, `no rollout found for thread id ${currentId}`,
+      ),
+    )).toBeNull()
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new CodexRpcResponseError(
+        'thread/resume', 4, -32600, `prefix: no rollout found for thread id ${currentId}`,
+      ),
+    )).toBeNull()
+
+    expect(clearedResumes).toEqual([])
+    expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(ref)
+    expect(session.lastSessionId).toBe(ref.sessionId)
+  })
+
+  test('legacy cwd-null ghost binding is invalidated during thread/read migration', async () => {
+    const session = new Session('codex-legacy-ghost', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000099'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: null }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ghostRef
+    session.lastSessionId = ghostId
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    session.resolveLegacyResumeRef = async () => {
+      const readError = new CodexRpcResponseError(
+        'thread/read', 2, -32600, `no rollout found for thread id ${ghostId}`,
+      )
+      const cleanupError = new Error('catalog kill timeout')
+      throw new AggregateError(
+        [readError, cleanupError],
+        `Codex legacy resume lookup and cleanup failed: read=${readError.message}; cleanup=${cleanupError.message}`,
+      )
+    }
+    let spawnCalls = 0
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('codex') }
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+    expect(statuses.join('\n')).toContain('旧会话不可恢复')
+    expect(statuses.join('\n')).toContain('已作废无 rollout 的恢复点')
+    expect(statuses.join('\n')).toContain('catalog kill timeout')
   })
 
   test('serializes concurrent restarts so a kill completes before either replacement spawn', async () => {
@@ -2013,6 +3141,196 @@ describe('Session lifecycle reliability', () => {
     expect(session.proc).toBe(spawned[1])
 
     await session.stop('测试收尾', { announce: false })
+  })
+
+  test('restart freezes a Codex conversation that materializes while the old process is stopping', async () => {
+    const session = new Session('restart-materialize-race', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const oldProc = new FakeAgentProc('codex', 'materialized-thread')
+    oldProc.launchKind = 'fresh'
+    oldProc.conversationResumable = false
+    session.proc = oldProc
+    session.wireProc(oldProc)
+    oldProc.kill = async () => {
+      oldProc.killCalls++
+      oldProc.conversationResumable = true
+      oldProc.emit('conversation_materialized', {
+        session_id: oldProc.sessionId,
+        source: 'turn/started notification',
+      })
+      oldProc.alive = false
+      oldProc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+    let resumedRef: any = null
+    session.spawnAgent = (ref: any) => {
+      resumedRef = ref
+      const replacement = new FakeAgentProc('codex', ref?.sessionId ?? null)
+      replacement.launchKind = 'resume'
+      replacement.conversationResumable = true
+      return replacement
+    }
+
+    const ok = await session.restart(true, { announce: false })
+
+    expect(ok).toBe(true)
+    expect(resumedRef).toEqual({
+      provider: 'codex', sessionId: 'materialized-thread', cwd: session.workDir,
+    })
+    expect(session.lastSessionId).toBe('materialized-thread')
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('materialized-thread')
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('restart waits an in-flight Codex materialization verification before killing its owner', async () => {
+    const session = new Session('restart-materialize-barrier', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const oldProc = new FakeAgentProc('codex', 'verified-thread')
+    oldProc.launchKind = 'fresh'
+    oldProc.conversationResumable = false
+    let releaseVerification: () => void = () => {}
+    oldProc.materializationBarrier = new Promise<void>(resolve => { releaseVerification = resolve })
+    session.proc = oldProc
+    session.wireProc(oldProc)
+    let resumedRef: any = null
+    session.spawnAgent = (ref: any) => {
+      resumedRef = ref
+      const replacement = new FakeAgentProc('codex', ref?.sessionId ?? null)
+      replacement.launchKind = 'resume'
+      return replacement
+    }
+
+    const restarting = session.restart(true, { announce: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(oldProc.killCalls).toBe(0)
+    session.pendingMidTurnMsgs = [{
+      text: 'must not drain', wireText: 'must not drain', userOpenId: '', msgId: '',
+    }]
+    oldProc.emit('result', { is_error: false, checkpoint: null })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(oldProc.sentTexts).toEqual([])
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+
+    oldProc.conversationResumable = true
+    releaseVerification()
+    expect(await restarting).toBe(true)
+    expect(oldProc.killCalls).toBe(1)
+    expect(resumedRef?.sessionId).toBe('verified-thread')
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('restart preserves an idle fresh Codex process when its only resume point cannot be verified', async () => {
+    const session = new Session('restart-materialize-fails-safe', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.status = 'idle'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    proc.materializationBarrier = Promise.reject(new Error('thread/read materialization timeout'))
+    session.proc = proc
+    session.wireProc(proc)
+    let spawnCalls = 0
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('codex') }
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(spawnCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.stoppingProc).toBeNull()
+    expect(session.status).toBe('idle')
+    expect(statuses.join('\n')).toContain('已保留当前进程')
+    proc.materializationBarrier = null
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('stop persists a verified Codex materialization that lands during SIGTERM', async () => {
+    const session = new Session('stop-materialize-race', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'materialized-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    proc.kill = async () => {
+      proc.killCalls++
+      proc.conversationResumable = true
+      proc.emit('conversation_materialized', {
+        session_id: proc.sessionId,
+        source: 'turn/started notification',
+      })
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+
+    await session.stop('测试停止', { announce: false })
+
+    expect(session.lastSessionId).toBe('materialized-thread')
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('materialized-thread')
+  })
+
+  test('stop fails transparently when the final materialized Codex resume point cannot fsync', async () => {
+    const session = new Session('stop-materialize-fsync-fails', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'materialized-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    proc.kill = async () => {
+      proc.killCalls++
+      proc.conversationResumable = true
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+    setResumeWriteError(new Error('final resume-map fsync failed'))
+
+    try {
+      await expect(session.stop('测试停止', { announce: false })).rejects.toThrow(
+        'final resume-map fsync failed',
+      )
+      expect(session.status).toBe('stopped')
+      expect(session.proc).toBeNull()
+      expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+      expect(sentRawTexts.some(text => text.includes('当前进程可继续'))).toBe(false)
+    } finally {
+      setResumeWriteError(null)
+    }
+  })
+
+  test('a blocked Codex process that materializes before its late exit still commits resume and checkpoint', async () => {
+    const session = new Session('blocked-late-materialize', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    const checkpoint = {
+      provider: 'codex' as const,
+      kind: 'turn' as const,
+      id: 'turn-fast',
+      source: { provider: 'codex' as const, sessionId: 'fresh-thread', cwd: session.workDir },
+    }
+    proc.emit('result', { is_error: false, checkpoint })
+    proc.kill = async () => {
+      proc.killCalls++
+      throw new Error('kill timeout')
+    }
+
+    await expect(session.stop('测试停止', { announce: false })).rejects.toThrow('kill timeout')
+    expect(session.blockedProc).toBe(proc)
+    proc.conversationResumable = true
+    proc.alive = false
+    proc.emit('exit', { code: null, signal: 'SIGKILL', expected: true })
+
+    expect(session.proc).toBeNull()
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('fresh-thread')
+    expect(turnAnchorsBySession.get(session.sessionName)?.[0]?.checkpoint).toEqual(checkpoint)
   })
 
   test('ignores late events from a replaced process generation', async () => {
@@ -2458,6 +3776,80 @@ describe('Session lifecycle reliability', () => {
       expect(replaceCalls).toBe(2)
     } finally {
       replaceSpy.mockRestore()
+    }
+  })
+
+  test('rollback never resurrects a previous Codex binding that app-server confirmed has no rollout', async () => {
+    const session = new Session('codex-rollback-ghost', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000077'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = ghostId
+    session.lastSessionRef = ghostRef
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-old', source: ghostRef,
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const replacement = new FakeAgentProc('codex', null)
+    replacement.launchKind = 'fork'
+    replacement.initialization = Promise.reject(new CodexRpcResponseError(
+      'thread/fork', 2, -32600, `no rollout found for thread id ${ghostId}`,
+    ))
+    session.spawnAgent = () => replacement
+
+    const ok = await session.rollbackTo(
+      { kind: 'fork', source: ghostRef },
+      { anchors: [], base: { kind: 'fork', source: ghostRef } },
+      { announce: false },
+    )
+
+    expect(ok).toBe(false)
+    expect(replacement.killCalls).toBe(1)
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+    expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+  })
+
+  test('rollback retains the prior binding when confirmed-ghost cleanup itself fails', async () => {
+    const session = new Session('codex-rollback-ghost-clear-fails', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000078'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = ghostId
+    session.lastSessionRef = ghostRef
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    const replacement = new FakeAgentProc('codex', null)
+    replacement.launchKind = 'fork'
+    replacement.initialization = Promise.reject(new CodexRpcResponseError(
+      'thread/fork', 2, -32600, `no rollout found for thread id ${ghostId}`,
+    ))
+    session.spawnAgent = () => replacement
+    const clearSpy = spyOn(feishu, 'clearSessionResumeChecked').mockImplementation(() => {
+      throw new Error('ghost cleanup fsync failed')
+    })
+
+    try {
+      const ok = await session.rollbackTo(
+        { kind: 'fork', source: ghostRef },
+        { anchors: [], base: { kind: 'fork', source: ghostRef } },
+        { announce: false },
+      )
+
+      expect(ok).toBe(false)
+      expect(session.lastSessionRef).toEqual(ghostRef)
+      expect(session.lastSessionId).toBe(ghostId)
+      expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(ghostRef)
+    } finally {
+      clearSpy.mockRestore()
     }
   })
 

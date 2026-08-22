@@ -325,6 +325,11 @@ export function rebuildToolsOnRotate(
   // 已先于本函数完成 —— 这里搬过来的 tool insert_before taskLiveAnchor(turn)
   // 时 live 区已在新卡就位。board 是 session 级累积快照,这里直接用。
   for (const [useId, meta] of oldToolByUseId) {
+    // Rotation performs an immediate pass for running tools, then a second
+    // pass after the old-card queue settles. Entries already rebuilt in the
+    // first pass must be idempotent; the second pass only picks up completed
+    // tools whose old add was rejected late.
+    if (turn.toolByUseId.has(useId)) continue
     const batchSlot = meta.batchSlot ?? null
     let input = meta.input
     let output: string | null

@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-import { sanitizeMarkdownForCardKit, downgradeExternalImagesForCardKit } from './elements'
+import {
+  sanitizeMarkdownForCardKit,
+  downgradeExternalImagesForCardKit,
+  neutralizeMarkdownImagesInCard,
+} from './elements'
 
 describe('sanitizeMarkdownForCardKit', () => {
   test('降级 prose 里的外链图片,保留 alt + url', () => {
@@ -16,9 +20,12 @@ describe('sanitizeMarkdownForCardKit', () => {
     expect(out).toContain('https://x/y.png')
   })
 
-  test('飞书合法 img_key 的公式图不降级(math-render 回填的 ![formula](img_v2_…))', () => {
-    const md = '评分公式:\n\n![formula](img_v2_abc123XYZ)\n\n完'
-    expect(sanitizeMarkdownForCardKit(md)).toContain('![formula](img_v2_abc123XYZ)')
+  test('不按字符串外形信任图片 key,占位符和伪造 key 都降级', () => {
+    for (const key of ['img_key', 'img_v2_fakeKey123']) {
+      const out = sanitizeMarkdownForCardKit(`评分公式:\n\n![formula](${key})\n\n完`)
+      expect(out).not.toContain('![formula]')
+      expect(out).toContain(key)
+    }
   })
 
   test('代码块内的图片语法原样保留(字面量,不解析也不转义)', () => {
@@ -80,6 +87,15 @@ describe('sanitizeMarkdownForCardKit', () => {
     expect(out).not.toMatch(/!\[/)
     expect(out).toContain('https://example.com/my architecture.png')
   })
+
+  test('嵌套 alt/url 也不残留可解析的图片 opener', () => {
+    for (const src of [
+      '![](foo![x](img_key))',
+      '![a [b]](img_key)',
+    ]) {
+      expect(sanitizeMarkdownForCardKit(src)).not.toContain('![')
+    }
+  })
 })
 
 describe('downgradeExternalImagesForCardKit', () => {
@@ -102,6 +118,28 @@ describe('downgradeExternalImagesForCardKit', () => {
   test('代码块内的图片语法与 HTML 标签原样保留(字面)', () => {
     const src = "```\n![](https://x/y.png)\n<font color='red'>x</font>\n```"
     expect(downgradeExternalImagesForCardKit(src)).toBe(src)
+  })
+})
+
+describe('neutralizeMarkdownImagesInCard', () => {
+  test('递归覆盖 plan/goal/task/Ask 等任意 markdown sink,保留结构化图片和 HTML', () => {
+    const card = neutralizeMarkdownImagesInCard({
+      body: {
+        elements: [
+          {
+            tag: 'collapsible_panel',
+            elements: [{ tag: 'markdown', content: "<font color='red'>x</font> ![bad](img_key)" }],
+          },
+          { tag: 'img', img_key: 'img_v2_uploaded' },
+        ],
+      },
+    }) as any
+
+    const markdown = card.body.elements[0].elements[0].content
+    expect(markdown).toContain("<font color='red'>x</font>")
+    expect(markdown).not.toContain('![')
+    expect(markdown).toContain('img_key')
+    expect(card.body.elements[1]).toEqual({ tag: 'img', img_key: 'img_v2_uploaded' })
   })
 })
 

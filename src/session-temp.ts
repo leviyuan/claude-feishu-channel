@@ -20,6 +20,7 @@ import {
 import { closeSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { diagnosticIdLabel } from './session-util'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const PANEL_TTL_MS = 30 * 60 * 1000
@@ -469,7 +470,7 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
         message: `本群已准备 Claude 新分支；发送下一条消息时生成并接入，旧会话未删除，磁盘文件未回滚${writeLogWarning}`,
       }
     }
-    const thread = s.lastSessionId ? ` ${s.lastSessionId.slice(0, 8)}…` : ''
+    const thread = s.lastSessionId ? ` ${diagnosticIdLabel(s.lastSessionId)}` : ''
     return { ok: true, message: `本群已改接新会话${thread}；旧会话未删除，磁盘文件未回滚${writeLogWarning}` }
   } catch (error) {
     return { ok: false, message: `回退失败: ${error instanceof Error ? error.message : error}` }
@@ -517,7 +518,7 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
     if (choice.sourceStatus === 'active') {
       return finish(false, '所选 Codex 会话仍在运行；请先在原位置停止后再创建完整分支', 'unchanged')
     }
-    log(`session-temp: history fork ${s.sessionName} ← ${choice.launch.source.provider} ${sourceId.slice(0, 8)}`)
+    log(`session-temp: history fork ${s.sessionName} ← ${choice.launch.source.provider} ${sourceId}`)
     const ok = await s.rollbackTo(choice.launch, {
       anchors: [],
       base: choice.launch,
