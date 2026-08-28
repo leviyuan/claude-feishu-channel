@@ -44,7 +44,11 @@ import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
-import { isStaleAtReceipt } from './src/inbound-message'
+import {
+  inboundMessageResource,
+  inboundResourceDownloadFailureText,
+  isStaleAtReceipt,
+} from './src/inbound-message'
 import { drainDynamicWork, trackWork } from './src/inflight-work'
 import {
   ActionDeduper,
@@ -500,7 +504,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // instead of opening a new turn. This is how custom-text answers
   // work in this version — Feishu schema 2.0 doesn't support form/
   // input elements, so the chat box itself is the input. Only applies
-  // to text-only messages (post / 图片 / 文件附件都按一次新轮处理)。
+  // to text-only messages (post / 图片 / 文件 / 视频附件都按一次新轮处理)。
   if (msgType === 'text' && text && session.hasPendingAsk()) {
     // ✅ 不在这里抢打 —— 只有 onAskMessageAnswer 真把这条文本记成 ask
     // 答案时才回 ✅。撞上僵尸 ask(can_use_tool 没来)时这条消息会被当
@@ -510,13 +514,20 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
     return
   }
 
-  if (msgType === 'image' && contentObj.image_key) {
-    const p = await feishu.downloadAttachment(message.message_id, contentObj.image_key, 'image')
-    if (p) filePaths.push(p)
-  } else if (msgType === 'file' && contentObj.file_key) {
-    const p = await feishu.downloadAttachment(message.message_id, contentObj.file_key, 'file', contentObj.file_name)
-    if (p) filePaths.push(p)
-    if (!text) text = `(file: ${contentObj.file_name})`
+  const resource = inboundMessageResource(msgType, contentObj)
+  if (resource) {
+    const p = await feishu.downloadAttachment(
+      message.message_id,
+      resource.key,
+      resource.type,
+      resource.name,
+    )
+    if (!p) {
+      await feishu.sendText(chatId, inboundResourceDownloadFailureText(msgType))
+      return
+    }
+    filePaths.push(p)
+    if (!text && resource.displayText) text = resource.displayText
   }
 
   if (!text && filePaths.length === 0) {
