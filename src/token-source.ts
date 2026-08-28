@@ -32,6 +32,12 @@ export interface TokenSourceModel {
   context1m?: boolean
 }
 
+export interface TokenSourceModelCatalogState {
+  status: 'idle' | 'loading' | 'ready' | 'disabled' | 'failed'
+  updatedAt: number | null
+  error?: string
+}
+
 // ── 统一用量(codex 5h/weekly、glm 5h/monthly 归一) ────────────────────
 
 export interface UsageWindowUnified {
@@ -89,6 +95,9 @@ export interface TokenSource {
    *  codex 看 ~/.codex 登录态;glm 看 config 有没有 token。精确有效性在 spawn/查额度时暴露。 */
   enabled: boolean
   models: TokenSourceModel[]
+  /** Last authoritative model-catalog refresh result. Real built-in sources
+   * populate this; test/custom sources may omit it and are reported as idle. */
+  modelCatalogState?: TokenSourceModelCatalogState
   defaultModel: string
   /** 启动/刷新时拉模型填 models。失败如实留空(MISS),绝不假数据。 */
   refreshModels(): Promise<void>
@@ -208,4 +217,11 @@ export function refreshAllTokenSourceModels(): Promise<void> {
     })
   refreshAllInFlight = { generation, promise }
   return promise
+}
+
+/** Await an already-running catalog refresh without starting a new network
+ * refresh. Consultation discovery uses this to avoid returning a transient
+ * loading-only catalog immediately after boot/setup. */
+export function pendingTokenSourceModelRefresh(): Promise<void> | null {
+  return refreshAllInFlight?.promise ?? null
 }

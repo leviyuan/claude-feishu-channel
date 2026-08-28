@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
+import { writeExecutableFileAtomic, writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
 
 const roots: string[] = []
 afterEach(() => {
@@ -29,5 +29,12 @@ describe('atomic state store', () => {
     writeStateFileAtomic(file, 'ok\n')
     expect(readFileSync(file, 'utf8')).toBe('ok\n')
     if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  test('creates private executable files on unix', () => {
+    const file = target('command')
+    writeExecutableFileAtomic(file, '#!/bin/sh\nexit 0\n')
+    expect(readFileSync(file, 'utf8')).toContain('#!/bin/sh')
+    if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o700)
   })
 })

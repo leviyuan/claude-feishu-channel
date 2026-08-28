@@ -67,10 +67,6 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
     await feishu.sendText(s.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
     return
   }
-  if (worktree.isReservedWorktreeSlug(slug)) {
-    await feishu.sendText(s.chatId, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能用 wt 命令操作。`)
-    return
-  }
   if (!userOpenId) {
     await feishu.sendText(s.chatId, '❌ 找不到发起人，不能拉群。')
     return
@@ -158,7 +154,6 @@ async function buildWorktreeListCardUnlocked(
         error: entry.error,
         chatId,
         duplicateChatCount: ids.length,
-        protected: worktree.isReservedWorktreeSlug(entry.slug),
       }
     }),
   })
@@ -202,9 +197,6 @@ async function worktreeActionResult(
 export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<WorktreeActionResult> {
   const slug = worktree.normalizeWorktreeSlug(slugRaw)
   if (!slug) return worktreeActionResult(s, false, '❌ 名称无效', 'error')
-  if (worktree.isReservedWorktreeSlug(slug)) {
-    return worktreeActionResult(s, false, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能解散。`, 'error')
-  }
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
   let outcome: { ok: boolean; message: string; type: 'success' | 'error' | 'info' }

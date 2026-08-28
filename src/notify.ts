@@ -282,6 +282,7 @@ export function parseCallbackUrl(raw: unknown): { url?: string; error?: string }
 export interface NotifyOptions {
   bind: string
   port: number
+  extraHandler?: (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<boolean>
 }
 
 export function startNotifyServer(opts: NotifyOptions): void {
@@ -290,7 +291,11 @@ export function startNotifyServer(opts: NotifyOptions): void {
   // Bun has full node:http compat so dev behavior is byte-for-byte preserved.
   try {
     const server = createServer((req, res) => {
-      handleNotifyRequest(req, res).catch((err: any) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+      const work = opts.extraHandler
+        ? opts.extraHandler(req, res, url).then(handled => handled ? undefined : handleNotifyRequest(req, res))
+        : handleNotifyRequest(req, res)
+      work.catch((err: any) => {
         log(`notify: handler crash: ${err?.message ?? err}`)
         if (!res.headersSent) {
           res.statusCode = 500
@@ -331,6 +336,7 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
       'lodestar notify\n' +
       'POST /notify        body={project,text,title?,level?,images?,buttons?,callback?}  → push card to group\n' +
       'GET  /notify/result/<notify_id>  → poll a button card\'s resolution (pull mode, no callback server)\n' +
+      'GET  /consult/identities; POST/GET/DELETE /consult/runs[/<id>]  → capability-protected model consultation\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
       'buttons:[{id,text,type?}] (any count, one per row); callback=http://127.0.0.1:PORT/path optional (push) — omit to poll\n')
   }

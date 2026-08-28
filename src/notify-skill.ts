@@ -1,9 +1,7 @@
 /**
- * Auto-install the `feishu-notify` skill into BOTH agent backends
- * lodestar supports — Codex (`~/.codex/skills/`) and Claude Code
- * (`~/.claude/skills/`) — so whichever the user drives at the terminal
- * can push to any bound group via `/notify` without manually placing
- * the skill file.
+ * Auto-install the `feishu-notify` Skill through the shared managed-Skill
+ * pipeline: Codex/Claude standalone locations plus the daemon-owned Claude
+ * SDK plugin used when GLM/DeepSeek deliberately exclude user settings.
  *
  * Why daemon writes these files:
  *
@@ -23,18 +21,16 @@
  * themselves.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { log } from './log'
 import { config } from './config'
+import { syncManagedSkill } from './managed-skills'
 
-const SKILL_FRONTMATTER_NAME = 'feishu-notify'
+export const NOTIFY_SKILL_NAME = 'feishu-notify'
 
-function skillBody(port: number): string {
+export function notifySkillBody(port: number): string {
+  const description = `Push a one-shot notification card to a Feishu (Lark) group via the local lodestar daemon's HTTP endpoint. Auto-trigger whenever the user asks to "通知飞书", "推送到飞书", "推到飞书群", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lodestar notify", "post to lark group", or wants any local script / cron / long-running process to ping a Feishu group (build done, deploy finished, trade filled, monitor alert, error caught). Encodes the call shape — POST http://127.0.0.1:${port}/notify with \`{project, text, level}\` — so consumers do not have to re-derive it. Also covers interactive buttons: add \`buttons\` and either pledge a loopback \`callback\` URL (daemon POSTs the click back) or omit it and poll \`GET /notify/result/NOTIFY_ID\`; all on localhost.`
   return `---
-name: ${SKILL_FRONTMATTER_NAME}
-description: Push a one-shot notification card to a Feishu (Lark) group via the local lodestar daemon's HTTP endpoint. Auto-trigger whenever the user asks to "通知飞书", "推送到飞书", "推到飞书群", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lodestar notify", "post to lark group", or wants any local script / cron / long-running process to ping a Feishu group (build done, deploy finished, trade filled, monitor alert, error caught). Encodes the call shape — POST http://127.0.0.1:${port}/notify with \`{project, text, level}\` — so consumers do not have to re-derive it. Also covers interactive buttons: add \`buttons\` and either pledge a loopback \`callback\` URL (daemon POSTs the click back) or omit it and poll \`GET /notify/result/<notify_id>\`; all on localhost.
+name: ${NOTIFY_SKILL_NAME}
+description: ${JSON.stringify(description)}
 ---
 
 # feishu-notify
@@ -205,29 +201,5 @@ Notes:
 }
 
 export function ensureFeishuNotifySkill(): void {
-  if (process.env.LODESTAR_DISABLE_SKILL_SYNC === '1') {
-    log('skill: sync disabled via LODESTAR_DISABLE_SKILL_SYNC, skip')
-    return
-  }
-  // Sync to BOTH agent backends lodestar supports — Codex (codex CLI) and
-  // Claude Code. Same body, two locations; each is idempotent and a per-
-  // location failure (e.g. one dir not created yet) doesn't block the
-  // other. Both follow the same `*/<name>/SKILL.md` convention.
-  const skillDirs = [
-    join(homedir(), '.codex', 'skills'),
-    join(homedir(), '.claude', 'skills'),
-  ]
-  const desired = skillBody(config.notify.port)
-  for (const dir of skillDirs) {
-    const skillFile = join(dir, SKILL_FRONTMATTER_NAME, 'SKILL.md')
-    try {
-      const current = existsSync(skillFile) ? readFileSync(skillFile, 'utf8') : null
-      if (current === desired) continue  // already up to date
-      mkdirSync(dirname(skillFile), { recursive: true })
-      writeFileSync(skillFile, desired)
-      log(`skill: ${current === null ? 'installed' : 'updated'} ${skillFile}`)
-    } catch (e) {
-      log(`skill: sync failed (${skillFile}): ${e}`)
-    }
-  }
+  syncManagedSkill({ name: NOTIFY_SKILL_NAME, body: notifySkillBody(config.notify.port) })
 }

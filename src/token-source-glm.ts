@@ -108,9 +108,15 @@ registerTokenSourceFactory({
       display: cfg.display?.trim() || 'GLM Coding Plan',
       enabled,
       models: [],
+      modelCatalogState: { status: enabled ? 'idle' : 'disabled', updatedAt: Date.now() },
       defaultModel: cfgDefaultModel ?? '',
       async refreshModels(): Promise<void> {
-        if (!ts.enabled) { ts.models = []; return }
+        if (!ts.enabled) {
+          ts.models = []
+          ts.modelCatalogState = { status: 'disabled', updatedAt: Date.now() }
+          return
+        }
+        ts.modelCatalogState = { status: 'loading', updatedAt: null }
         try {
           const fetched = await fetchGlmModels(baseUrl, token)
           // config models 键补充:上游 /v1/models 列表滞后(新模型已可用但未列出)时手动补登。
@@ -131,9 +137,11 @@ registerTokenSourceFactory({
             const observed = observedContextWindow('glm', m.model)
             m.context1m = observed != null && observed >= 1_000_000 || undefined
           }
+          ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (e: any) {
           log(`glm refreshModels MISS: ${e?.message ?? e}`)
           ts.models = []
+          ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e?.message ?? String(e) }
         }
       },
       spawnEnv(base: Env): Env {

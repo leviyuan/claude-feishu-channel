@@ -53,14 +53,11 @@ export const ELEMENTS = {
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */
   modelPanel: 'model_panel',
-  /** One-shot agy task card. */
-  agyPrompt: 'agy_prompt',
-  agyStats: 'agy_stats',
-  agyResult: 'agy_result',
-  agyForward: 'agy_forward',
-  agyRepo: 'agy_repo',
-  /** Tasklist automation panel. */
+  /** Basic project tasklist binding panel. */
   tasklistPanel: 'tasklist_panel',
+  /** Global consultation identity catalog/preset panel. */
+  consultIdentityPanel: 'consult_id_panel',
+  consultRunFooter: 'consult_run_footer',
 } as const
 
 function escapeHtmlEntities(s: string): string {

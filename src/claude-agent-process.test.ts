@@ -1,5 +1,5 @@
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, writeFileSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync, unlinkSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { beforeEach, describe, expect, test } from 'bun:test'
 
@@ -14,6 +14,9 @@ const {
   resolveClaudeExecutableConfig,
   settingSourcesFromProfile,
   toolsFromProfile,
+  claudeSafeModeArgs,
+  claudeManagedSkillOptions,
+  claudeReadOnlyToolDecision,
 } = await import('./claude-agent-process')
 const {
   resolveClaudeSdkModel,
@@ -25,6 +28,51 @@ const { config } = await import('./config')
 beforeEach(() => resetClaudeContextWindowMaxCache())
 
 describe('Claude model profiles', () => {
+  test('maps reviewer safe mode to the Claude Code isolation flag', () => {
+    expect(claudeSafeModeArgs(true)).toEqual({ 'safe-mode': null })
+    expect(claudeSafeModeArgs(false)).toBeUndefined()
+  })
+
+  test('loads daemon-managed Skills as a plugin only when user settings are excluded', () => {
+    expect(claudeManagedSkillOptions(['project', 'local'], '/data/lodestar-plugin')).toEqual({
+      plugins: [{ type: 'local', path: '/data/lodestar-plugin', skipMcpDiscovery: true }],
+      skills: 'all',
+    })
+    expect(claudeManagedSkillOptions(['user', 'project'], '/data/lodestar-plugin')).toEqual({})
+    expect(claudeManagedSkillOptions(['project'], '/data/lodestar-plugin', true)).toEqual({})
+  })
+
+  test('keeps reviewer file tools inside the real project root', () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-review-root-'))
+    const outside = mkdtempSync(join(tmpdir(), 'claude-review-outside-'))
+    const projectFile = join(root, 'inside.ts')
+    const outsideFile = join(outside, 'secret.txt')
+    const escapeLink = join(root, 'escape.txt')
+    writeFileSync(projectFile, 'export const ok = true\n')
+    writeFileSync(outsideFile, 'secret\n')
+    symlinkSync(outsideFile, escapeLink)
+    try {
+      expect(claudeReadOnlyToolDecision('Read', { file_path: projectFile }, root, [root]))
+        .toEqual({ allowed: true })
+      expect(claudeReadOnlyToolDecision('Grep', { pattern: 'ok' }, root, [root]))
+        .toEqual({ allowed: true })
+      expect(claudeReadOnlyToolDecision('Read', { file_path: outsideFile }, root, [root]))
+        .toMatchObject({ allowed: false })
+      expect(claudeReadOnlyToolDecision('Read', { file_path: escapeLink }, root, [root]))
+        .toMatchObject({ allowed: false })
+      expect(claudeReadOnlyToolDecision('Glob', { pattern: '../**' }, root, [root]))
+        .toMatchObject({ allowed: false })
+      expect(claudeReadOnlyToolDecision('WebSearch', { query: 'latest docs' }, root, [root], ['WebSearch', 'WebFetch']))
+        .toEqual({ allowed: true })
+      expect(claudeReadOnlyToolDecision('WebFetch', { url: 'https://example.com' }, root, [root], ['WebSearch', 'WebFetch']))
+        .toEqual({ allowed: true })
+      expect(claudeReadOnlyToolDecision('Bash', { command: 'pwd' }, root, [root]))
+        .toMatchObject({ allowed: false })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
   test('uses SDK default executable when no global Claude command is found', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',

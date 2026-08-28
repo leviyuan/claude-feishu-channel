@@ -31,11 +31,6 @@ let resumeWriteError: Error | null = null
 export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
 let turnAnchorWriteError: Error | null = null
 export function setTurnAnchorWriteError(error: Error | null): void { turnAnchorWriteError = error }
-/** task v2 list 调用捕获(测 tasklist-worker 的 scanTaskSections 调用预算:每个 section
- *  只能拉一次,防 2026-07-30 修掉的双重拉取回归)。beforeEach 调 resetFeishuMock() 清空。 */
-export const listSectionTasksCalls: Array<[string, boolean | undefined]> = []
-export const listTasklistSectionsCalls: string[] = []
-export const listTasklistTasksCalls: Array<[string, boolean | undefined]> = []
 export const modelSelections = new Map<string, {
   provider: 'codex' | 'claude'
   model: string | null
@@ -51,9 +46,6 @@ export function resetFeishuMock(): void {
     sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, clearedResumes, urgentPushes,
     clearedTurnAnchorSessions, seededTurnAnchors,
   ]) {
-    arr.length = 0
-  }
-  for (const arr of [listSectionTasksCalls, listTasklistSectionsCalls, listTasklistTasksCalls]) {
     arr.length = 0
   }
   projectProfiles.clear()
@@ -94,18 +86,6 @@ mock.module('./feishu', () => ({
   },
   urgentApp: async (messageId: string, openIds: string[]) => {
     urgentPushes.push([messageId, openIds])
-  },
-  listSectionTasks: async (guid: string, completed?: boolean) => {
-    listSectionTasksCalls.push([guid, completed])
-    return []
-  },
-  listTasklistSections: async (guid: string) => {
-    listTasklistSectionsCalls.push(guid)
-    return []
-  },
-  listTasklistTasks: async (guid: string, completed?: boolean) => {
-    listTasklistTasksCalls.push([guid, completed])
-    return []
   },
   bindSessionResume: (sessionName: string, sessionIdOrRef: string | { sessionId: string; provider: string }, provider?: string) => {
     const normalized = typeof sessionIdOrRef === 'string'

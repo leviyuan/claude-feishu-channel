@@ -10,6 +10,8 @@ import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
   CodexProcess,
+  codexAppServerArgs,
+  codexAppServerSpawnOptions,
   imageGenerationOutput,
   usageFromTokenUsagePayload,
 } from './codex-process'
@@ -109,6 +111,32 @@ function makeCodexProtocolHarness(
 }
 
 describe('codex JSON-RPC lifecycle reliability', () => {
+  test('builds isolated app-server args for one-shot reviewers', () => {
+    expect(codexAppServerArgs({
+      configOverrides: ['mcp_servers={}', 'hooks={}'],
+      disabledFeatures: ['apps', 'plugins'],
+    })).toEqual([
+      'app-server',
+      '--config', 'mcp_servers={}',
+      '--config', 'hooks={}',
+      '--disable', 'apps',
+      '--disable', 'plugins',
+      '--listen', 'stdio://',
+    ])
+  })
+
+  test('keeps Windows-compatible Codex spawning shell-free so TOML argv stays literal', () => {
+    const env = { PATH: 'C:\\bin' }
+    expect(codexAppServerSpawnOptions('C:\\repo', env)).toEqual({
+      cwd: 'C:\\repo',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      env,
+    })
+    expect(codexAppServerArgs({ configOverrides: ['web_search="live"'] }))
+      .toContain('web_search="live"')
+  })
+
   test('registers pending before write and clears its timeout on response', async () => {
     let written = ''
     const proc = makeCodexLifecycleHarness({
@@ -455,6 +483,49 @@ describe('codex app-server conversation protocol', () => {
 
     await expect(proc.initializeAndStartThread()).rejects.toThrow('returned invalid thread.path=MISS')
     expect(proc.sessionId).toBeNull()
+  })
+
+  test('allows a pathless ephemeral read-only consultation thread', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({
+      ephemeral: true,
+      sandbox: 'read-only',
+      model: 'gpt-test',
+      effort: 'max',
+    }, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') return { thread: { id: 'ephemeral-thread', cwd: '/repo', path: null } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).resolves.toBeUndefined()
+    expect(proc.sessionId).toBe('ephemeral-thread')
+    expect(proc.isConversationResumable()).toBe(false)
+    const start = calls.find(call => call.method === 'thread/start')!
+    expect(start.params).toMatchObject({
+      ephemeral: true,
+      sandbox: 'read-only',
+      model: 'gpt-test',
+    })
+  })
+
+  test('keeps consultation turns read-only while allowing outbound network', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({
+      sandbox: 'read-only',
+      networkAccess: true,
+    }, async (method) => {
+      if (method === 'turn/start') return { turn: { id: 'review-turn' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'ephemeral-thread'
+    await proc.startTurn('review')
+    expect(calls[0]).toMatchObject({
+      method: 'turn/start',
+      params: {
+        sandboxPolicy: { type: 'readOnly', networkAccess: true },
+        runtimeWorkspaceRoots: ['/repo'],
+      },
+    })
   })
 
   test('rejects a resume response that routes to a different thread id', async () => {

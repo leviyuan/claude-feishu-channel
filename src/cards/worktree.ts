@@ -10,7 +10,6 @@ export interface WorktreeCardEntry {
   error: string | null
   chatId: string | null
   duplicateChatCount: number
-  protected?: boolean
 }
 
 export interface WorktreeListCardOpts {
@@ -101,17 +100,16 @@ function worktreeEntryElements(entry: WorktreeCardEntry): object[] {
     : entry.chatId
       ? '群正常'
       : '无群'
-  const guardState = entry.protected ? ' · 系统保留' : ''
   const columns: object[] = [{
     tag: 'column',
     width: 'weighted',
     weight: 4,
     elements: [{
       tag: 'markdown',
-      content: `**${inlineCode(entry.slug)}**\n${repoState} · ${chatState}${guardState}\n${inlineCode(entry.branch)}`,
+      content: `**${inlineCode(entry.slug)}**\n${repoState} · ${chatState}\n${inlineCode(entry.branch)}`,
     }],
   }]
-  if (!entry.protected && (entry.mounted || entry.chatId)) {
+  if (entry.mounted || entry.chatId) {
     columns.push({
       tag: 'column',
       width: 'weighted',

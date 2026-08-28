@@ -42,6 +42,10 @@ export function buildTokenSourcesFromConfig(): number {
   if (native) {
     const hasClaudeSource = sources.some(s => s.agent === 'claude' && s.enabled && s.kind !== 'claude-native')
     native.enabled = !hasClaudeSource
+    native.modelCatalogState = {
+      status: native.enabled ? 'ready' : 'disabled',
+      updatedAt: Date.now(),
+    }
   }
   for (const s of sources) registerTokenSource(s)
   const configuredDefault = sources.find(s => s.enabled && config.token_sources?.[s.id]?.default === true)

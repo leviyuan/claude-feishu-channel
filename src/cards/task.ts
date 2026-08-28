@@ -1,7 +1,5 @@
 import { ELEMENTS } from './elements'
-import { TASKLIST_SECTION_SPECS, type TasklistBinding } from '../tasklist'
-
-const PREVIEW_LABEL = '预览版'
+import type { TasklistBinding } from '../tasklist'
 
 export interface TasklistPanelNotice {
   type: 'success' | 'error' | 'info'
@@ -29,7 +27,7 @@ export function tasklistPanelCard(opts: TasklistPanelOpts): object {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: `task · ${PREVIEW_LABEL}` },
+      title: { tag: 'plain_text', content: 'task' },
       template,
     },
     body: {
@@ -50,7 +48,6 @@ function panelContent(opts: TasklistPanelOpts): string {
   const lines = [
     `项目：${inlineCode(opts.projectName)}`,
     `清单：${inlineCode(opts.tasklistName)}`,
-    `阶段：${PREVIEW_LABEL}`,
   ]
   if (!opts.binding) {
     lines.push('', '未启用')
@@ -58,22 +55,12 @@ function panelContent(opts: TasklistPanelOpts): string {
   }
   lines.push('', '已启用')
   lines.push(`GUID：${inlineCode(opts.binding.guid)}`)
-  lines.push(`分组：${sectionSummary(opts.binding)}`)
   if (opts.binding.url) lines.push(`链接：${opts.binding.url}`)
   if (opts.confirmDelete) {
     lines.push('')
     lines.push(`<font color='red'>确认后会删除该清单以及清单内所有任务。</font>`)
   }
   return lines.join('\n')
-}
-
-function sectionSummary(binding: TasklistBinding): string {
-  const sections = binding.sections ?? {}
-  return TASKLIST_SECTION_SPECS
-    .map(spec => spec.key === 'design'
-      ? `${spec.name}默认`
-      : `${spec.name}${sections[spec.key] ? '✓' : 'MISS'}`)
-    .join(' · ')
 }
 
 function actionElement(opts: TasklistPanelOpts): object {

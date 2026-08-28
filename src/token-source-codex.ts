@@ -82,9 +82,15 @@ registerTokenSourceFactory({
       display: cfg.display?.trim() || 'Codex 订阅',
       enabled,
       models: [],
+      modelCatalogState: { status: enabled ? 'idle' : 'disabled', updatedAt: Date.now() },
       defaultModel: cfgDefaultModel ?? '',
       async refreshModels(): Promise<void> {
-        if (!ts.enabled) { ts.models = []; return }
+        if (!ts.enabled) {
+          ts.models = []
+          ts.modelCatalogState = { status: 'disabled', updatedAt: Date.now() }
+          return
+        }
+        ts.modelCatalogState = { status: 'loading', updatedAt: null }
         try {
           ts.models = await fetchCodexModels()
           // config effort pin:把订阅默认 effort 覆盖为用户选择(per-model 仍可用)。
@@ -94,9 +100,11 @@ registerTokenSourceFactory({
           // 默认模型:config model 键优先;未配 → 动态列表第一个(app-server 自己
           // 的首选顺序,订阅语义明确,不重排)。
           if (!cfgDefaultModel) ts.defaultModel = ts.models[0]?.model ?? ''
+          ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (e: any) {
           log(`codex-sub refreshModels MISS: ${e?.message ?? e}`)
           ts.models = []
+          ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e?.message ?? String(e) }
         }
       },
       spawnEnv(base: Env): Env {

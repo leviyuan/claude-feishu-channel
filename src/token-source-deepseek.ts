@@ -140,9 +140,15 @@ registerTokenSourceFactory({
       display: cfg.display?.trim() || 'DeepSeek',
       enabled,
       models: [],
+      modelCatalogState: { status: enabled ? 'idle' : 'disabled', updatedAt: Date.now() },
       defaultModel: cfgDefaultModel ?? '',
       async refreshModels(): Promise<void> {
-        if (!ts.enabled) { ts.models = []; return }
+        if (!ts.enabled) {
+          ts.models = []
+          ts.modelCatalogState = { status: 'disabled', updatedAt: Date.now() }
+          return
+        }
+        ts.modelCatalogState = { status: 'loading', updatedAt: null }
         try {
           const fetched = await fetchDeepseekModels(baseUrl, apiKey)
           // config models 键补充(同 glm 约定):端点列表缺模型时手动补登,去重合并。
@@ -162,9 +168,11 @@ registerTokenSourceFactory({
             const observed = observedContextWindow('deepseek', m.model)
             m.context1m = observed != null && observed >= 1_000_000 || undefined
           }
+          ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (e: any) {
           log(`deepseek refreshModels MISS: ${e?.message ?? e}`)
           ts.models = []
+          ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e?.message ?? String(e) }
         }
       },
       spawnEnv(base: Env): Env {

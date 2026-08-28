@@ -48,6 +48,33 @@ beforeEach(() => {
   }) as typeof fetch
 })
 
+describe('Session consult capability', () => {
+  test('accepts only the live process capability and delegates cancellation', async () => {
+    const cancellations: Array<[string, string]> = []
+    const session = new Session('consult-capability', 'chat_id', {
+      onCancelConsultRuns: async (name: string, _chatId: string, reason: string) => { cancellations.push([name, reason]) },
+    }) as any
+    session.proc = { isAlive: () => true }
+    session.consultCapability = 'secret-capability'
+
+    expect(session.acceptsConsultCapability('secret-capability')).toBe(true)
+    expect(session.acceptsConsultCapability('wrong')).toBe(false)
+    session.proc = { isAlive: () => false }
+    expect(session.acceptsConsultCapability('secret-capability')).toBe(false)
+
+    await session.cancelConsultRuns('stop')
+    expect(cancellations).toEqual([['consult-capability', 'stop']])
+  })
+
+  test('routes the global reviewers command to the identity panel', async () => {
+    const session = new Session('reviewers-command', 'chat_id') as any
+    let owner = ''
+    session.showConsultIdentityPanel = async (userOpenId: string) => { owner = userOpenId }
+    expect(await session.runCommand('reviewers', 'ou_owner')).toBe(true)
+    expect(owner).toBe('ou_owner')
+  })
+})
+
 class FakeAgentProc extends EventEmitter {
   lastAssistantUuid = null
   lastModel: string | null = null

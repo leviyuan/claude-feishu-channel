@@ -127,6 +127,14 @@ describe('card action identity', () => {
       .not.toBe(cardActionDedupeKey(data({ kind: 'ask', tool_use_id: 't', question_idx: 1, option_idx: 0 })))
   })
 
+  test('admits global consult identity actions and keeps pagination targets distinct', () => {
+    expect(validateCardActionAdmission(data({
+      kind: 'consult_identity_add', panel_id: 'p', identity_id: 'catalog:a',
+    }))).toBeNull()
+    expect(cardActionDedupeKey(data({ kind: 'consult_identity_page', panel_id: 'p', page: 1 })))
+      .not.toBe(cardActionDedupeKey(data({ kind: 'consult_identity_page', panel_id: 'p', page: 2 })))
+  })
+
   test('uses event_id and semantic keys together', () => {
     const event = { ...data({ kind: 'tasklist_enable' }), event_id: 'evt-1' }
     expect(cardActionDedupeKeys(event)).toHaveLength(2)

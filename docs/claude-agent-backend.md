@@ -79,7 +79,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - 启动与恢复：Codex 仍走 `codex app-server --listen stdio://`，仍检查 `codex login`，仍等待 app-server `init` 后把 session 置为 ready；`restart` 仍用 Codex thread id 恢复。
 - turn 调度：Codex 的 eager-open、cold-start、mid-turn buffer、OneSecond reaction、stop interrupt、result 后 drain 逻辑保持同一条 Session 路径；不会在当前 turn 中途迁移到 Claude。
 - 模型选择：Codex 模型列表仍来自 app-server `model/list`，Codex effort 仍只接受 app-server/Codex 定义的 `none|minimal|low|medium|high|xhigh`。
-- 卡片与控制台：Codex action value 保持旧形状，不额外带 `provider`；Codex 控制台标题保持原来的 `当前模型`，不显示 `(Codex)`；Codex `agy` 转发按钮默认仍显示 `转 Codex`。
+- 卡片与控制台：Codex action value 保持旧形状，不额外带 `provider`；Codex 控制台标题保持原来的 `当前模型`，不显示 `(Codex)`。
 - 使用量与上下文：Codex token usage、context window、manual compact、thread goal、plan delta 事件仍按原 app-server 事件处理。
 - 持久化兼容：旧版 `session-resume-map.json` 的 string 值按 Codex thread id 读取；旧版 `session-model-map.json` 的 string/object 若无 provider，按模型名前缀推断，普通 GPT 模型仍按 Codex 读取。
 
@@ -107,7 +107,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
 - Claude `onUserDialog` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
 - spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。
-- `agy` 转发按钮在 Codex 下保持 `转 Codex`，在 Claude 下显示 `转 Claude`，实际仍进入同一 session 用户消息路径。
+- 一次性跨模型咨询收敛为 daemon-owned `ConsultService` + 主 Agent `lodestar-consult` Skill，不经过主 Session 的消息/resume 路径。
 - 对话卡续卡 banner 在 Codex 下保持 `Codex turn` 原文，在 Claude 下显示 `Claude turn`。
 
 ## Verification Plan

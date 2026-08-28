@@ -8,12 +8,6 @@ const binding = {
   url: 'https://applink.feishu.cn/client/todo/task_list?guid=tl-guid-1',
   projectName: 'feishu',
   ownerOpenId: 'ou_owner',
-  sections: {
-    aiTodo: 'sec-todo',
-    aiDoing: 'sec-doing',
-    aiReview: 'sec-review',
-    done: 'sec-done',
-  },
 }
 
 describe('tasklist panel card rendering', () => {
@@ -25,8 +19,7 @@ describe('tasklist panel card rendering', () => {
     }) as any
 
     const json = JSON.stringify(card)
-    expect(card.header.title.content).toBe('task · 预览版')
-    expect(json).toContain('阶段：预览版')
+    expect(card.header.title.content).toBe('task')
     expect(json).toContain('未启用')
     expect(json).toContain('启用')
     expect(json).toContain('tasklist_enable')
@@ -43,9 +36,7 @@ describe('tasklist panel card rendering', () => {
 
     const json = JSON.stringify(card)
     expect(json).toContain('已启用')
-    expect(json).toContain('设计中默认')
-    expect(json).toContain('[AI]待执行✓')
-    expect(json).toContain('已完成✓')
+    expect(json).not.toContain('[AI]')
     expect(json).toContain('tl-guid-1')
     expect(json).toContain('tasklist_delete_prompt')
     expect(json).not.toContain('tasklist_delete_confirm')

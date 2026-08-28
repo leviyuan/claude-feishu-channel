@@ -26,14 +26,17 @@ Lodestar 是一个 Bun/TypeScript daemon：它从飞书 WebSocket 接收消息�
 
 ## 跨模块不变式
 
-- 一个飞书群只对应一个 `Session` 和一个当前 agent 进程。Codex 走 `codex app-server --listen stdio://` JSON-RPC；Claude/GLM/DeepSeek/native 走 `@anthropic-ai/claude-agent-sdk` 的 streaming-input `query()`。不要恢复 tmux、旧 JSONL 队列或旁路进程控制。
+- 一个飞书群只对应一个 `Session` 和一个当前主 agent 进程。Codex 走 `codex app-server --listen stdio://` JSON-RPC；Claude/GLM/DeepSeek/native 走 `@anthropic-ai/claude-agent-sdk` 的 streaming-input `query()`。`ConsultService` 可按全局身份并行启动文件系统只读、网络开放、一次性 reviewer，但它们不得接收群消息、绑定 resume id 或继承 consult capability。不要恢复 tmux、旧 JSONL 队列或旁路进程控制。
+- daemon-owned Skill 必须由 `managed-skills.ts` 同源同步：Codex/Claude standalone 目录用于各自 user source，另生成 Claude 本地插件供排除 user settings/env 的 GLM/DeepSeek SDK 主会话显式加载。不得为了加载 Skill 把 user source 重新混入注入凭据的 TokenSource。
 - Token Source 是账号、凭据、模型目录、spawn env 和额度的真相源。内置 source 包括 Codex subscription、GLM Coding Plan、DeepSeek 与 Claude native；GLM/DeepSeek 可由 config 或本机 Claude settings 探测，存在显式 Claude-side source 时 native 让位。新增 source 按 factory 注册模式扩展，禁止在 model/session 层再建固定枚举。
+- Consult 身份目录必须动态遍历 Token Source 的全部模型，以字面 `max` 作默认 effort；不支持 max、source disabled 或目录刷新失败都显示 MISS，禁止换模型/降 effort。全局 preset 只引用 source/model，不复制凭据或建第二份模型目录。
+- 同一用户意图选择多个 consult 身份时，主 Agent 必须用一个 run 携带全部 identity id；并发只由 run 内 fan-out 实现，禁止按身份拆成多个后台或顺序 run。服务端的每群 active-run 守护必须在首次 await 前完成原子占位，不能用“检查后建卡、建卡后登记”的竞态流程。
 - `model` 是账号→模型→effort 三级动态面板。Codex 模型来自 app-server `model/list`，GLM/DeepSeek 来自兼容端点并允许受验证的补录，native 使用 SDK aliases；失败显示 MISS，不造假选项。
 - 同 provider、同 token source 的模型设置走 `setModelSettings`：Claude 从后续 turn 使用，Codex 持久目标需重启进程生效。跨 provider 或跨 source 会改变进程/env，只能在空闲时停止旧进程并按各 provider 独立 resume id 重新启动；活跃或排队状态按现有规则拒绝切换。
 - Claude 路径保留原生 session resume/fork、`fk`/`bk`/`rs`、AskUserQuestion、project profile、MCP/skills、主动 `/compact` 和 SDK `task_*` 后台任务；Codex 路径保留 app-server 权限、`request_user_input`、plan/goal、compaction、usage 与 collab 子 agent 映射。共享卡片事件不能抹平两端确有差异。
 - `cardkit.ts` 独占生产卡的 sequence、队列、流式 TTL 重开、元素计数和写失败状态。session 与模板不得旁路它直调 Card Kit HTTP；专用探针只能在 `scripts/cardkit-probe.ts` 中显式操作测试卡。
 - Assistant 正文按完整 block 插入静态元素，不走 `/content` 逐字输出；footer 用 element replace。公式渲染、换卡和 turn 收尾服从同一 per-card 队列，具体事务见 `src/AGENTS.md`。
-- `worktree.ts` 独占 `work/*` 分支和同级 `<project>[name]` worktree 操作；`agy-task.ts` 独占 agy 参数与 Git 快照；任务绑定、worker 调度和模板分别留在既有模块。
+- `worktree.ts` 独占 `work/*` 分支和同级 `<project>[name]` worktree 操作。飞书任务清单只保留基础绑定/删除，不运行自动计划、执行、审核或合并 worker。
 - `[[send: /abs/path]]` 由 outbound marker 流程解析并作为独立飞书文件消息发送；正文保留原标记作为可见回执，卡片模板本身不得读取本机文件。
 
 ## Live daemon 操作

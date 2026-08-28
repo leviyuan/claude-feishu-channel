@@ -48,6 +48,7 @@ registerTokenSourceFactory({
       display: 'Claude',
       enabled: false,  // buildTokenSourcesFromConfig 后处理:无 claude source 启用时置 true
       models: NATIVE_MODELS,
+      modelCatalogState: { status: 'ready', updatedAt: Date.now() },
       defaultModel: 'opus',
       // native 透传本机配置,需读 user settings.json(Claude Code 的 env / API key / 中转);
       // 注入 env 的 source(glm/deepseek)不设此字段 → DEFAULT(['project','local'],不读 user,spawnEnv 权威)。
@@ -55,6 +56,10 @@ registerTokenSourceFactory({
       async refreshModels(): Promise<void> {
         // 静态 alias 列表,无网络拉取;幂等重赋值即可。
         ts.models = NATIVE_MODELS
+        ts.modelCatalogState = {
+          status: ts.enabled ? 'ready' : 'disabled',
+          updatedAt: Date.now(),
+        }
       },
       spawnEnv(base: Env): Env {
         // 透传:零注入、零 scrub —— Claude SDK 完全用本机 settings.json / 默认配置。

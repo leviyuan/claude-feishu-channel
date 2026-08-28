@@ -40,7 +40,6 @@ export interface WorktreeInstructionsFile {
 
 const WORK_BRANCH_PREFIX = 'work/'
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
-const AUTOMATION_WORKTREE_PREFIX = 'AI-'
 const projectWorktreeTails = new Map<string, Promise<void>>()
 
 /** Serialize every worktree registry transaction for one canonical repository.
@@ -68,10 +67,6 @@ export function normalizeWorktreeSlug(raw: string): string | null {
   const slug = raw.trim()
   if (!SLUG_RE.test(slug)) return null
   return slug
-}
-
-export function isReservedWorktreeSlug(slug: string): boolean {
-  return slug.startsWith(AUTOMATION_WORKTREE_PREFIX)
 }
 
 export function projectNameFromSessionName(sessionName: string): string {
@@ -124,7 +119,6 @@ export function listProjectWorktrees(projectDir: string, projectName: string): W
   for (const branch of branches) {
     const slug = branch.slice(WORK_BRANCH_PREFIX.length)
     if (!normalizeWorktreeSlug(slug)) continue
-    if (isReservedWorktreeSlug(slug)) continue
     const chatName = worktreeChatName(projectName, slug)
     const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
     const mountedPath = mountedByBranch.get(branch) ?? null

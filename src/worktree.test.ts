@@ -155,17 +155,6 @@ describe('project worktrees', () => {
     expect(updated.find(e => e.slug === 'stale-work')?.state).toBe('stale')
   })
 
-  test('ignores AI-prefixed work branches in managed wt lists', () => {
-    const { repo } = initRepo()
-    git(repo, ['branch', 'work/AI-AUTO'])
-    git(repo, ['branch', 'work/AI-REVIEW'])
-    ensureProjectWorktree(repo, 'feishu', 'feature-worktree')
-
-    const entries = listProjectWorktrees(repo, 'feishu')
-
-    expect(entries.map(e => e.slug)).toEqual(['feature-worktree'])
-  })
-
   test('finds first-segment agents file for managed worktree branches', () => {
     const { repo } = initRepo()
     const result = ensureProjectWorktree(repo, 'feishu', 'avatar-art')

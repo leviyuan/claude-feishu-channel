@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.15.1",
+  "version": "0.16.0",
   "publishConfig": {
     "access": "public"
   },
@@ -40,7 +40,8 @@
     "build:stop": "bun build src/stop-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-stop.js",
     "build:update": "bun build src/update-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-update.js",
     "build:version": "bun build src/version-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-version.js",
-    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version",
+    "build:consult": "bun build src/consult-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-consult.js",
+    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version && bun run build:consult",
     "prepublishOnly": "bun run ci",
     "postinstall": "node scripts/postinstall.cjs"
   },
@@ -49,7 +50,8 @@
     "lodestar-setup": "./dist/lodestar-setup.js",
     "lodestar-stop": "./dist/lodestar-stop.js",
     "lodestar-update": "./dist/lodestar-update.js",
-    "lodestar-version": "./dist/lodestar-version.js"
+    "lodestar-version": "./dist/lodestar-version.js",
+    "lodestar-consult": "./dist/lodestar-consult.js"
   },
   "files": [
     "dist/",

@@ -7,13 +7,14 @@
  * Codex turns.
  *
  * Tool tracking, AskUserQuestion flow, permission rendering, command
- * routing, model/task/wt/compact panels, and agy tasks live in sibling
+ * routing and model/task/wt/compact panels live in sibling
  * session-*.ts modules. Fields touched by those helpers carry no
  * `private` modifier — convention is "no modifier = package-internal,
  * only the session-*.ts helpers should touch it."
  */
 
 import { existsSync } from 'node:fs'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import {
   CODEX_EFFORT,
@@ -62,6 +63,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
+import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
 import { readUsage, refreshUsageFromConnection, observeRateLimitsNotification, peekUsage, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
@@ -73,7 +75,6 @@ import { extractSendMarkerPaths, normalizeOutboundPath } from './outbound-marker
 import * as sessionMultimsg from './session-multimsg'
 import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
-import * as sessionAgy from './session-agy'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionPermission from './session-permission'
@@ -90,6 +91,7 @@ import {
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
+import * as sessionConsultIdentities from './session-consult-identities'
 import * as sessionTasklist from './session-tasklist'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
@@ -123,6 +125,15 @@ function findCodexRpcResponseError(
     return findCodexRpcResponseError(error.cause, seen)
   }
   return null
+}
+
+function consultApiUrl(bind: string, port: number): string {
+  const host = bind === '0.0.0.0'
+    ? '127.0.0.1'
+    : bind === '::' || bind === '::1'
+      ? '[::1]'
+      : bind
+  return `http://${host}:${port}`
 }
 
 function compactionKey(notice: ContextCompactedNotification): string {
@@ -266,6 +277,7 @@ export class Session {
    * or a later explicit stop/restart successfully confirms termination. */
   private blockedProc: AgentProcess | null = null
   private blockedProcReason: string | null = null
+  private consultCapability: string | null = null
   /** Spawn-affecting token-source revision captured for each owned process.
    * Same source id with rotated credentials/base URL must still replace the
    * idle child after the registry is rebuilt. Weak keys avoid lifecycle leaks. */
@@ -499,9 +511,6 @@ export class Session {
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
   manualContextCompactionPending = false
-  runningAgy: sessionAgy.AgyTaskState | null = null
-  startingAgy = false
-  agyForwardPrompts = new Map<string, sessionAgy.AgyForwardRecord>()
   /** Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex
    * 的 TodoWrite 一次就带完整列表,直接渲染即可;但 Claude Code 把它拆成 4
    * 个单点工具,只有 TaskList 才有完整快照。这里跨 turn / rotate 累积一份
@@ -882,6 +891,12 @@ export class Session {
   }
 
   private spawnAgent(resumeRef?: ConversationRef): AgentProcess {
+    this.consultCapability = randomBytes(32).toString('base64url')
+    const hostEnv = {
+      LODESTAR_CONSULT_URL: consultApiUrl(config.notify.bind, config.notify.port),
+      LODESTAR_CONSULT_CAPABILITY: this.consultCapability,
+      LODESTAR_CONSULT_SESSION: this.sessionName,
+    }
     const launch: ConversationLaunch = this.pendingConversationLaunch
       ?? this.pendingMaterializationLaunch()
       ?? (resumeRef
@@ -917,8 +932,12 @@ export class Session {
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(this.worktreeProjectName()),
         ...(ts?.settingSources ? { settingSources: ts.settingSources } : {}),
+        ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1'
+          ? {}
+          : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
         tokenSourceId: ts?.id ?? null,
         transformEnv,
+        hostEnv,
       })
       this.procSourceRevisions.set(proc, ts?.spawnRevision ?? null)
       return proc
@@ -931,6 +950,7 @@ export class Session {
       appendSystemPrompt: this.spawnDeveloperInstructions(),
       tokenSourceId: ts?.id ?? null,
       transformEnv,
+      hostEnv,
     })
     this.procSourceRevisions.set(proc, ts?.spawnRevision ?? null)
     return proc
@@ -1164,18 +1184,6 @@ export class Session {
     }
   }
 
-  beginAgyForwardToCodex(resultIdRaw: string, userOpenId = ''): ModelActionResult {
-    return sessionAgy.beginAgyForwardToCodex(this, resultIdRaw, userOpenId)
-  }
-
-  runAgyCommand(prompt: string): Promise<void> {
-    return sessionAgy.runAgyCommand(this, prompt)
-  }
-
-  stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
-    return sessionAgy.stopAgyTask(this, status)
-  }
-
   private async runLifecycle<T>(label: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.lifecycleTail
     let release!: () => void
@@ -1279,6 +1287,7 @@ export class Session {
     this.invalidateTurnOpen()
     this.invalidateBackgroundOpen()
     this.proc = null
+    this.consultCapability = null
     if (this.stoppingProc === proc) this.stoppingProc = null
     if (this.blockedProc === proc) {
       this.blockedProc = null
@@ -1290,6 +1299,19 @@ export class Session {
 
   private beginProcStop(proc: AgentProcess): void {
     this.stoppingProc = proc
+    this.consultCapability = null
+  }
+
+  acceptsConsultCapability(value: string): boolean {
+    const expected = this.consultCapability
+    if (!expected || !value || !this.proc?.isAlive()) return false
+    const a = Buffer.from(expected)
+    const b = Buffer.from(value)
+    return a.length === b.length && timingSafeEqual(a, b)
+  }
+
+  async cancelConsultRuns(reason = '用户取消'): Promise<void> {
+    await this.opts.onCancelConsultRuns?.(this.sessionName, this.chatId, reason)
   }
 
   /** Returns true only when process termination is confirmed. */
@@ -1622,12 +1644,12 @@ export class Session {
   private async stopUnlocked(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
-    const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
+    await this.cancelConsultRuns(reason)
     if (!this.proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      report?.(stoppedAgy ? `✅ ${reason}` : '⚪ session 当前未运行')
-      if (announce && !stoppedAgy) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
+      report?.('⚪ session 当前未运行')
+      if (announce) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
     const proc = this.proc
@@ -2365,6 +2387,38 @@ export class Session {
     return sessionTasklist.showTasklistPanel(this)
   }
 
+  showConsultIdentityPanel(userOpenId = ''): Promise<void> {
+    return sessionConsultIdentities.showConsultIdentityPanel(this, userOpenId)
+  }
+
+  onConsultIdentityAdd(panelId: string, identityId: string, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityAdd(panelId, identityId, userOpenId)
+  }
+
+  onConsultIdentityRole(panelId: string, identityId: string, role: string, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityRole(panelId, identityId, role, userOpenId)
+  }
+
+  onConsultIdentityToggle(panelId: string, presetId: string, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityToggle(panelId, presetId, userOpenId)
+  }
+
+  onConsultIdentityDelete(panelId: string, presetId: string, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityDelete(panelId, presetId, userOpenId)
+  }
+
+  onConsultIdentityDeleteConfirm(panelId: string, presetId: string, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityDeleteConfirm(panelId, presetId, userOpenId)
+  }
+
+  onConsultIdentityPage(panelId: string, page: unknown, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityPage(panelId, page, userOpenId)
+  }
+
+  onConsultIdentityBack(panelId: string, userOpenId: string): ModelActionResult {
+    return sessionConsultIdentities.onConsultIdentityBack(panelId, userOpenId)
+  }
+
   onTasklistEnable(): Promise<TasklistActionResult> {
     return sessionTasklist.onTasklistEnable(this)
   }
@@ -2692,10 +2746,6 @@ export class Session {
     // misclassified as queued and its card closes with `📨 转交新卡`
     // instead of `✅`.
     this.clearStaleIdleQueueState('user_message')
-    if (this.startingAgy || this.runningAgy) {
-      await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
-      return
-    }
     if (
       this.proc?.isAlive() &&
       !this.currentTurn &&
@@ -3702,6 +3752,9 @@ export class Session {
         return
       }
       this.discardPendingCodexTurnAnchors(p, 'unexpected process exit')
+      void this.cancelConsultRuns(`${p.provider} process exited`).catch(error => {
+        log(`session "${this.sessionName}": cancel consult after process exit failed: ${messageOf(error)}`)
+      })
       const backend = this.backendLabel(p.provider)
       const exitDetail = `code=${code ?? 'null'}, signal=${signal ?? 'null'}`
       const terminalSuffix = expected

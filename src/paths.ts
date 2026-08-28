@@ -15,6 +15,9 @@
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
  *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
+ *   consult-identities.json — global reviewer role presets   (in DATA_DIR)
+ *   consult-runs/           — terminal consultation reports  (in DATA_DIR)
+ *   managed-claude-plugin/  — daemon-owned Skills for SDK     (in DATA_DIR)
  *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
@@ -75,6 +78,15 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
+/** Global reviewer aliases/roles shared by every project group. Catalog
+ * identities derived from token sources are not duplicated here. */
+export const CONSULT_IDENTITIES_FILE = join(DATA_DIR, 'consult-identities.json')
+/** Completed consultation reports. Active process handles remain in memory;
+ * terminal artifacts live here for CLI/status inspection and audit. */
+export const CONSULT_RUNS_DIR = join(DATA_DIR, 'consult-runs')
+/** Daemon-owned Claude Agent SDK plugin. It mirrors every managed Skill so
+ * injected TokenSources can load them without enabling user settings/env. */
+export const MANAGED_CLAUDE_PLUGIN_DIR = join(DATA_DIR, 'managed-claude-plugin')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
  *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow
  *  (CLI 按 [1m] 后缀记 1M)或爆窗错误(model_context_window_exceeded → 200K 降级)。

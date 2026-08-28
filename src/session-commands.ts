@@ -31,17 +31,12 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
 export async function runCommand(s: Session, raw: string, userOpenId = ''): Promise<boolean> {
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
   if (wt) {
-    if (s.startingAgy || s.runningAgy) {
-      await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 wt。')
-      return true
-    }
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
     return true
   }
   // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
   // bk/back = 列 turn；点选并通过 stale/owner 校验后才终止并切到新分支。
   if (raw.trim().match(/^btw$/i)) {
-    if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
     await s.runBtwCommand(userOpenId)
     return true
   }
@@ -50,24 +45,21 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     return true
   }
   if (raw.trim().match(/^(?:fk|fork)$/i)) {
-    if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 fk。'); return true }
     await s.showForkList(userOpenId)
     return true
   }
   if (raw.trim().match(/^(?:bk|back)$/i)) {
-    if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 bk。'); return true }
     // 只展示选择卡；真正的 stop→fork 在点击具体锚点并通过 owner/provider/cwd
     // 校验之后发生，避免用户看完不点也被提前终止。
     await s.showBackList(userOpenId)
     return true
   }
-  const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
-  if (agy) {
-    await s.runAgyCommand((agy[1] ?? '').trim())
-    return true
-  }
   if (raw.trim().toLowerCase() === 'task') {
     await s.showTasklistPanel()
+    return true
+  }
+  if (raw.trim().match(/^(?:reviewers|reviewer)$/i)) {
+    await s.showConsultIdentityPanel(userOpenId)
     return true
   }
   // <source>-setup <args> —— 启用某 token source(generic:路由到 source factory 的 setup.parseArgs,
@@ -80,10 +72,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
   }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
   if (!command) return false
-  if ((s.startingAgy || s.runningAgy) && !['stop', 'kill', 'restart', 'hi', 'model'].includes(command)) {
-    await feishu.sendText(s.chatId, `⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再执行 ${command}。`)
-    return true
-  }
   switch (command) {
     case 'model':
       await s.showModelPanel()
@@ -129,10 +117,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       await s.showConsole()
       return true
     case 'stop':
-      if (s.runningAgy) {
-        await s.stopAgyTask('🛑 agy 已打断')
-        return true
-      }
+      await s.cancelConsultRuns('stop command')
       // Soft barge-out: interrupt the current turn (if any) AND drop
       // the pending-message count so a stack of type-ahead doesn't
       // refire after the interrupt. Subprocess stays alive. Note: the
@@ -192,7 +177,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       return true
     case 'kill':
       {
-        if (s.runningAgy) await s.stopAgyTask('🛑 agy 已终止')
         const wasRunning = s.isRunning()
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = wasRunning ? `🛑 停止 ${backend}` : '⚪ session 当前未运行'
@@ -243,10 +227,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
             ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}`)
             : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
-        if (s.runningAgy) {
-          s.setStatusCard(statusCard, '🛑 restart 前终止 agy')
-          await s.stopAgyTask('🛑 restart 前已终止 agy')
-        }
         let lastStatus = initialStatus
         const ok = await s.restart(true, {
           announce: !statusCard,
