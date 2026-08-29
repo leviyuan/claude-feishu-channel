@@ -54,3 +54,4 @@ Lodestar 是一个 Bun/TypeScript daemon：它从飞书 WebSocket 接收消息�
 - 聚焦命令写在适用的嵌套 AGENTS 中。共享 Session、Card Kit、飞书协议或持久状态有改动时，最终仍跑全量测试。
 - 真实飞书、任一 agent 登录/凭据、Card action、建群/解散或 worktree 流程只能在明确目标群和副作用后做人工 smoke；碰 live daemon 的前置操作仍需单独获得当前消息授权。
 - 发布前必须通过 `bun test` 与 `bun run build`。除非用户明确要求 minor/major，版本只递增 patch；同一版本需发布 npm 与 GitHub Packages、推送 `main` 和 tag，并创建对应 GitHub Release。仓库没有 `gh` CLI 时使用 GitHub REST，临时认证文件用完立即删除。
+- 所有 GitHub Release 版本说明必须使用中文：章节标题、功能与修复说明、验证结果均用中文书写，模型名、API、CLI、Skill、命令和代码标识符可保留原文。不得直接采用英文提交信息或英文模板；创建或更新 Release 前必须检查正文没有整段纯英文说明。
