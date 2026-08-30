@@ -9,6 +9,15 @@ import { roleLabel } from '../consult-roles'
 import { createHash } from 'node:crypto'
 import type { ConsultReviewerResult, ConsultRunSnapshot } from '../consult-types'
 
+/** Card-only preview budgets. Reviewer prompts and durable snapshots retain the
+ * complete strings; these caps protect the aggregate Card Kit payload from
+ * 200860 `card over max size` when a question embeds a codebase or dataset. */
+const CONSULT_QUESTION_PREVIEW_CHARS = 8_000
+const CONSULT_INSTRUCTIONS_PREVIEW_CHARS = 4_000
+const CONSULT_REVIEWER_TOTAL_PREVIEW_CHARS = 48_000
+const CONSULT_REVIEWER_MAX_PREVIEW_CHARS = 7_000
+const CONSULT_REVIEWER_MIN_PREVIEW_CHARS = 512
+
 export interface ConsultIdentityPanelNotice {
   type: 'success' | 'error' | 'info'
   content: string
@@ -119,6 +128,7 @@ export function consultIdentityDeleteCard(opts: {
 }
 
 export function consultRunCard(run: ConsultRunSnapshot): object {
+  const reviewerPreviewChars = consultReviewerPreviewChars(run.reviewers.length)
   return {
     schema: '2.0',
     config: {
@@ -139,24 +149,31 @@ export function consultRunCard(run: ConsultRunSnapshot): object {
           elements: [{
             tag: 'markdown',
             content: [
-              run.question ? `**问题**\n${sanitizeMarkdownForCardKit(run.question)}` : '',
-              run.instructions ? `**要求**\n${sanitizeMarkdownForCardKit(run.instructions)}` : '',
+              run.question
+                ? `**问题**\n${consultInputPreview(run.question, CONSULT_QUESTION_PREVIEW_CHARS, '问题')}`
+                : '',
+              run.instructions
+                ? `**要求**\n${consultInputPreview(run.instructions, CONSULT_INSTRUCTIONS_PREVIEW_CHARS, '要求')}`
+                : '',
               `fingerprint: ${inlineCode(run.targetFingerprint.slice(0, 16))}`,
               run.crossReview ? '交叉复核：开启' : '交叉复核：关闭',
             ].filter(Boolean).join('\n\n'),
           }],
         },
-        ...run.reviewers.map(consultReviewerElement),
+        ...run.reviewers.map(result => consultReviewerElement(result, reviewerPreviewChars)),
         consultRunFooterElement(run),
       ],
     },
   }
 }
 
-export function consultReviewerElement(result: ConsultReviewerResult): object {
+export function consultReviewerElement(
+  result: ConsultReviewerResult,
+  outputPreviewChars = CONSULT_REVIEWER_MAX_PREVIEW_CHARS,
+): object {
   const status = reviewerStatusLabel(result)
   const body: string[] = [`**${escapeMarkdown(status)}**`]
-  if (result.output) body.push('', truncate(sanitizeMarkdownForCardKit(result.output), 7000))
+  if (result.output) body.push('', truncate(sanitizeMarkdownForCardKit(result.output), outputPreviewChars))
   if (result.error) body.push('', `<font color='red'>${sanitizeMarkdownForCardKit(result.error)}</font>`)
   if (!result.output && !result.error) body.push('', '_等待结果…_')
   body.push('', `${inlineCode(result.tokenSourceId)} · ${inlineCode(result.model)} · ${inlineCode(result.effort)}`)
@@ -189,6 +206,14 @@ export function consultRunFooterElement(run: ConsultRunSnapshot): object {
 
 export function consultReviewerElementId(identityId: string): string {
   return `cr_${createHash('sha256').update(identityId).digest('hex').slice(0, 16)}`
+}
+
+export function consultReviewerPreviewChars(reviewerCount: number): number {
+  const count = Math.max(1, Math.floor(reviewerCount))
+  return Math.min(
+    CONSULT_REVIEWER_MAX_PREVIEW_CHARS,
+    Math.max(CONSULT_REVIEWER_MIN_PREVIEW_CHARS, Math.floor(CONSULT_REVIEWER_TOTAL_PREVIEW_CHARS / count)),
+  )
 }
 
 export function consultRunSummary(run: ConsultRunSnapshot): string {
@@ -326,7 +351,18 @@ function targetLabel(run: ConsultRunSnapshot): string {
 }
 
 function truncate(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, max - 24)}\n\n_卡片输出已截断，完整结果由 CLI 返回。_`
+  if (value.length <= max) return value
+  const receipt = '_卡片输出已截断，完整结果由 CLI 返回。_'
+  const headLength = Math.max(0, max - receipt.length - 2)
+  return `${value.slice(0, headLength)}\n\n${receipt}`
+}
+
+function consultInputPreview(value: string, max: number, label: '问题' | '要求'): string {
+  const sanitized = sanitizeMarkdownForCardKit(value)
+  if (sanitized.length <= max) return sanitized
+  const receipt = `_卡片${label}预览已截断；完整${label}仍原样交给 reviewer，并保存在 consult 结果文件中。_`
+  const headLength = Math.max(0, max - receipt.length - 2)
+  return `${sanitized.slice(0, headLength)}\n\n${receipt}`
 }
 
 function shortText(value: string, max: number): string {

@@ -60,6 +60,20 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) #2')
   })
 
+  test('renders a scheduled wakeup banner without exposing the full cron prompt', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 3,
+      provider: 'claude',
+      kind: 'scheduled_wakeup',
+      userInputs: [],
+    }) as any
+
+    expect(card.body.elements[0].content).toContain('⏰ 定时任务触发')
+    expect(card.body.elements[0].content).toContain('Claude')
+    expect(card.body.elements.map((element: any) => element.element_id).filter(Boolean)).toEqual(['footer'])
+  })
+
   test('user input panel neutralizes markdown image syntax that would break card creation', () => {
     // Card Kit 把 `![alt](url)` 解析成 image 并拿 url 当 img_key;外链 URL
     // 被服务端拒(ErrCode 200570 invalid image keys),整张卡 create 失败。

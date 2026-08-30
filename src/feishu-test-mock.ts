@@ -17,6 +17,7 @@ import type { ConversationBranchBase, PendingConversationLaunch } from './conver
 export const sentCards: object[] = []
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
+export const updatedCards: Array<[string, object]> = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const clearedResumes: Array<[string, string | undefined]> = []
@@ -31,6 +32,10 @@ let resumeWriteError: Error | null = null
 export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
 let turnAnchorWriteError: Error | null = null
 export function setTurnAnchorWriteError(error: Error | null): void { turnAnchorWriteError = error }
+let updateCardHandler: ((messageId: string, card: object) => Promise<void>) | null = null
+export function setUpdateCardHandler(handler: ((messageId: string, card: object) => Promise<void>) | null): void {
+  updateCardHandler = handler
+}
 export const modelSelections = new Map<string, {
   provider: 'codex' | 'claude'
   model: string | null
@@ -43,7 +48,7 @@ export const projectProfiles = new Map<string, { cwd?: string }>()
 
 export function resetFeishuMock(): void {
   for (const arr of [
-    sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, clearedResumes, urgentPushes,
+    sentCards, sentTexts, sentRawTexts, updatedCards, deletedReactions, boundResumes, clearedResumes, urgentPushes,
     clearedTurnAnchorSessions, seededTurnAnchors,
   ]) {
     arr.length = 0
@@ -54,6 +59,7 @@ export function resetFeishuMock(): void {
   turnAnchorsBySession.clear()
   resumeWriteError = null
   turnAnchorWriteError = null
+  updateCardHandler = null
   branchBaseBySession.clear()
   pendingConversationLaunchBySession.clear()
 }
@@ -80,6 +86,10 @@ mock.module('./feishu', () => ({
   sendTextRaw: async (_chatId: string, text: string) => {
     sentRawTexts.push(text)
     return 'om_raw'
+  },
+  updateCard: async (messageId: string, card: object) => {
+    updatedCards.push([messageId, card])
+    if (updateCardHandler) await updateCardHandler(messageId, card)
   },
   deleteReaction: async (messageId: string, reactionId: string) => {
     deletedReactions.push([messageId, reactionId])

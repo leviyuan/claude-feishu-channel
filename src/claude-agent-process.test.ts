@@ -341,6 +341,91 @@ describe('Claude background task protocol validation', () => {
 })
 
 describe('Claude user dialog bridge', () => {
+  test('emits only SDK meta string prompts as scheduled turn input', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const scheduled: any[] = []
+    proc.on('scheduled_turn_input', (event: any) => scheduled.push(event))
+
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      promptId: 'cron-prompt-1',
+      permissionMode: 'default',
+      message: { role: 'user', content: '【CrossEX 半小时运行巡检】检查服务并汇报。' },
+    })
+    // 手动用户消息由 Lodestar 自己的 input claim/card 负责，不是 scheduled。
+    proc.handleMessage({
+      type: 'user',
+      isMeta: false,
+      promptSource: 'sdk',
+      promptId: 'manual-prompt',
+      permissionMode: 'default',
+      message: { role: 'user', content: [{ type: 'text', text: '手动检查一下' }] },
+    })
+    // Claude 图片结果也是 meta string，但不是 SDK prompt，不能误开定时卡。
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptId: 'image-result',
+      message: { role: 'user', content: '[Image: original 1440x2400]' },
+    })
+
+    expect(scheduled).toEqual([{
+      text: '【CrossEX 半小时运行巡检】检查服务并汇报。',
+      promptId: 'cron-prompt-1',
+    }])
+  })
+
+  test('marks subagent assistant text with its parent and never promotes its UUID to the main checkpoint', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const texts: any[] = []
+    const stops: any[] = []
+    proc.on('assistant_text', (event: any) => texts.push(event))
+    proc.on('assistant_block_stop', (event: any) => stops.push(event))
+
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-child',
+      parent_tool_use_id: 'task-main-1',
+      message: {
+        model: 'opus',
+        content: [{ type: 'text', text: '子 Agent 的阶段性独白' }],
+      },
+    })
+
+    expect(texts).toEqual([{
+      uuid: 'assistant-child',
+      text: '子 Agent 的阶段性独白',
+      parentToolUseId: 'task-main-1',
+    }])
+    expect(stops).toEqual([{
+      index: 'assistant-child',
+      parentToolUseId: 'task-main-1',
+    }])
+    expect(proc.lastAssistantUuid).toBeNull()
+
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-main',
+      message: {
+        model: 'opus',
+        content: [{ type: 'text', text: '主 Agent 正文' }],
+      },
+    })
+
+    expect(texts.at(-1)).toEqual({
+      uuid: 'assistant-main',
+      text: '主 Agent 正文',
+      parentToolUseId: null,
+    })
+    expect(stops.at(-1)).toEqual({
+      index: 'assistant-main',
+      parentToolUseId: null,
+    })
+    expect(proc.lastAssistantUuid).toBe('assistant-main')
+  })
+
   test('uses session_state_changed running as turn start boundary', () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
@@ -587,6 +672,7 @@ describe('Claude user dialog bridge', () => {
       ['assistant_text', {
         uuid: 'assistant-intro',
         text: '我用视觉分析工具来看这两张图。',
+        parentToolUseId: null,
       }],
       ['tool_use', {
         id: 'call_image_1',

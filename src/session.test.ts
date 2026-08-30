@@ -2,8 +2,8 @@ import { EventEmitter } from 'node:events'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   boundResumes, branchBaseBySession, clearedResumes, deletedReactions, projectProfiles, resetFeishuMock,
-  modelSelections, sentCards, sentRawTexts, sentTexts, urgentPushes,
-  setResumeWriteError, setTurnAnchorWriteError,
+  modelSelections, sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
+  setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
 } from './feishu-test-mock'
 
@@ -2331,6 +2331,71 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     return { session, proc }
   }
 
+  test('an init already owned by an eager-open card consumes its SDK input claim without creating a later empty user turn', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastUserOpenId = 'ou_user'
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_eager_user')
+    session.pendingUserMessageCount = 1
+    session.pendingReactionIds = new Map([['om_later_buffered', 'reaction_later']])
+
+    proc.emit('init', { session_id: 'claude-session-1' })
+
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.pendingReactionIds).toEqual(new Map([['om_later_buffered', 'reaction_later']]))
+    expect(session.currentBatchReactionIds.size).toBe(0)
+
+    session.currentTurn = null
+    proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+    proc.emit('init', { session_id: 'claude-session-1' })
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('bg_task_resume')
+      expect(session.currentTurn.trigger).not.toBe('user_message')
+    } finally {
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+    }
+  })
+
+  test('defensive init owner conflict stays inside the Session and preserves the unclaimed input', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.pendingUserMessageCount = 1
+    session.pendingTurnInputs = ['still pending']
+    session.beginTurnOpen = () => { throw new Error('forced owner conflict') }
+
+    expect(() => proc.emit('init', { session_id: 'claude-session-1' })).not.toThrow()
+    expect(proc.isAlive()).toBe(true)
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.pendingTurnInputs).toEqual(['still pending'])
+    expect(sentCards).toHaveLength(0)
+  })
+
+  test('defensive drain owner conflict leaves the user batch and reactions queued', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.pendingMidTurnMsgs = [{
+      text: 'must survive', wireText: 'must survive', userOpenId: 'ou_user', msgId: 'om_survive',
+    }]
+    session.pendingReactionIds = new Map([['om_survive', 'reaction_survive']])
+    session.beginTurnOpen = () => { throw new Error('forced owner conflict') }
+
+    await session.drainMidTurnAndOpen()
+
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['must survive'])
+    expect(session.pendingReactionIds).toEqual(new Map([['om_survive', 'reaction_survive']]))
+    expect(proc.sentTexts).toEqual([])
+  })
+
   test('settle 后的自发 init 开 bg_task_resume 卡,终报告落卡、正常收尾并加急推送', async () => {
     const { session, proc } = wiredClaudeSession()
     expect(session.currentTurn).toBeNull()
@@ -2343,8 +2408,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       expect(session.currentTurn.trigger).toBe('bg_task_resume')
       expect(session.status).toBe('working')
 
-      proc.emit('assistant_text', { text: '双盲 review 合并终报告' })
-      proc.emit('assistant_block_stop', {})
+      proc.emit('assistant_text', { text: '双盲 review 合并终报告', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
       emitClaudeResult(proc)
       await waitFor(() => session.currentTurn === null)
       // closeTurnCard 是 fire-and-forget:等终态 settings patch 落地再断言
@@ -2367,6 +2432,39 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     }
   })
 
+  test('Cron scheduled input arriving after an empty init opens its own card and renders the report', async () => {
+    const { session, proc } = wiredClaudeSession()
+
+    proc.emit('init', { session_id: 'claude-session-1' })
+    expect(session.currentTurn).toBeNull()
+    proc.emit('scheduled_turn_input', {
+      text: '【CrossEX 半小时运行巡检】检查服务并汇报。',
+      promptId: 'cron-prompt-1',
+    })
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('scheduled_wakeup')
+      expect(JSON.stringify(sentCards.at(-1))).toContain('定时任务触发')
+      expect(JSON.stringify(sentCards.at(-1))).not.toContain('CrossEX 半小时运行巡检')
+
+      proc.emit('assistant_text', { text: '**巡检 10:13**：服务正常，零异常。', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant-cron-1', parentToolUseId: null })
+      emitClaudeResult(proc)
+      await waitFor(() => session.currentTurn === null)
+      await cardkit.flush('card_status_1')
+
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        /\/cards\/[^/]+\/elements$/.test(call.path) &&
+        String(call.body?.elements ?? '').includes('巡检 10:13')
+      )).toBe(true)
+      expect(sentTexts.some(text => text.includes('后台轮输出'))).toBe(false)
+    } finally {
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+    }
+  })
+
   test('开卡窗口期先到的 assistant 文本并入新卡,不丢', async () => {
     const { session, proc } = wiredClaudeSession()
 
@@ -2374,8 +2472,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     proc.emit('init', { session_id: 'claude-session-1' })
     // openTurnCard 还在 await sendCard/id_convert,文本已经开始流 —— 事故里
     // 55ms 后模型就开写。这些字必须并入随后落地的卡。
-    proc.emit('assistant_text', { text: '窗口期先到的段落' })
-    proc.emit('assistant_block_stop', {})
+    proc.emit('assistant_text', { text: '窗口期先到的段落', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
     await waitFor(() => session.currentTurn !== null)
 
     try {
@@ -2425,8 +2523,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
       proc.emit('init', { session_id: 'claude-session-1' })
       // 开卡在 await 中就会失败;这些字必须仍被兜住(开卡窗口 + cardless 续窗)。
-      proc.emit('assistant_text', { text: '孤儿终报告内容' })
-      proc.emit('assistant_block_stop', {})
+      proc.emit('assistant_text', { text: '孤儿终报告内容', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
       await waitFor(() => session.bgResumeCardless === true || session.currentTurn !== null)
       emitClaudeResult(proc)
       await waitFor(() => sentTexts.length > 0)
@@ -2457,8 +2555,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
 
       // interrupt 落地前 SDK 仍在流式:这些 delta 到达时已无卡。旧行为是
       // 静默丢弃 —— 修复后必须仍然丢弃,不能变成 📄 纯文本兜底。
-      proc.emit('assistant_text', { text: '被取消的轮次尾巴' })
-      proc.emit('assistant_block_stop', {})
+      proc.emit('assistant_text', { text: '被取消的轮次尾巴', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
       emitClaudeResult(proc)
       await new Promise(resolve => setTimeout(resolve, 30))
 
@@ -2476,8 +2574,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
 
     proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
     proc.emit('init', { session_id: 'claude-session-1' }) // 开始开卡(await sendCard/id_convert)
-    proc.emit('assistant_text', { text: '短恢复轮输出' })
-    proc.emit('assistant_block_stop', {})
+    proc.emit('assistant_text', { text: '短恢复轮输出', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
     // 开卡还没落地(openingTurn 仍 true)就来 result —— 竞态窗口。
     emitClaudeResult(proc)
 
@@ -2494,6 +2592,76 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     expect(inCard).toBe(true)
     // 卡片已收尾(有终态 settings patch),session 不卡在 working。
     expect(session.status).toBe('idle')
+  })
+
+  test('用户消息撞上 bg-resume 开卡时排队等待,不抢 owner、不重复迁移、不把后台正文塞进用户卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastUserOpenId = 'ou_user'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' })
+
+    session.backgroundTasks = [{
+      id: 'still-running',
+      type: 'shell',
+      description: 'long review',
+      status: 'running',
+      startedAt: Date.now(),
+      steps: [],
+    }]
+    session.backgroundCard = { messageId: 'om_bg_old', cardId: 'card_bg_old' }
+
+    let releaseMigration: () => void = () => {}
+    const migrationGate = new Promise<void>(resolve => { releaseMigration = resolve })
+    let migrateCalls = 0
+    session.migrateBackgroundCard = async function () {
+      migrateCalls++
+      await migrationGate
+      this.backgroundCard = null
+      this.backgroundTasks = []
+    }
+
+    try {
+      session.bgResumePending = true
+      proc.emit('init', { session_id: 'claude-session-1' })
+      await waitFor(() => migrateCalls === 1 && session.openingTurn)
+
+      proc.emit('assistant_text', { text: '上一轮后台结果', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant_bg', parentToolUseId: null })
+      await session.onUserMessage('请只讲直接结论', [], 'ou_user', '')
+      expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['请只讲直接结论'])
+
+      emitClaudeResult(proc)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      // result handler 只能等待既有 bg-resume owner；不能 beginTurnOpen 覆盖它，
+      // 更不能让两条 openTurnCard 协程同时迁移同一张后台卡。
+      expect(migrateCalls).toBe(1)
+
+      releaseMigration()
+      await waitFor(() => session.currentTurn?.trigger === 'user_message' && !session.openingTurn)
+      const userCardId = session.currentTurn.cardId
+      await cardkit.flush(userCardId)
+
+      expect(proc.sentTexts).toEqual(['请只讲直接结论'])
+      expect(sentTexts.some(text => text.includes('后台轮输出'))).toBe(false)
+      expect(calls.some(call =>
+        call.path === `/cards/${userCardId}/elements` &&
+        String(call.body?.elements ?? '').includes('上一轮后台结果')
+      )).toBe(false)
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        /\/cards\/[^/]+\/elements$/.test(call.path) &&
+        String(call.body?.elements ?? '').includes('上一轮后台结果')
+      )).toBe(true)
+    } finally {
+      releaseMigration()
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+      session.backgroundCard = null
+      session.backgroundTasks = []
+      session.pendingBgTasks = []
+    }
   })
 
   test('切换 provider 停旧进程时清掉 bgResumePending,新进程 boot init 不误开恢复卡', async () => {
@@ -2562,6 +2730,44 @@ describe('Session claude subagent tool calls stay off the main card', () => {
     } finally {
       session.stopFooterStatus(session.currentTurn)
       await cardkit.dispose('card_subagent_iso')
+    }
+  })
+
+  test('子 agent assistant text/block_stop 不进入主卡,主 agent 正文仍正常渲染', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_text_iso')
+    cardkit.recordCardCreated('card_subagent_text_iso', 1)
+
+    try {
+      proc.emit('assistant_text', {
+        text: '我将并行开展多轮搜索来收集证据。',
+        parentToolUseId: 'task_main_1',
+      })
+      proc.emit('assistant_block_stop', {
+        index: 'assistant_child_1',
+        parentToolUseId: 'task_main_1',
+      })
+
+      expect(session.currentTurn.assistantSegmentCount).toBe(0)
+      expect(session.currentTurn.segmentTexts.size).toBe(0)
+
+      proc.emit('assistant_text', { text: '这是主 Agent 的结论。', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant_main_1', parentToolUseId: null })
+      await cardkit.flush('card_subagent_text_iso')
+
+      expect(session.currentTurn.assistantSegmentCount).toBe(1)
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['这是主 Agent 的结论。'])
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_subagent_text_iso/elements' &&
+        String(call.body?.elements ?? '').includes('我将并行开展多轮搜索')
+      )).toBe(false)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_subagent_text_iso')
     }
   })
 
@@ -2769,6 +2975,128 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
       session.backgroundTasks = []
       if (cardId) await cardkit.dispose(cardId)
       globalThis.fetch = baseFetch
+    }
+  })
+
+  test('background migration is single-flight and rejects refresh writes against the transitioning element tree', async () => {
+    const session = new Session('background-migration-owner', 'chat_id') as any
+    const running = makeRunningTask('running')
+    const completed = {
+      id: 'completed',
+      type: 'subagent',
+      description: 'done',
+      status: 'completed',
+      startedAt: Date.now() - 1000,
+      endTime: Date.now(),
+      steps: [],
+    }
+    session.backgroundTasks = [running, completed]
+    session.backgroundCard = { messageId: 'om_bg_migrate', cardId: 'card_bg_migrate' }
+    session.backgroundDetailAdded = new Set(['running', 'completed'])
+    cardkit.recordCardCreated('card_bg_migrate', 2)
+
+    let releaseUpdate: () => void = () => {}
+    const updateGate = new Promise<void>(resolve => { releaseUpdate = resolve })
+    setUpdateCardHandler(async () => { await updateGate })
+
+    try {
+      const first = session.migrateBackgroundCard()
+      await waitUntil(() => updatedCards.length === 1)
+      const second = session.migrateBackgroundCard()
+
+      expect(second).toBe(first)
+      session.refreshBackgroundCardFull()
+      session.onBackgroundTaskChanged()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path.startsWith('/cards/card_bg_migrate/elements/bg_')
+      )).toBe(false)
+
+      releaseUpdate()
+      await Promise.all([first, second])
+      expect(updatedCards).toHaveLength(1)
+      expect(session.backgroundCard).toBeNull()
+      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['running'])
+    } finally {
+      releaseUpdate()
+      setUpdateCardHandler(null)
+      session.backgroundCard = null
+      session.backgroundTasks = []
+      session.pendingBgTasks = []
+      await cardkit.dispose('card_bg_migrate')
+    }
+  })
+
+  test('a failed migration is retried by terminal settle instead of poisoning stop cleanup', async () => {
+    const session = new Session('background-migration-failure', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    session.backgroundCard = { messageId: 'om_bg_failure', cardId: 'card_bg_failure' }
+    session.backgroundDetailAdded = new Set(['running'])
+    cardkit.recordCardCreated('card_bg_failure', 1)
+
+    let updateCalls = 0
+    let releaseFirstUpdate: () => void = () => {}
+    const firstUpdateGate = new Promise<void>(resolve => { releaseFirstUpdate = resolve })
+    setUpdateCardHandler(async () => {
+      updateCalls++
+      if (updateCalls === 1) {
+        await firstUpdateGate
+        throw new Error('forced migration update failure')
+      }
+    })
+
+    try {
+      const migrationOutcome = session.migrateBackgroundCard().catch((error: Error) => error)
+      await waitUntil(() => updateCalls === 1)
+
+      const reset = session.resetBackgroundTasks()
+      releaseFirstUpdate()
+      await expect(reset).resolves.toBeUndefined()
+      expect(await migrationOutcome).toBeInstanceOf(Error)
+      expect(updateCalls).toBe(2)
+      expect(session.backgroundCard).toBeNull()
+      expect(session.backgroundTasks).toEqual([])
+      expect(JSON.stringify(updatedCards.at(-1)?.[1])).toContain('已终止')
+    } finally {
+      releaseFirstUpdate()
+      setUpdateCardHandler(null)
+      session.migratingBackgroundCard = null
+      session.backgroundCard = null
+      session.backgroundTasks = []
+      await cardkit.dispose('card_bg_failure')
+    }
+  })
+
+  test('stop during a post-snapshot migration cannot leave killed task state behind', async () => {
+    const session = new Session('background-migration-stop-race', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    session.backgroundCard = { messageId: 'om_bg_stop_race', cardId: 'card_bg_stop_race' }
+    session.backgroundDetailAdded = new Set(['running'])
+    cardkit.recordCardCreated('card_bg_stop_race', 1)
+
+    let releaseUpdate: () => void = () => {}
+    const updateGate = new Promise<void>(resolve => { releaseUpdate = resolve })
+    setUpdateCardHandler(async () => { await updateGate })
+
+    try {
+      const migration = session.migrateBackgroundCard()
+      await waitUntil(() => updatedCards.length === 1)
+      const reset = session.resetBackgroundTasks()
+      await new Promise(resolve => setTimeout(resolve, 5))
+
+      releaseUpdate()
+      await Promise.all([migration, reset])
+
+      expect(session.backgroundCard).toBeNull()
+      expect(session.backgroundTasks).toEqual([])
+      expect(session.pendingBgTasks).toEqual([])
+    } finally {
+      releaseUpdate()
+      setUpdateCardHandler(null)
+      session.backgroundCard = null
+      session.backgroundTasks = []
+      await cardkit.dispose('card_bg_stop_race')
     }
   })
 })
@@ -3369,7 +3697,7 @@ describe('Session lifecycle reliability', () => {
     session.initCount = 0
 
     oldProc.emit('init', { session_id: 'old-session' })
-    oldProc.emit('assistant_text', { text: 'stale output' })
+    oldProc.emit('assistant_text', { text: 'stale output', parentToolUseId: null })
     oldProc.emit('exit', { code: 0, signal: 'SIGTERM', expected: false })
     await new Promise(resolve => setTimeout(resolve, 0))
 

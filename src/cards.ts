@@ -106,6 +106,7 @@ export {
   consultReviewerElement,
   consultRunFooterElement,
   consultReviewerElementId,
+  consultReviewerPreviewChars,
   consultRunSummary,
 } from './cards/consult'
 export {

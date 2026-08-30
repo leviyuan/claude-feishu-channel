@@ -128,8 +128,13 @@ export type AgentProcessEventMap = {
   rate_limits_updated: any
   thread_goal_updated: ThreadGoal
   thread_goal_cleared: any
-  assistant_text: { uuid?: string; text: string }
-  assistant_block_stop: { index?: string }
+  /** Claude SDK Cron dequeued an autonomous prompt. Unlike a daemon user
+   * write, this has no pending input claim, so Session must open its own card. */
+  scheduled_turn_input: { text: string; promptId: string | null }
+  /** parentToolUseId 非空 = 子 agent 的正文块。它必须与子 agent 工具事件
+   *  一样保留归属，Session 不得把它追加到主 Agent 对话卡。 */
+  assistant_text: { uuid?: string; text: string; parentToolUseId: string | null }
+  assistant_block_stop: { index?: string; parentToolUseId: string | null }
   /** parentToolUseId 非空 = 子 agent 内的调用,session 只累积进后台 task steps,
    *  不上主卡(与 codex isSubagentThread 分流同构)。 */
   tool_use: { id: string; name: string; input: any; parentToolUseId: string | null }

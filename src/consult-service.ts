@@ -306,7 +306,10 @@ export class ConsultService {
       const landed = await this.deps.replaceElementChecked(
         run.cardId,
         cards.consultReviewerElementId(reviewer.identityId),
-        cards.consultReviewerElement(reviewer),
+        cards.consultReviewerElement(
+          reviewer,
+          cards.consultReviewerPreviewChars(run.snapshot.reviewers.length),
+        ),
       )
       if (!landed) this.recordPresentationError(run, `reviewer card MISS: ${reviewer.identityName}`)
     } catch (error) {

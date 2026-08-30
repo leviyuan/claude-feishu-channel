@@ -764,7 +764,7 @@ export class CodexProcess extends EventEmitter {
       }
       case 'item/agentMessage/delta': {
         if (typeof params.delta === 'string' && params.delta.length > 0) {
-          this.emit('assistant_text', { uuid: params.itemId, text: params.delta })
+          this.emit('assistant_text', { uuid: params.itemId, text: params.delta, parentToolUseId: null })
         } else {
           logUnhandledAppServerPayload('AGENT_MESSAGE_DELTA_EMPTY', { method, params })
         }
@@ -854,7 +854,7 @@ export class CodexProcess extends EventEmitter {
     }
     if (item.type === 'agentMessage') {
       this.lastAssistantUuid = item.id
-      this.emit('assistant_block_stop', { index: item.id })
+      this.emit('assistant_block_stop', { index: item.id, parentToolUseId: null })
       return
     }
     if (this.feedCollabItem(item, 'completed', params)) return
