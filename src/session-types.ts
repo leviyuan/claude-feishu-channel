@@ -201,9 +201,9 @@ export interface SessionOpts {
   }) => Promise<{ ok: boolean; chatId?: string; error?: string }>
   /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用)。*/
   onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string }>
-  /** Daemon-owned consultation workers are outside Session.proc but must be
+  /** Daemon-owned delegated Agents are outside Session.proc but must be
    * cancelled by stop/kill/restart and staged daemon shutdown. */
-  onCancelConsultRuns?: (sessionName: string, chatId: string, reason: string) => Promise<void>
+  onCancelAgentRuns?: (sessionName: string, chatId: string, reason: string) => Promise<void>
 }
 
 /** Per-turn delta extracted from the SDK `result` message — feeds the

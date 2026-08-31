@@ -4,6 +4,7 @@ import type { TurnAnchor } from './feishu'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { resetAgentSessionRegistryForTest } from './agent-session-registry'
 import {
   clearedTurnAnchorSessions,
   branchBaseBySession,
@@ -23,6 +24,7 @@ const {
   showBackList,
   showForkList,
   showResumeList,
+  listClaudeSessions,
 } = await import('./session-temp')
 
 interface TempHarnessState {
@@ -324,6 +326,27 @@ describe('session-temp Codex back', () => {
 })
 
 describe('session-temp Codex stopped-session history', () => {
+  test('Claude history excludes delegated Agent native sessions', () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'lodestar-claude-agent-history-'))
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const workDir = '/workspace/project'
+    const transcriptDir = join(configDir, 'projects', workDir.replace(/[^a-zA-Z0-9]/g, '-'))
+    mkdirSync(transcriptDir, { recursive: true })
+    const line = (content: string) => `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content })}\n`
+    writeFileSync(join(transcriptDir, 'delegated.jsonl'), line('child work'))
+    writeFileSync(join(transcriptDir, 'main.jsonl'), line('main work'))
+    process.env.CLAUDE_CONFIG_DIR = configDir
+    resetAgentSessionRegistryForTest(['claude:delegated'])
+    try {
+      expect(listClaudeSessions(workDir).map(item => item.sessionId)).toEqual(['main'])
+    } finally {
+      resetAgentSessionRegistryForTest()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
   test('rs 对所选历史 thread 创建不带 checkpoint 的 full fork', async () => {
     const h = makeHarness()
     const selectedTs = 1_787_350_000_000

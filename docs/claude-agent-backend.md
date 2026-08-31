@@ -107,7 +107,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
 - Claude `onUserDialog` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
 - spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。
-- 一次性跨模型咨询收敛为 daemon-owned `ConsultService` + 主 Agent `lodestar-consult` Skill，不经过主 Session 的消息/resume 路径。
+- 跨模型调用已收敛为 daemon-owned `AgentService` + `lodestar-agent` Skill：child 是完整 delegated Agent，使用独立 run-scoped capability，可递归委派、桥接输入工具，并通过 provider 原生 session 做 follow-up；它不接收群消息，也不占用主 `Session.proc`。
 - 对话卡续卡 banner 在 Codex 下保持 `Codex turn` 原文，在 Claude 下显示 `Claude turn`。
 
 ## Verification Plan

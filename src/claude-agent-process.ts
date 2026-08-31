@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
-import { delimiter, isAbsolute, join, posix, relative, resolve, sep, win32 } from 'node:path'
+import { delimiter, join, posix, win32 } from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
   query,
@@ -111,89 +111,20 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
   settingSources?: readonly string[]
   /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
   tokenSourceId?: string | null
-  /** Use a narrow custom prompt for isolated consultation workers instead of
-   * the full Claude Code coding-agent preset. */
-  systemPrompt?: string
-  /** Disable filesystem customizations (skills/plugins/hooks/MCP/CLAUDE.md)
-   * while retaining auth/model settings for one-shot reviewers. */
-  safeMode?: boolean
-  /** When present, turn this process into a strict read-only worker: only
-   * Read/Grep/Glob calls whose real paths remain below these roots are
-   * accepted. Other tools and symlink escapes are denied by the host. */
-  readOnlyRoots?: readonly string[]
-  /** Additional non-filesystem tools allowed for a read-only worker. */
-  readOnlyExtraTools?: readonly string[]
   /** Daemon-owned local plugin containing shared Skills. Loaded only when the
-   * effective settingSources omit `user`; reviewers/safe mode never load it. */
+   * effective settingSources omit `user`. */
   managedSkillPluginPath?: string
-}
-
-export function claudeSafeModeArgs(enabled: boolean | undefined): Record<string, string | null> | undefined {
-  return enabled ? { 'safe-mode': null } : undefined
 }
 
 export function claudeManagedSkillOptions(
   settingSources: readonly string[],
   pluginPath: string | undefined,
-  safeMode = false,
 ): Record<string, unknown> {
-  if (!pluginPath || safeMode || settingSources.includes('user')) return {}
+  if (!pluginPath || settingSources.includes('user')) return {}
   return {
     plugins: [{ type: 'local', path: pluginPath, skipMcpDiscovery: true }],
     skills: 'all',
   }
-}
-
-type ClaudeReadToolDecision = { allowed: true } | { allowed: false; message: string }
-
-/** Host-side boundary for Claude's in-process file tools. Claude Code's
- * ordinary read-only mode intentionally permits reads outside cwd, so a
- * one-shot reviewer needs an explicit realpath policy as well. */
-export function claudeReadOnlyToolDecision(
-  toolName: string,
-  input: Record<string, unknown>,
-  workDir: string,
-  roots: readonly string[],
-  extraTools: readonly string[] = [],
-): ClaudeReadToolDecision {
-  if (extraTools.includes(toolName)) return { allowed: true }
-  if (!['Read', 'Grep', 'Glob'].includes(toolName)) {
-    return { allowed: false, message: `consult reviewer tool is not allowed: ${toolName}` }
-  }
-  if (roots.length === 0) {
-    return { allowed: false, message: 'consult reviewer has no readable project root' }
-  }
-  if (toolName === 'Glob') {
-    const pattern = input.pattern
-    if (typeof pattern !== 'string' || !pattern || globPatternEscapesRoot(pattern)) {
-      return { allowed: false, message: 'consult reviewer Glob pattern escapes the project root' }
-    }
-  }
-  const rawPath = toolName === 'Read' ? input.file_path : input.path ?? workDir
-  if (typeof rawPath !== 'string' || !rawPath) {
-    return { allowed: false, message: `consult reviewer ${toolName} path is missing` }
-  }
-  let candidate: string
-  let canonicalRoots: string[]
-  try {
-    candidate = realpathSync(resolve(workDir, rawPath))
-    canonicalRoots = roots.map(root => realpathSync(root))
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    return { allowed: false, message: `consult reviewer path cannot be resolved: ${message}` }
-  }
-  if (canonicalRoots.some(root => pathWithinRoot(candidate, root))) return { allowed: true }
-  return { allowed: false, message: `consult reviewer read is outside the project root: ${rawPath}` }
-}
-
-function globPatternEscapesRoot(pattern: string): boolean {
-  if (isAbsolute(pattern) || pattern.startsWith('~')) return true
-  return pattern.replaceAll('\\', '/').split('/').includes('..')
-}
-
-function pathWithinRoot(candidate: string, root: string): boolean {
-  const child = relative(root, candidate)
-  return child === '' || (!isAbsolute(child) && child !== '..' && !child.startsWith(`..${sep}`))
 }
 
 type ClaudePathLookup = {
@@ -787,7 +718,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     const managedSkillOptions = claudeManagedSkillOptions(
       settingSources,
       this.opts.managedSkillPluginPath,
-      this.opts.safeMode === true,
     )
     const toolsOption = toolsFromProfile(profile)
     const strictMcpConfig = profile?.strictMcp === true
@@ -810,7 +740,6 @@ export class ClaudeAgentProcess extends EventEmitter {
           resume: this.opts.resumeSessionId,
           ...(this.opts.resumeSessionAt ? { resumeSessionAt: this.opts.resumeSessionAt } : {}),
           ...(this.opts.forkSession ? { forkSession: true } : {}),
-          ...(claudeSafeModeArgs(this.opts.safeMode) ? { extraArgs: claudeSafeModeArgs(this.opts.safeMode) } : {}),
           ...(executable.pathToClaudeCodeExecutable
             ? { pathToClaudeCodeExecutable: executable.pathToClaudeCodeExecutable }
             : {}),
@@ -841,7 +770,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           },
           canUseTool: (toolName, input, opts) => this.canUseTool(toolName, input, opts),
           includePartialMessages: false,
-          systemPrompt: this.opts.systemPrompt ?? {
+          systemPrompt: {
             type: 'preset',
             preset: 'claude_code',
             ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
@@ -1077,19 +1006,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     input: Record<string, unknown>,
     options: { signal: AbortSignal; toolUseID: string },
   ): Promise<PermissionResult> {
-    if (this.opts.readOnlyRoots) {
-      const decision = claudeReadOnlyToolDecision(
-        toolName,
-        input,
-        this.opts.workDir,
-        this.opts.readOnlyRoots,
-        this.opts.readOnlyExtraTools,
-      )
-      if (!decision.allowed) {
-        log(`claude-agent-process: denied read-only worker tool ${toolName}: ${decision.message}`)
-        return Promise.resolve({ behavior: 'deny', message: decision.message })
-      }
-    }
     // 非 AskUserQuestion:秒放,复刻旧 bypassPermissions「不弹审批」语义。
     // default 模式下 canUseTool 对每个需权限的工具都会被调,这里只拦 AskUserQuestion。
     if (toolName !== 'AskUserQuestion') {

@@ -10,9 +10,7 @@ export const SUPPORTED_CARD_ACTION_KINDS = new Set([
   'model_panel_cancel', 'model_effort_select', 'ask', 'worktree_disband',
   'temp_fork_select', 'temp_back_select', 'temp_resume_select', 'tasklist_enable',
   'tasklist_delete_prompt', 'tasklist_delete_confirm', 'token_source_enable',
-  'consult_identity_add', 'consult_identity_role', 'consult_identity_toggle',
-  'consult_identity_delete', 'consult_identity_delete_confirm', 'consult_identity_page',
-  'consult_identity_back', 'notify_callback',
+  'agent_identity_page', 'notify_callback',
 ])
 
 /** Admission validation runs synchronously before actor/dedupe reservation;
@@ -213,13 +211,7 @@ function cardActionSemanticKey(data: any): string {
     case 'tasklist_delete_confirm': resource = { guid: value.guid }; break
     case 'tasklist_enable': resource = { guid: value.guid, project: value.project, panel_id: value.panel_id }; break
     case 'token_source_enable': resource = { source_id: value.source_id }; break
-    case 'consult_identity_add': resource = { panel_id: value.panel_id, identity_id: value.identity_id }; break
-    case 'consult_identity_role': resource = { panel_id: value.panel_id, identity_id: value.identity_id }; break
-    case 'consult_identity_toggle':
-    case 'consult_identity_delete':
-    case 'consult_identity_delete_confirm': resource = { panel_id: value.panel_id, preset_id: value.preset_id }; break
-    case 'consult_identity_page': resource = { panel_id: value.panel_id, page: value.page }; break
-    case 'consult_identity_back': resource = { panel_id: value.panel_id }; break
+    case 'agent_identity_page': resource = { panel_id: value.panel_id, page: value.page }; break
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
     case 'provider_select':
     case 'model_select':

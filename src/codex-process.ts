@@ -36,6 +36,7 @@ import {
   type ConversationRef,
   type ConversationSummary,
 } from './conversation'
+import { isAgentSession } from './agent-session-registry'
 import type {
   BgTaskSettledEvent,
   BgTaskStartedEvent,
@@ -95,30 +96,17 @@ export interface SpawnOpts {
   appendSystemPrompt?: string
   /** Host-owned environment injected before token-source credential routing. */
   hostEnv?: Record<string, string | undefined>
-  /** Main sessions retain danger-full-access; one-shot consultation workers
-   * explicitly request read-only. */
-  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
-  /** Outbound network policy for read-only/workspace-write command sandboxes. */
-  networkAccess?: boolean
-  /** Do not persist one-shot consultation threads in the user's history. */
-  ephemeral?: boolean
-  /** Process-level config isolation used by one-shot reviewers. */
-  configOverrides?: string[]
-  disabledFeatures?: string[]
+  /** App-server conversation source label. Delegated agents use a distinct
+   * value so their resumable threads can be excluded from main rs/fk history. */
+  serviceName?: string
   /** token source 注入:对 spawn env 做 scrub+inject(防 A 账号夹带 B 凭据)。未传 = 走 config 默认。 */
   transformEnv?: (env: Record<string, string | undefined>) => Record<string, string | undefined>
   /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
   tokenSourceId?: string | null
 }
 
-export function codexAppServerArgs(opts: Pick<SpawnOpts, 'configOverrides' | 'disabledFeatures'> = {}): string[] {
-  return [
-    'app-server',
-    ...(opts.configOverrides ?? []).flatMap(value => ['--config', value]),
-    ...(opts.disabledFeatures ?? []).flatMap(value => ['--disable', value]),
-    '--listen',
-    'stdio://',
-  ]
+export function codexAppServerArgs(): string[] {
+  return ['app-server', '--listen', 'stdio://']
 }
 
 export function codexAppServerSpawnOptions(
@@ -131,24 +119,6 @@ export function codexAppServerSpawnOptions(
   env: Record<string, string | undefined>
 } {
   return { cwd: workDir, stdio: ['pipe', 'pipe', 'pipe'], shell: false, env }
-}
-
-function turnSandboxPolicy(
-  mode: NonNullable<SpawnOpts['sandbox']>,
-  workDir: string,
-  networkAccess = false,
-): Record<string, unknown> {
-  switch (mode) {
-    case 'read-only': return { type: 'readOnly', networkAccess }
-    case 'workspace-write': return {
-      type: 'workspaceWrite',
-      writableRoots: [workDir],
-      networkAccess,
-      excludeTmpdirEnvVar: false,
-      excludeSlashTmp: false,
-    }
-    default: return { type: 'dangerFullAccess' }
-  }
 }
 
 // gpt-5.6 起服务端新增 max(单 agent 最深推理)与 ultra(多 agent 并行编排,默认 4 agent);
@@ -402,7 +372,7 @@ export class CodexProcess extends EventEmitter {
     this.tokenSourceId = opts.tokenSourceId ?? null
     this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
-    const args = codexAppServerArgs(opts)
+    const args = codexAppServerArgs()
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
     const baseEnv = {
       ...(process.env as Record<string, string>),
@@ -697,7 +667,7 @@ export class CodexProcess extends EventEmitter {
             log(`codex-process: stale turn/completed ignored turn=${completedTurnId} current=${this.currentTurnId}`)
             return
           }
-          if (!this.opts.ephemeral) this.flushRolloutImageGenerations()
+          this.flushRolloutImageGenerations()
           this.markConversationMaterialized('turn/completed notification')
           this.markTurnStartTerminal(completedTurnId)
           this.rememberFinishedTurn(completedTurnId)
@@ -706,7 +676,7 @@ export class CodexProcess extends EventEmitter {
         }
         const status = turn.status
         const isError = status === 'failed' || !!turn.error
-        const isCheckpointable = !this.opts.ephemeral && status === 'completed' && !isError && !!completedTurnId
+        const isCheckpointable = status === 'completed' && !isError && !!completedTurnId
         // Never leave a previous turn's checkpoint visible on a failed,
         // interrupted, or malformed terminal notification.
         this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
@@ -1506,7 +1476,7 @@ export class CodexProcess extends EventEmitter {
       throw new Error(`codex app-server thread/resume returned thread id ${thread.id}, expected ${launch.source.sessionId}`)
     }
     const rolloutPath = typeof thread.path === 'string' && thread.path ? thread.path : null
-    if (!this.opts.ephemeral && (!rolloutPath || !isAbsolute(rolloutPath) || !rolloutPath.endsWith(`${thread.id}.jsonl`))) {
+    if (!rolloutPath || !isAbsolute(rolloutPath) || !rolloutPath.endsWith(`${thread.id}.jsonl`)) {
       throw new Error(`codex app-server ${method} returned invalid thread.path=${rolloutPath ?? 'MISS'}`)
     }
     this.sessionId = thread.id
@@ -1522,12 +1492,11 @@ export class CodexProcess extends EventEmitter {
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort ?? null
     log(`codex-process: thread=${this.sessionId}`)
-    if (!this.opts.ephemeral) this.primeRolloutImageGenerationScan()
+    this.primeRolloutImageGenerationScan()
     this.emit('init', { session_id: this.sessionId, thread })
   }
 
   private markConversationMaterialized(source: string): void {
-    if (this.opts.ephemeral) return
     if (this.conversationResumable) return
     if (!this.sessionId) {
       throw new Error(`codex ${source} arrived before thread initialization`)
@@ -1632,7 +1601,7 @@ export class CodexProcess extends EventEmitter {
       cwd: this.opts.workDir,
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
-      sandbox: this.opts.sandbox ?? 'danger-full-access',
+      sandbox: 'danger-full-access',
       // config 键合并下发:request_user_input flag + effort。effort 走
       // config.model_reasoning_effort —— codex 0.147 顶层 effort 参数是摆设
       // (下发任何值都被无视、回落 ~/.codex/config.toml),config 键才真生效
@@ -1643,8 +1612,7 @@ export class CodexProcess extends EventEmitter {
       },
       ...(this.opts.model ? { model: this.opts.model } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
-      serviceName: 'lodestar',
-      ...(this.opts.ephemeral ? { ephemeral: true } : {}),
+      serviceName: this.opts.serviceName ?? 'lodestar',
     }
   }
 
@@ -1723,6 +1691,7 @@ export class CodexProcess extends EventEmitter {
           : typeof raw.status?.type === 'string'
             ? raw.status.type
             : undefined
+        if (isAgentSession('codex', raw.id)) continue
         conversations.push({
           provider: 'codex',
           sessionId: raw.id,
@@ -1914,11 +1883,7 @@ export class CodexProcess extends EventEmitter {
         cwd: this.opts.workDir,
         runtimeWorkspaceRoots: [this.opts.workDir],
         approvalPolicy: 'never',
-        sandboxPolicy: turnSandboxPolicy(
-          this.opts.sandbox ?? 'danger-full-access',
-          this.opts.workDir,
-          this.opts.networkAccess === true,
-        ),
+        sandboxPolicy: { type: 'dangerFullAccess' },
       })
       this.recordTurnStarted(res?.turn, this.sessionId, 'turn/start response', attempt)
     } catch (e) {

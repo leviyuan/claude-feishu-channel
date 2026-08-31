@@ -58,8 +58,8 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await s.showTasklistPanel()
     return true
   }
-  if (raw.trim().match(/^(?:reviewers|reviewer)$/i)) {
-    await s.showConsultIdentityPanel(userOpenId)
+  if (raw.trim().match(/^(?:agents|agent)$/i)) {
+    await s.showAgentIdentityPanel(userOpenId)
     return true
   }
   // <source>-setup <args> —— 启用某 token source(generic:路由到 source factory 的 setup.parseArgs,
@@ -117,7 +117,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       await s.showConsole()
       return true
     case 'stop':
-      await s.cancelConsultRuns('stop command')
+      await s.cancelAgentRuns('stop command')
       // Soft barge-out: interrupt the current turn (if any) AND drop
       // the pending-message count so a stack of type-ahead doesn't
       // refire after the interrupt. Subprocess stays alive. Note: the

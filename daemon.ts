@@ -39,10 +39,10 @@ import {
 import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
-import { ConsultService } from './src/consult-service'
-import { handleConsultRequest } from './src/consult-api'
-import { ensureLodestarConsultSkill } from './src/consult-skill'
-import { ensureLodestarConsultCommand } from './src/managed-commands'
+import { AgentService } from './src/agent-service'
+import { handleAgentRequest } from './src/agent-api'
+import { ensureLodestarAgentSkill } from './src/agent-skill'
+import { ensureLodestarAgentCommand } from './src/managed-commands'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
@@ -132,11 +132,13 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
           ...chatActor.pending(),
           ...inflightCardActions,
         ])
-        return await Promise.allSettled([
-          ...[...sessions.values()].map(session =>
-            session.stop(`daemon ${reason}`, { announce: false })
-          ),
+        const agentResults = await Promise.allSettled([
+          agentService.shutdown(`daemon ${reason}`),
         ])
+        const sessionResults = await Promise.allSettled(
+          [...sessions.values()].map(session => session.stop(`daemon ${reason}`, { announce: false })),
+        )
+        return [...agentResults, ...sessionResults]
       })()
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null
       const deadline = new Promise<'deadline'>(resolve => {
@@ -193,7 +195,7 @@ process.on('uncaughtException', e => {
 
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
-const consultService = new ConsultService()
+const agentService = new AgentService()
 let pendingReviveSessionNames = new Set<string>()
 const chatActor = new PerKeyActor()
 const cardActionDeduper = new ActionDeduper(30_000)
@@ -243,7 +245,7 @@ const tempSessionRuntime = createTempSessionRuntime<Session>({
     onLifecycleChange: writeCurrentAliveMarker,
     onCreateTempSession: createTempSession,
     onDisbandTempSession: disbandTempSession,
-    onCancelConsultRuns: (name, chatId, reason) => consultService.cancelSessionRuns(name, chatId, reason),
+    onCancelAgentRuns: (name, chatId, reason) => agentService.cancelSessionRuns(name, chatId, reason),
   }),
   ensureChatForSession: feishu.createTempChatForSession,
   disbandChatForSessionExact: feishu.disbandChatForSessionExact,
@@ -557,10 +559,7 @@ function cardActionLabel(kind: string): string {
     temp_back_select: '会话回滚', temp_resume_select: '会话恢复',
     tasklist_enable: '启用任务清单', tasklist_delete_prompt: '删除任务清单',
     tasklist_delete_confirm: '确认删除任务清单', token_source_enable: '启用账号',
-    consult_identity_add: '添加评审身份', consult_identity_role: '选择评审角色',
-    consult_identity_toggle: '启停评审身份', consult_identity_delete: '删除评审身份',
-    consult_identity_delete_confirm: '确认删除评审身份', consult_identity_page: '评审身份翻页',
-    consult_identity_back: '返回评审身份列表',
+    agent_identity_page: 'Agent 身份翻页',
     notify_callback: '通知反馈',
   }
   return labels[kind] ?? kind
@@ -674,7 +673,7 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
   deduper: cardActionDeduper,
   scope: data => {
     const kind = String(data?.action?.value?.kind ?? '')
-    if (kind.startsWith('consult_identity_')) return '__consult_identities_global__'
+    if (kind.startsWith('agent_identity_')) return '__agent_identities_global__'
     return String(data?.context?.open_chat_id ?? '') || '__notify_global__'
   },
   execute: handleCardAction,
@@ -888,38 +887,10 @@ async function handleCardAction(data: any): Promise<any> {
       await onTokenSourceEnable(session, String(value.source_id ?? ''))
       return { toast: { type: 'info', content: '已处理' } }
     }
-    case 'consult_identity_add': {
-      return modelActionResponse(session.onConsultIdentityAdd(
-        String(value.panel_id ?? ''), String(value.identity_id ?? ''), userId,
-      ))
-    }
-    case 'consult_identity_role': {
-      return modelActionResponse(session.onConsultIdentityRole(
-        String(value.panel_id ?? ''), String(value.identity_id ?? ''), String(value.role ?? ''), userId,
-      ))
-    }
-    case 'consult_identity_toggle': {
-      return modelActionResponse(session.onConsultIdentityToggle(
-        String(value.panel_id ?? ''), String(value.preset_id ?? ''), userId,
-      ))
-    }
-    case 'consult_identity_delete': {
-      return modelActionResponse(session.onConsultIdentityDelete(
-        String(value.panel_id ?? ''), String(value.preset_id ?? ''), userId,
-      ))
-    }
-    case 'consult_identity_delete_confirm': {
-      return modelActionResponse(session.onConsultIdentityDeleteConfirm(
-        String(value.panel_id ?? ''), String(value.preset_id ?? ''), userId,
-      ))
-    }
-    case 'consult_identity_page': {
-      return modelActionResponse(session.onConsultIdentityPage(
+    case 'agent_identity_page': {
+      return modelActionResponse(session.onAgentIdentityPage(
         String(value.panel_id ?? ''), value.page, userId,
       ))
-    }
-    case 'consult_identity_back': {
-      return modelActionResponse(session.onConsultIdentityBack(String(value.panel_id ?? ''), userId))
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
@@ -1468,22 +1439,22 @@ async function boot(): Promise<void> {
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,
-    extraHandler: (req, res, url) => handleConsultRequest(req, res, url, {
-      service: consultService,
-      authorize: capability => {
+    extraHandler: (req, res, url) => handleAgentRequest(req, res, url, {
+      service: agentService,
+      authorizeSession: capability => {
         for (const session of sessions.values()) {
-          if (session.acceptsConsultCapability(capability)) return session
+          if (session.acceptsAgentCapability(capability)) return session
         }
         return null
       },
     }),
   })
 
-  // Install the bare consult command first, then sync both managed Skills.
+  // Install the bare delegated-agent command first, then sync managed Skills.
   // Source checkouts execute the TS entry through Bun; release installs execute
   // the sibling Node bundle. Missing entries fail boot instead of shipping a
   // Skill whose first command is guaranteed to fail.
-  ensureLodestarConsultCommand()
+  ensureLodestarAgentCommand()
 
   // Sync the feishu-notify skill into ~/.codex/skills (idempotent).
   // Lets the user's main Codex session push to bound groups via
@@ -1491,7 +1462,7 @@ async function boot(): Promise<void> {
   // notify server is up so the port number we bake into the skill
   // body matches what's actually listening.
   ensureFeishuNotifySkill()
-  ensureLodestarConsultSkill()
+  ensureLodestarAgentSkill()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the

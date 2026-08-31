@@ -55,9 +55,9 @@ export const ELEMENTS = {
   modelPanel: 'model_panel',
   /** Basic project tasklist binding panel. */
   tasklistPanel: 'tasklist_panel',
-  /** Global consultation identity catalog/preset panel. */
-  consultIdentityPanel: 'consult_id_panel',
-  consultRunFooter: 'consult_run_footer',
+  /** Global delegated-agent identity catalog and run status. */
+  agentIdentityPanel: 'agent_id_panel',
+  agentRunFooter: 'agent_run_footer',
 } as const
 
 function escapeHtmlEntities(s: string): string {

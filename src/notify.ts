@@ -336,7 +336,7 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
       'lodestar notify\n' +
       'POST /notify        body={project,text,title?,level?,images?,buttons?,callback?}  → push card to group\n' +
       'GET  /notify/result/<notify_id>  → poll a button card\'s resolution (pull mode, no callback server)\n' +
-      'GET  /consult/identities; POST/GET/DELETE /consult/runs[/<id>]  → capability-protected model consultation\n' +
+      'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
       'buttons:[{id,text,type?}] (any count, one per row); callback=http://127.0.0.1:PORT/path optional (push) — omit to poll\n')
   }

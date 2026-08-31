@@ -15,6 +15,7 @@ import {
   imageGenerationOutput,
   usageFromTokenUsagePayload,
 } from './codex-process'
+import { resetAgentSessionRegistryForTest } from './agent-session-registry'
 
 function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
   const proc = Object.create(CodexProcess.prototype) as any
@@ -111,18 +112,8 @@ function makeCodexProtocolHarness(
 }
 
 describe('codex JSON-RPC lifecycle reliability', () => {
-  test('builds isolated app-server args for one-shot reviewers', () => {
-    expect(codexAppServerArgs({
-      configOverrides: ['mcp_servers={}', 'hooks={}'],
-      disabledFeatures: ['apps', 'plugins'],
-    })).toEqual([
-      'app-server',
-      '--config', 'mcp_servers={}',
-      '--config', 'hooks={}',
-      '--disable', 'apps',
-      '--disable', 'plugins',
-      '--listen', 'stdio://',
-    ])
+  test('starts the complete app-server feature surface without isolation overrides', () => {
+    expect(codexAppServerArgs()).toEqual(['app-server', '--listen', 'stdio://'])
   })
 
   test('keeps Windows-compatible Codex spawning shell-free so TOML argv stays literal', () => {
@@ -133,8 +124,7 @@ describe('codex JSON-RPC lifecycle reliability', () => {
       shell: false,
       env,
     })
-    expect(codexAppServerArgs({ configOverrides: ['web_search="live"'] }))
-      .toContain('web_search="live"')
+    expect(codexAppServerArgs()).not.toContain('--disable')
   })
 
   test('registers pending before write and clears its timeout on response', async () => {
@@ -485,44 +475,18 @@ describe('codex app-server conversation protocol', () => {
     expect(proc.sessionId).toBeNull()
   })
 
-  test('allows a pathless ephemeral read-only consultation thread', async () => {
-    const { proc, calls } = makeCodexProtocolHarness({
-      ephemeral: true,
-      sandbox: 'read-only',
-      model: 'gpt-test',
-      effort: 'max',
-    }, async (method) => {
-      if (method === 'initialize') return {}
-      if (method === 'thread/start') return { thread: { id: 'ephemeral-thread', cwd: '/repo', path: null } }
-      throw new Error(`unexpected request ${method}`)
-    })
-
-    await expect(proc.initializeAndStartThread()).resolves.toBeUndefined()
-    expect(proc.sessionId).toBe('ephemeral-thread')
-    expect(proc.isConversationResumable()).toBe(false)
-    const start = calls.find(call => call.method === 'thread/start')!
-    expect(start.params).toMatchObject({
-      ephemeral: true,
-      sandbox: 'read-only',
-      model: 'gpt-test',
-    })
-  })
-
-  test('keeps consultation turns read-only while allowing outbound network', async () => {
-    const { proc, calls } = makeCodexProtocolHarness({
-      sandbox: 'read-only',
-      networkAccess: true,
-    }, async (method) => {
-      if (method === 'turn/start') return { turn: { id: 'review-turn' } }
+  test('runs every Codex turn with the complete danger-full-access policy', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') return { turn: { id: 'agent-turn' } }
       throw new Error(`unexpected request ${method}`)
     })
     proc.readyPromise = Promise.resolve()
-    proc.sessionId = 'ephemeral-thread'
-    await proc.startTurn('review')
+    proc.sessionId = 'agent-thread'
+    await proc.startTurn('work')
     expect(calls[0]).toMatchObject({
       method: 'turn/start',
       params: {
-        sandboxPolicy: { type: 'readOnly', networkAccess: true },
+        sandboxPolicy: { type: 'dangerFullAccess' },
         runtimeWorkspaceRoots: ['/repo'],
       },
     })
@@ -927,6 +891,28 @@ describe('codex app-server conversation protocol', () => {
     ])
     expect(writes).toEqual([{ method: 'initialized' }])
     expect(calls.some(c => c.method === 'thread/start')).toBe(false)
+  })
+
+  test('excludes delegated Agent threads from the main rs history', async () => {
+    resetAgentSessionRegistryForTest(['codex:delegated'])
+    try {
+      const { proc } = makeCodexProtocolHarness({}, async (method) => {
+        if (method === 'initialize') return {}
+        if (method === 'thread/list') return {
+          data: [
+            { id: 'delegated', cwd: '/repo', preview: 'child work', updatedAt: 2 },
+            { id: 'main', cwd: '/repo', preview: 'main work', updatedAt: 1 },
+          ],
+          nextCursor: null,
+        }
+        throw new Error(`unexpected request ${method}`)
+      })
+      await expect(proc.listConversations()).resolves.toEqual([
+        { provider: 'codex', sessionId: 'main', cwd: '/repo', preview: 'main work', ts: 1000 },
+      ])
+    } finally {
+      resetAgentSessionRegistryForTest()
+    }
   })
 
   test('surfaces thread/list transport and malformed-response failures', async () => {

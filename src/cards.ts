@@ -97,18 +97,15 @@ export {
   tasklistPanelCard,
 } from './cards/task'
 export {
-  type ConsultIdentityPanelNotice,
-  type ConsultIdentityListCardOpts,
-  consultIdentityListCard,
-  consultIdentityRoleCard,
-  consultIdentityDeleteCard,
-  consultRunCard,
-  consultReviewerElement,
-  consultRunFooterElement,
-  consultReviewerElementId,
-  consultReviewerPreviewChars,
-  consultRunSummary,
-} from './cards/consult'
+  type AgentIdentityListCardOpts,
+  agentIdentityListCard,
+  agentRunCard,
+  agentWorkerElement,
+  agentRunFooterElement,
+  agentWorkerElementId,
+  agentWorkerPreviewChars,
+  agentRunSummary,
+} from './cards/agents'
 export {
   type TaskBoardEntry,
   type TaskBoardOp,

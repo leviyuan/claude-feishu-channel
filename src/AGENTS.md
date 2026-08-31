@@ -4,13 +4,13 @@
 
 ## 边界与不变式
 
-- `Session` 的 package-internal 字段由 `session-*.ts` helper 协作访问；命令、模型、权限、工具、临时会话、worktree、consult 身份与 tasklist 逻辑继续放在对应 helper，不把它们重新堆回 `session.ts`。
+- `Session` 的 package-internal 字段由 `session-*.ts` helper 协作访问；命令、模型、权限、工具、临时会话、worktree、Agent 身份与 tasklist 逻辑继续放在对应 helper，不把它们重新堆回 `session.ts`。
 - `AgentProcess` 是 Codex/Claude 的共享契约。新增事件或方法时，必须同时检查 `codex-process.ts`、`claude-agent-process.ts`、Session 消费方和卡片呈现；只有一端支持的能力用显式 capability/分支表达，不能伪造 parity。
 - Codex 进程只通过 app-server JSON-RPC 管理 thread、turn、权限、`request_user_input`、plan/goal、usage、compaction 与 collab 子 agent；未知或畸形 payload 要记录，不得静默当成功。
 - Claude 进程使用 Agent SDK `query()` streaming input。`permissionMode: default` 下普通工具由 `canUseTool` 明确放行，AskUserQuestion 必须等待飞书回答；`task_*`、`compact_boundary`、resume/fork 与 project profile 行为不可在通用事件归一化时丢失。
 - Token Source 通过 factory 自注册并拥有 enabled、模型刷新、spawn env、模型解析、setting sources 和额度。GLM/DeepSeek 注入凭据前要 scrub 其他 Anthropic env，默认只读 project/local settings；native 才读取 user settings。跨 source 即使同属 Claude，也必须换进程才能更换 base URL/凭据。
 - `managed-skills.ts` 是 Codex/Claude 共用的 Skill 安装器：standalone 文件同步到 `~/.codex/skills` 与 `~/.claude/skills`，同一 canonical body 还镜像进 daemon-owned Claude 本地插件。排除 `user` setting source 的 GLM/DeepSeek 主会话必须由 SDK `plugins` 显式加载该插件，禁止为了发现 Skill 而重新引入 user settings/env。
-- `consult-*` 是主 Agent 主动咨询其他模型的完整闭环：daemon 先同步裸 `lodestar-consult` 命令与 Skill，主 Agent 再查实时身份、创建 run、查询结果/取消。多身份必须合并为单个 run，由 `ConsultService` 在 run 内并发 fan-out；禁止主 Agent 为每个身份拆独立后台 run。每群 active-run 检查须在第一次 await 前原子占位；git 目标上下文只用异步子进程并设硬超时，禁止阻塞 daemon 事件循环。Session capability 只注入主进程；reviewer 必须剔除 `LODESTAR_CONSULT_*`、文件系统只读、网络全开放、一次性，并在结果后确认退出。Claude SDK reviewer 由 host 将 Read/Grep/Glob 限制在当前项目真实路径，符号链接越界也拒绝，同时开放 WebSearch/WebFetch；Linux Codex reviewer 固定使用 Landlock，沙箱不可用时显式失败，绝不无沙箱重试。交叉复核最多一轮。
+- `agent-*` 是主 Agent 委派任意普通任务的完整闭环：daemon 同步裸 `lodestar-agent` 命令与 Skill，主 Agent 查询实时身份后把原始 prompt 交给一个或多个完整 Agent。`AgentService` 管理并发 fan-out、run DAG、持久快照、Card Kit 呈现、递归取消和 follow-up；不得重建 review/critique/target-fingerprint 等审计协议。worker 继承完整 coding-agent 工具面和独立 `LODESTAR_AGENT_*` capability，可继续委派但只能访问自己的 run 子树。输入工具进入 `needs_input` 并暂停 watchdog，answer 后恢复；非输入权限请求自动允许。Session/daemon 关停必须递归取消全部后代。
 - 模型面板是 source→model→effort。同 provider/source 的设置调用 `setModelSettings`；Claude 下一轮生效，Codex 仍需 restart 才应用持久目标。跨 provider/source 或 Claude profile 切换在 turn/开卡/排队期间拒绝，空闲时终止不匹配进程；resume id 按 provider 隔离。
 - `fk`/`bk`/进程已停时的 `rs` 使用 backend-native 会话能力：Claude 以 transcript + `forkSession/resumeSessionAt` 实现，Codex 以 app-server `thread/list` + `thread/fork(lastTurnId)` 实现。共享 checkpoint 必须携带 provider、源会话 id 与原生锚点；Claude fork 在首条输入前必须持久化 pending launch，materialize 新 session id 后才能清除。禁止扫描/复制 Codex rollout、重建旁路索引或把 fork 失败静默退化成 resume。
 - 所有生产 Card Kit mutation 经 `cardkit.ts` 的 per-card queue 和执行时 sequence。必须知道写入结果的事务使用 checked API；普通 fire-and-forget 调用不能用于决定 rendered/持久状态是否成功。
@@ -23,5 +23,5 @@
 
 - 双后端协议和 provider/source 切换：`bun test src/codex-process.test.ts src/claude-agent-process.test.ts src/session.test.ts src/token-source-glm.test.ts`。
 - 公式与卡片事务：`bun test src/math-render.test.ts src/cardkit.test.ts src/session.test.ts src/cards/elements.test.ts`。
-- 配置、持久 map、consult 或基础 tasklist：运行对应 `*.test.ts`；触及共享 Session/Feishu 路径后再运行 `bun test`。
+- 配置、持久 map、delegated Agent 或基础 tasklist：运行对应 `*.test.ts`；触及共享 Session/Feishu 路径后再运行 `bun test`。
 - 构建入口、SDK/native dependency、动态加载或 Node/Bun 兼容性变化时运行 `bun run build`。

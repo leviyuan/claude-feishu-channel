@@ -15,8 +15,8 @@
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
  *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
- *   consult-identities.json — global reviewer role presets   (in DATA_DIR)
- *   consult-runs/           — terminal consultation reports  (in DATA_DIR)
+ *   agent-runs/             — durable delegated-agent runs    (in DATA_DIR)
+ *   agent-session-ids.json  — delegated native session ids    (in DATA_DIR)
  *   managed-claude-plugin/  — daemon-owned Skills for SDK     (in DATA_DIR)
  *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
@@ -78,12 +78,12 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
-/** Global reviewer aliases/roles shared by every project group. Catalog
- * identities derived from token sources are not duplicated here. */
-export const CONSULT_IDENTITIES_FILE = join(DATA_DIR, 'consult-identities.json')
-/** Completed consultation reports. Active process handles remain in memory;
- * terminal artifacts live here for CLI/status inspection and audit. */
-export const CONSULT_RUNS_DIR = join(DATA_DIR, 'consult-runs')
+/** Durable delegated-agent runs. Every state transition is written so completed
+ * native sessions remain follow-up capable across daemon restarts. */
+export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
+/** Provider-native session ids created by delegated agents. Main-session
+ * history pickers exclude these ids so background work never pollutes rs/fk. */
+export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
 /** Daemon-owned Claude Agent SDK plugin. It mirrors every managed Skill so
  * injected TokenSources can load them without enabling user settings/env. */
 export const MANAGED_CLAUDE_PLUGIN_DIR = join(DATA_DIR, 'managed-claude-plugin')

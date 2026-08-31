@@ -35,7 +35,7 @@ npm i -g @leviyuan/lodestar
 | `lodestar-stop` | 停止 daemon |
 | `lodestar-update` | 升级到最新版(含 Codex CLI、Claude Code 和 Claude SDK)|
 | `lodestar-version` | 查看 Lodestar 和 Codex CLI 版本 |
-| `lodestar-consult` | 供项目群主 Agent 查询全局身份并调用其他模型 |
+| `lodestar-agent` | 供主 Agent 把完整任务委派给其他模型并续跑原生会话 |
 
 **2. 跑向导**
 
@@ -62,7 +62,7 @@ lodestar-setup
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
 | `model` / `md` | 展示账号→动态模型→effort 面板,按群持久化 |
-| `reviewers` | 管理所有项目共用的评审身份与角色预设 |
+| `agents` | 查看当前所有可调用的完整 Agent 身份 |
 | `task` | 打开基础飞书任务清单绑定/删除面板 |
 
 **并发 worktree 群**
@@ -97,17 +97,17 @@ lodestar-setup
 
 ## 🎁 附加能力
 
-### 🧠 多模型咨询与评审
+### 🧠 完整多模型 Agent 委派
 
-daemon 会为每个 Token Source 目录中的每个模型生成一个 `max` 默认身份。项目群发 `reviewers` 可把任意底层模型预设为正确性、架构、安全、测试或可维护性审查员;这些身份由所有项目共用。
+daemon 会为每个 Token Source 目录中的每个模型生成一个实时 Agent 身份，并采用模型目录声明的真实默认 effort。项目群发 `agents` 可查看身份、模型、默认 effort 与当前 MISS；身份只负责模型路由，不再自动注入任何评审角色或提示词。
 
-主 Agent 每次发起咨询前都必须通过 `lodestar-consult identities --json` 重新获取实时身份,再创建 `question` / `review` / `critique` run。选中多个身份时必须把全部 `--identity` 合并进同一个 run，由 daemon 在该 run 内并发 fan-out；禁止一身份一个 run 后台串行。`--cross-review` 会在首轮全部成功后进行且仅进行一轮交叉复核。任何指定身份失败都会保留在报告和卡片中,不会替换模型。
+主 Agent 每次委派前通过 `lodestar-agent identities --json` 获取实时身份，再把完整原始 prompt 交给 `lodestar-agent run`。同一 prompt 选择多个身份时用重复 `--identity` 合并为一个 run，由 daemon 并发 fan-out；不同任务可以建立多个并行 run。daemon 不理解“评审/实现/研究”等任务语义，也不改写输出格式，全部行为约束都来自主 Agent prompt。
 
-Reviewer 的文件系统保持只读，但网络完全开放：Codex 可使用 live Web Search 和只读沙箱内的出站网络，Claude/GLM/DeepSeek 可使用 WebSearch/WebFetch。reviewer 仍不会继承主 Agent 的 consult capability。
+Delegated Agent 使用完整能力：Codex 固定 `danger-full-access`，保留 apps、plugins、multi-agent、MCP 与 hooks；Claude/GLM/DeepSeek 使用标准 `claude_code` preset、完整工具、项目 MCP 与 daemon-managed Skills。它们可以真实修改文件、运行命令、联网、调用外部系统并再次委派；这些副作用与主 Agent 在同一工作区立即可见。
 
-`lodestar-consult` 只能在 Lodestar 管理的主 Agent 进程内使用。daemon 为当前 Session 注入短期 capability，reviewer 子进程会强制移除它,避免递归调用。daemon 每次启动都会先主动安装/更新裸 `lodestar-consult` 命令，再把它与 `feishu-notify` 的 canonical Skill 同步到 Codex、Claude standalone 目录及一个 Claude SDK 本地插件；因此排除 user settings/env 的 GLM/DeepSeek 主会话也能发现两项 Skill。源码运行与 npm 发布安装使用同一条命令契约。
+`lodestar-agent` 只能在 Lodestar 管理的 Agent 进程内使用。主 Session 和每个 child 都得到独立随机 capability；child capability 只允许访问自己的 run 子树，父 run 取消时递归吊销。进程治理上限为同时运行 8 个 turn、全局 128 个在途 worker、每 Session 64 个 active run、每子树 32 个 active run、递归深度 8；排队原因会在 run 状态中透明显示，这些上限不改变 Agent 权限。daemon 启动时会安装/更新裸命令和 canonical Skill，并安全清理旧 daemon-owned `lodestar-consult` 命令/Skill。
 
-本机 API 闭环为 `GET /consult/identities` 查身份、`POST /consult/runs` 建 run、`GET /consult/runs/<id>` 查结果、`DELETE /consult/runs/<id>` 取消。四个端点都要求当前主 Agent 的 Bearer capability，不接受项目名/cwd 猜测路由。
+本机 API 为 `GET /agents/identities`、`POST /agents/runs`、`GET|DELETE /agents/runs/<id>`、`POST /agents/runs/<id>/answer` 与 `POST /agents/runs/<id>/follow-up`。模型调用 `AskUserQuestion`/`request_user_input` 时 run 进入 `needs_input`，主 Agent 精确回答后继续；follow-up 新建可追踪 run，但复用同一 provider 原生 session。run 生命周期元数据原子落盘，大 prompt/输出各自存入私有正文文件，避免状态转换反复同步重写巨型 JSON；委派 session 不会混入主会话 `rs`/`fk` 列表。
 
 ### 📋 基础飞书任务清单
 

@@ -1,4 +1,5 @@
 import type { Session } from './session'
+import type { AgentProvider } from './agent-process'
 import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -23,10 +24,17 @@ export function worktreeSessionDir(s: Session): string {
   return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 
-export function spawnDeveloperInstructions(s: Session): string {
-  const base = s.currentProvider() === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
+export function spawnDeveloperInstructions(s: Session, provider: AgentProvider = s.currentProvider()): string {
+  const base = provider === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
+}
+
+/** Delegated agents do not write directly to the Feishu channel, so they must
+ * not inherit channel marker protocols. Worktree-specific project policy still
+ * applies and is the only host-appended instruction. */
+export function delegatedAgentDeveloperInstructions(s: Session, _provider: AgentProvider): string {
+  return worktreeExtraInstruction(s) ?? ''
 }
 
 export function worktreeInstructionLoadedNotice(s: Session): string | null {

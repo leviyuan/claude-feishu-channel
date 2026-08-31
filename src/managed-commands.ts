@@ -1,10 +1,10 @@
-import { chmodSync, existsSync, readFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { log } from './log'
 import { writeExecutableFileAtomic } from './state-store'
 
-export interface ConsultCliLaunch {
+export interface AgentCliLaunch {
   runtime: string
   entry: string
 }
@@ -18,21 +18,21 @@ interface ResolveLaunchOptions {
 /** Resolve the source entry under Bun or the sibling release bundle under
  * Node. A missing command is a boot error: the Skill must never be installed
  * with a command that can only fail later. */
-export function resolveConsultCliLaunch(opts: ResolveLaunchOptions = {}): ConsultCliLaunch {
+export function resolveAgentCliLaunch(opts: ResolveLaunchOptions = {}): AgentCliLaunch {
   const daemonEntry = resolve(opts.daemonEntry ?? process.argv[1] ?? '')
   const runtime = opts.runtime ?? process.execPath
   const exists = opts.exists ?? existsSync
   const root = dirname(daemonEntry)
-  const source = join(root, 'src', 'consult-cli.ts')
-  const siblingBundle = join(root, 'lodestar-consult.js')
-  const rootBundle = join(root, 'dist', 'lodestar-consult.js')
+  const source = join(root, 'src', 'agent-cli.ts')
+  const siblingBundle = join(root, 'lodestar-agent.js')
+  const rootBundle = join(root, 'dist', 'lodestar-agent.js')
   const runtimeIsBun = /^bun(?:\.exe)?$/i.test(basename(runtime))
   const candidates = runtimeIsBun
     ? [source, siblingBundle, rootBundle]
     : [siblingBundle, rootBundle]
   const entry = candidates.find(exists)
   if (!entry) {
-    throw new Error(`lodestar-consult entry not found beside daemon: ${candidates.join(', ')}`)
+    throw new Error(`lodestar-agent entry not found beside daemon: ${candidates.join(', ')}`)
   }
   return { runtime, entry }
 }
@@ -40,16 +40,16 @@ export function resolveConsultCliLaunch(opts: ResolveLaunchOptions = {}): Consul
 interface SyncCommandOptions {
   platform?: NodeJS.Platform
   targetDir?: string
-  launch?: ConsultCliLaunch
+  launch?: AgentCliLaunch
   env?: NodeJS.ProcessEnv
   homeDir?: string
   localAppData?: string
 }
 
-/** Install/update the bare `lodestar-consult` command before managed Skills
+/** Install/update the bare `lodestar-agent` command before managed Skills
  * and sessions are revived. The wrapper contains paths only, never capability
  * or provider credentials. */
-export function ensureLodestarConsultCommand(opts: SyncCommandOptions = {}): string {
+export function ensureLodestarAgentCommand(opts: SyncCommandOptions = {}): string {
   const platform = opts.platform ?? process.platform
   const env = opts.env ?? process.env
   const targetDir = opts.targetDir ?? managedBinDir(
@@ -57,8 +57,8 @@ export function ensureLodestarConsultCommand(opts: SyncCommandOptions = {}): str
     opts.homeDir ?? homedir(),
     opts.localAppData ?? process.env.LOCALAPPDATA,
   )
-  const launch = opts.launch ?? resolveConsultCliLaunch()
-  const target = join(targetDir, platform === 'win32' ? 'lodestar-consult.cmd' : 'lodestar-consult')
+  const launch = opts.launch ?? resolveAgentCliLaunch()
+  const target = join(targetDir, platform === 'win32' ? 'lodestar-agent.cmd' : 'lodestar-agent')
   const body = platform === 'win32'
     ? `@"${windowsQuote(launch.runtime)}" "${windowsQuote(launch.entry)}" %*\r\n`
     : `#!/bin/sh\nexec ${shellQuote(launch.runtime)} ${shellQuote(launch.entry)} "$@"\n`
@@ -70,7 +70,24 @@ export function ensureLodestarConsultCommand(opts: SyncCommandOptions = {}): str
     chmodSync(target, 0o700)
   }
   prependPath(env, targetDir, platform)
+  removeLegacyConsultCommand(targetDir, platform)
   return target
+}
+
+function removeLegacyConsultCommand(targetDir: string, platform: NodeJS.Platform): void {
+  const legacy = join(targetDir, platform === 'win32' ? 'lodestar-consult.cmd' : 'lodestar-consult')
+  if (!existsSync(legacy)) return
+  try {
+    const body = readFileSync(legacy, 'utf8')
+    if (!body.includes('lodestar-consult') && !body.includes('consult-cli')) {
+      log(`command: obsolete path preserved because ownership is unclear ${legacy}`)
+      return
+    }
+    unlinkSync(legacy)
+    log(`command: removed obsolete ${legacy}`)
+  } catch (error) {
+    log(`command: obsolete removal failed (${legacy}): ${error}`)
+  }
 }
 
 function managedBinDir(

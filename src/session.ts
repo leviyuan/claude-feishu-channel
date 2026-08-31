@@ -48,11 +48,11 @@ import {
   type ClaudeReasoningEffort,
 } from './agent-process'
 import { config } from './config'
+import { createAgentProcess } from './agent-launch'
+import { agentApiUrl } from './agent-runtime'
 import { getTokenSource, listEnabledTokenSourcesByAgent, type TokenSource } from './token-source'
 import { clearRollbackWatchdog } from './rollback-watchdog'
 import {
-  ClaudeAgentProcess,
-  assertClaudeCodeAvailable,
   claudeTranscriptPath,
   type BgTaskStartedEvent,
   type BgTaskProgressEvent,
@@ -91,7 +91,7 @@ import {
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
-import * as sessionConsultIdentities from './session-consult-identities'
+import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTasklist from './session-tasklist'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
@@ -125,15 +125,6 @@ function findCodexRpcResponseError(
     return findCodexRpcResponseError(error.cause, seen)
   }
   return null
-}
-
-function consultApiUrl(bind: string, port: number): string {
-  const host = bind === '0.0.0.0'
-    ? '127.0.0.1'
-    : bind === '::' || bind === '::1'
-      ? '[::1]'
-      : bind
-  return `http://${host}:${port}`
 }
 
 function compactionKey(notice: ContextCompactedNotification): string {
@@ -281,7 +272,7 @@ export class Session {
    * or a later explicit stop/restart successfully confirms termination. */
   private blockedProc: AgentProcess | null = null
   private blockedProcReason: string | null = null
-  private consultCapability: string | null = null
+  private agentCapability: string | null = null
   /** Spawn-affecting token-source revision captured for each owned process.
    * Same source id with rotated credentials/base URL must still replace the
    * idle child after the registry is rebuilt. Weak keys avoid lifecycle leaks. */
@@ -889,11 +880,11 @@ export class Session {
   }
 
   private spawnAgent(resumeRef?: ConversationRef): AgentProcess {
-    this.consultCapability = randomBytes(32).toString('base64url')
+    this.agentCapability = randomBytes(32).toString('base64url')
     const hostEnv = {
-      LODESTAR_CONSULT_URL: consultApiUrl(config.notify.bind, config.notify.port),
-      LODESTAR_CONSULT_CAPABILITY: this.consultCapability,
-      LODESTAR_CONSULT_SESSION: this.sessionName,
+      LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
+      LODESTAR_AGENT_CAPABILITY: this.agentCapability,
+      LODESTAR_AGENT_SESSION: this.sessionName,
     }
     const launch: ConversationLaunch = this.pendingConversationLaunch
       ?? this.pendingMaterializationLaunch()
@@ -908,50 +899,20 @@ export class Session {
       throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
     }
     const ts = raw?.enabled ? raw : undefined
-    const transformEnv = ts
-      ? (base: Record<string, string | undefined>) => ts.spawnEnv(base)
-      : undefined
-    // 有 token source:下发 ts.resolveSpawnModel(默认或面板选的模型);无:走旧 modelForSpawn
-    const tsModel = ts ? ts.resolveSpawnModel(this.selectedModel ?? ts.defaultModel) : this.modelForSpawn()
-    if (this.selectedProvider === 'claude') {
-      assertClaudeCodeAvailable()
-      const sourceId = launch.kind === 'fresh' ? undefined : launch.source.sessionId
-      const through = launch.kind === 'fork' ? launch.through : undefined
-      if (through && (through.provider !== 'claude' || through.kind !== 'assistant-message')) {
-        throw new Error(`Claude cannot fork from ${through.provider}/${through.kind} checkpoint`)
-      }
-      const proc = new ClaudeAgentProcess({
-        workDir: this.workDir,
-        model: tsModel,
-        effort: this.claudeEffortForSpawn(),
-        resumeSessionId: sourceId,
-        resumeSessionAt: through?.id,
-        forkSession: launch.kind === 'fork',
-        appendSystemPrompt: this.spawnDeveloperInstructions(),
-        profile: feishu.projectProfile(this.worktreeProjectName()),
-        ...(ts?.settingSources ? { settingSources: ts.settingSources } : {}),
-        ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1'
-          ? {}
-          : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
-        tokenSourceId: ts?.id ?? null,
-        transformEnv,
-        hostEnv,
-      })
-      this.procSourceRevisions.set(proc, ts?.spawnRevision ?? null)
-      return proc
-    }
-    const proc = new CodexProcess({
+    const created = createAgentProcess({
+      provider: this.selectedProvider,
       workDir: this.workDir,
-      model: tsModel,
-      effort: this.effortForSpawn(),
-      launch,
-      appendSystemPrompt: this.spawnDeveloperInstructions(),
       tokenSourceId: ts?.id ?? null,
-      transformEnv,
+      model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(),
+      effort: this.selectedProvider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
+      launch,
+      developerInstructions: this.spawnDeveloperInstructions(),
+      profile: feishu.projectProfile(this.worktreeProjectName()),
+      ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
       hostEnv,
     })
-    this.procSourceRevisions.set(proc, ts?.spawnRevision ?? null)
-    return proc
+    this.procSourceRevisions.set(created.process, created.sourceRevision)
+    return created.process
   }
 
   async applyModelSelection(
@@ -1311,7 +1272,7 @@ export class Session {
     this.invalidateTurnOpen()
     this.invalidateBackgroundOpen()
     this.proc = null
-    this.consultCapability = null
+    this.agentCapability = null
     if (this.stoppingProc === proc) this.stoppingProc = null
     if (this.blockedProc === proc) {
       this.blockedProc = null
@@ -1323,19 +1284,19 @@ export class Session {
 
   private beginProcStop(proc: AgentProcess): void {
     this.stoppingProc = proc
-    this.consultCapability = null
+    this.agentCapability = null
   }
 
-  acceptsConsultCapability(value: string): boolean {
-    const expected = this.consultCapability
+  acceptsAgentCapability(value: string): boolean {
+    const expected = this.agentCapability
     if (!expected || !value || !this.proc?.isAlive()) return false
     const a = Buffer.from(expected)
     const b = Buffer.from(value)
     return a.length === b.length && timingSafeEqual(a, b)
   }
 
-  async cancelConsultRuns(reason = '用户取消'): Promise<void> {
-    await this.opts.onCancelConsultRuns?.(this.sessionName, this.chatId, reason)
+  async cancelAgentRuns(reason = '用户取消'): Promise<void> {
+    await this.opts.onCancelAgentRuns?.(this.sessionName, this.chatId, reason)
   }
 
   /** Returns true only when process termination is confirmed. */
@@ -1668,7 +1629,7 @@ export class Session {
   private async stopUnlocked(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
-    await this.cancelConsultRuns(reason)
+    await this.cancelAgentRuns(reason)
     if (!this.proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
@@ -2387,6 +2348,10 @@ export class Session {
     return sessionWorktree.spawnDeveloperInstructions(this)
   }
 
+  delegatedAgentDeveloperInstructions(provider: AgentProvider): string {
+    return sessionWorktree.delegatedAgentDeveloperInstructions(this, provider)
+  }
+
   worktreeInstructionLoadedNotice(): string | null {
     return sessionWorktree.worktreeInstructionLoadedNotice(this)
   }
@@ -2411,36 +2376,12 @@ export class Session {
     return sessionTasklist.showTasklistPanel(this)
   }
 
-  showConsultIdentityPanel(userOpenId = ''): Promise<void> {
-    return sessionConsultIdentities.showConsultIdentityPanel(this, userOpenId)
+  showAgentIdentityPanel(userOpenId = ''): Promise<void> {
+    return sessionAgentIdentities.showAgentIdentityPanel(this, userOpenId)
   }
 
-  onConsultIdentityAdd(panelId: string, identityId: string, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityAdd(panelId, identityId, userOpenId)
-  }
-
-  onConsultIdentityRole(panelId: string, identityId: string, role: string, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityRole(panelId, identityId, role, userOpenId)
-  }
-
-  onConsultIdentityToggle(panelId: string, presetId: string, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityToggle(panelId, presetId, userOpenId)
-  }
-
-  onConsultIdentityDelete(panelId: string, presetId: string, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityDelete(panelId, presetId, userOpenId)
-  }
-
-  onConsultIdentityDeleteConfirm(panelId: string, presetId: string, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityDeleteConfirm(panelId, presetId, userOpenId)
-  }
-
-  onConsultIdentityPage(panelId: string, page: unknown, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityPage(panelId, page, userOpenId)
-  }
-
-  onConsultIdentityBack(panelId: string, userOpenId: string): ModelActionResult {
-    return sessionConsultIdentities.onConsultIdentityBack(panelId, userOpenId)
+  onAgentIdentityPage(panelId: string, page: unknown, userOpenId: string): ModelActionResult {
+    return sessionAgentIdentities.onAgentIdentityPage(panelId, page, userOpenId)
   }
 
   onTasklistEnable(): Promise<TasklistActionResult> {
@@ -3933,8 +3874,8 @@ export class Session {
         return
       }
       this.discardPendingCodexTurnAnchors(p, 'unexpected process exit')
-      void this.cancelConsultRuns(`${p.provider} process exited`).catch(error => {
-        log(`session "${this.sessionName}": cancel consult after process exit failed: ${messageOf(error)}`)
+      void this.cancelAgentRuns(`${p.provider} process exited`).catch(error => {
+        log(`session "${this.sessionName}": cancel Agent runs after process exit failed: ${messageOf(error)}`)
       })
       const backend = this.backendLabel(p.provider)
       const exitDetail = `code=${code ?? 'null'}, signal=${signal ?? 'null'}`

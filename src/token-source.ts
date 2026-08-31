@@ -220,7 +220,7 @@ export function refreshAllTokenSourceModels(): Promise<void> {
 }
 
 /** Await an already-running catalog refresh without starting a new network
- * refresh. Consultation discovery uses this to avoid returning a transient
+ * refresh. Agent discovery uses this to avoid returning a transient
  * loading-only catalog immediately after boot/setup. */
 export function pendingTokenSourceModelRefresh(): Promise<void> | null {
   return refreshAllInFlight?.promise ?? null
