@@ -3284,6 +3284,50 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       await cardkit.dispose(turn.cardId)
     }
   })
+
+  test('a transient live footer MISS stays log-only and the next refresh still lands', async () => {
+    const session = new Session('footer-transient-miss', 'chat_id') as any
+    const turn = turnState('card_footer_transient_miss')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, turn.cardId, code, failure)
+    })
+    let footerAttempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (method === 'PUT' && path === `/cards/${turn.cardId}/elements/footer`) {
+        footerAttempts++
+        if (footerAttempts === 1) {
+          return new Response(JSON.stringify({ code: 300308, msg: 'temporary footer reject' }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.startThinkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      expect(footerAttempts).toBe(1)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotified).toBe(false)
+
+      session.startWritingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      expect(footerAttempts).toBe(2)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotified).toBe(false)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
 })
 
 describe('Session lifecycle reliability', () => {

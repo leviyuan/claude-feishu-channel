@@ -824,7 +824,16 @@ export class Session {
   }
 
   private replaceFooterContent(cardId: string, content: string): Promise<void> {
-    return cardkit.replaceElement(cardId, cards.ELEMENTS.footer, this.footerElement(content))
+    // 活跃 footer 是可丢的实时状态：second 模式下一秒就会再次刷新，单次
+    // replace MISS 不影响正文或 turn 状态。保留 Card Kit 日志，但不要触发
+    // Session 的群内写入失败告警；终态 footer 仍走 checked 事务并显式报错。
+    return cardkit.replaceElement(
+      cardId,
+      cards.ELEMENTS.footer,
+      this.footerElement(content),
+      undefined,
+      false,
+    )
   }
 
   private footerElement(content: string): object {
