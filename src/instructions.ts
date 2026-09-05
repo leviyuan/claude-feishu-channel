@@ -1,10 +1,4 @@
-/**
- * Daemon ↔ model I/O contracts. Sent to Codex as developer instructions on
- * every thread. Rules cover inbound file markers, outbound file markers,
- * and local shell-card summaries. 中文版 2026-05-18 切换 ——
- * 群里讲中文,模型回中文,顺手把这几条约束也用中文写,避免模型偶尔
- * 看到英文就把整轮回复语气切回英文。
- */
+/** 注入两个后端的文件收发、澄清提问和 shell 卡片标题约定。 */
 const COMMON_CHANNEL_INSTRUCTIONS = [
     "- 以 `[file: /abs/path]` 开头的文本表示该路径上挂着一个文件,相关时去读它。",
     "- 在回复任意位置，独占一行写 `[[send: /abs/path]]` 即可把该文件作为单独一条消息送出。只在用户主动要文件、或你要交付最终产物时才发。",
@@ -24,6 +18,6 @@ export const CHANNEL_INSTRUCTIONS = [
 
 export const CLAUDE_CHANNEL_INSTRUCTIONS = [
     ...COMMON_CHANNEL_INSTRUCTIONS,
-    "- 当你有问题需要澄清时，使用 Claude Code 自带的 AskUserQuestion 工具向用户提问；不要输出 Codex 专属的 host-marker 文本协议。",
+    "- 当你有问题需要澄清时，使用 Claude Code 自带的 AskUserQuestion 工具向用户提问。",
     ...COMMON_TAIL_INSTRUCTIONS,
 ].join("\n");

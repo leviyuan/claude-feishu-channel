@@ -4,7 +4,6 @@ import type { Session } from './session'
 import { config } from './config'
 import { listTokenSources, getTokenSource, refreshAllTokenSourceModels, type TokenSource } from './token-source'
 import { addTokenSource } from './token-source-config'
-import { CLAUDE_EFFORTS } from './token-source-models'
 import { isCodexReasoningEffort } from './codex-process'
 import {
   agentProviderLabel,
@@ -26,7 +25,6 @@ export interface ModelPanelState {
 // ── 第1级:账号(provider)选项 —— 每个 token source 一项 ─────
 function providerChoices(s: Session): cards.ProviderChoice[] {
   const cur = s.currentTokenSource()
-  const curModel = s.currentModelLabel()
   return listTokenSources()
     // native 是兜底项:仅在 enabled 时露面(本机未命中 Pro provider → 作为默认通路);
     // disabled 说明本机已用 GLM,此时它没意义,不显示灰项干扰选择。
@@ -233,22 +231,22 @@ export async function consumeModelCustomMessage(
     await failCard('无法校验(端点无响应或凭据问题)')
     return true
   }
-  // 校验通过:持久化 config models 键(addTokenSource 合并语义),rebuild 后
-  // 重取 registry 新实例并等它的 refreshModels 完成 —— rebuild 会整体换实例,
-  // 新实例 models 要 refresh 后才有(异步 void,不等会读到空列表),而后续
-  // 面板/currentTokenSource 都走 registry 新实例。等待失败如实 log,面板
-  // 用当时状态渲染(不猜)。
+  // 配置写入会重建全部账号；等待统一刷新后只读取新实例。
   const cfgModels = [...readSourceModelsConfig(ts.id), model].join(',')
-  addTokenSource(ts.id, { models: cfgModels })
-  log(`model-custom: ${ts.id} 补录 ${model} by ${user}(端点校验通过,已持久化)`)
-  const fresh = getTokenSource(ts.id) ?? ts
   try {
-    await withTimeout(fresh.refreshModels(), 15_000, 'refreshModels')
-  } catch (e: any) {
-    log(`model-custom: refresh after 补录 MISS (${e?.message ?? e})`)
+    await withTimeout(addTokenSource(ts.id, { models: cfgModels }), 15_000, 'refreshModels')
+  } catch (error) {
+    log(`model-custom: config/refresh MISS (${messageOf(error)})`)
+    await failCard(`配置写入或模型刷新失败：${messageOf(error)}`)
+    return true
   }
-  const target = fresh.models.some(m => m.model === model) ? fresh : ts
-  const models = modelChoicesFor(s, target)
+  log(`model-custom: ${ts.id} 补录 ${model} by ${user}(端点校验通过,已持久化)`)
+  const fresh = getTokenSource(ts.id)
+  if (!fresh || fresh.modelCatalogState?.status !== 'ready') {
+    await failCard(fresh?.modelCatalogState?.error ?? '刷新后的账号目录不可用')
+    return true
+  }
+  const models = modelChoicesFor(s, fresh)
   const selected = models.find(m => m.model === model)
   if (!selected) {
     await failCard('模型已验证，但刷新后的模型列表未返回该项')

@@ -35,7 +35,7 @@ export interface LodestarConfig {
     /**
      * 活跃 footer / 后台卡 header 的耗时展示。
      * - `bucket`(默认):粗档位,只在档位边界 push,省飞书配额
-     * - `second`:按秒显示,footer 每 1s / 后台卡每 2s push(旧行为,配额更费)
+     * - `second`:按秒显示,footer 刷新；长时间运行后降低刷新频率
      */
     live_elapsed: LiveElapsedMode
   }
@@ -61,15 +61,11 @@ export interface LodestarConfig {
   /** Per-project launch profiles keyed by session name (= group name).
    * Empty record ⇒ every project runs with Lodestar defaults. */
   projects: Record<string, ProjectProfile>
-  /** Token source 声明:每个 [token_source.<id>] = 一个账号(凭据 + 模型 + 额度查询)。
-   * 取代散落的 [codex.env] / [claude.env] / ~/.claude/settings.json 全局 env。
-   * daemon 可读写(飞书 config 命令);agent 层(codex/claude 进程)固定不变。 */
+  /** [token_source.<id>] 账号配置；群内启用和补录会更新对应节。 */
   token_sources: Record<string, TokenSourceConfig>
 }
 
 export interface ClaudeModelConfig {
-  display_name?: string
-  description?: string
   model?: string
 }
 
@@ -99,12 +95,8 @@ export interface TokenSourceConfig {
   default?: boolean
 }
 
-/** Per-project agent launch profile, sourced from `[projects.<name>].*`
- * sections in config.toml. Absent section ⇒ no override (Lodestar defaults:
- * `settingSources:['user','project','local']`, `claude_code` tool preset, project MCP auto-discovered).
- * Lets an external project (e.g. evolving) run a clean, isolated Claude
- * session pointed at an arbitrary cwd with a restricted tool set and its
- * own `.mcp.json`, without touching any other project. */
+/** [projects.<name>] 主会话启动配置。cwd 用于两个后端，其余字段用于 Claude。
+ * Token Source 指定的 settingSources 优先于项目配置。 */
 export interface ProjectProfile {
   /** Absolute working directory. Falls back to `PROJECTS_ROOT/<name>`. */
   cwd?: string
@@ -233,21 +225,12 @@ function loadConfig(): LodestarConfig {
       for (const [rawKey, value] of Object.entries(section)) {
         if (typeof value !== 'string' || value.length === 0) continue
         const field = rawKey.trim()
-        if (
-          field === 'display_name' ||
-          field === 'description' ||
-          field === 'model'
-        ) {
-          ;(profile as Record<string, string>)[field] = value
-        }
+        if (field === 'model') profile.model = value
       }
       out[key] = profile
     }
     return out
   }
-  // [projects.<name>] 节可选 —— 一个外部项目(如 evolving)想跑干净隔离的
-  // Claude session:指定 cwd、限定内置工具、只挂自己的 .mcp.json。未配置的
-  // 项目完全走 Lodestar 默认(settingSources:['user','project','local'] + claude_code 工具集 + 项目 .mcp.json 自动发现)。
   const projectSections = (): Record<string, ProjectProfile> => {
     const out: Record<string, ProjectProfile> = {}
     const prefix = 'projects.'
@@ -314,9 +297,7 @@ function loadConfig(): LodestarConfig {
 
 export const config = loadConfig()
 
-/** 飞书 config 命令改 [token_source.*] 后重载:重读 config.toml 的 token_sources 节,
- * 更新 config 单例的 token_sources 字段(其他 feishu/runtime 等字段不动,避免重启)。
- * 调用方接着调 buildTokenSourcesFromConfig() 重建 registry。 */
+/** 账号配置写入后仅重载 token_sources，由调用方重建目录。 */
 export function reloadTokenSources(): void {
   config.token_sources = loadConfig().token_sources
 }

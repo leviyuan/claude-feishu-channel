@@ -8,12 +8,13 @@ import {
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
+const sessionTools = await import('./session-tools')
 const { CodexRpcResponseError } = await import('./codex-process')
 const cardkit = await import('./cardkit')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
-const { getTokenSource, resetTokenSourceRegistry } = await import('./token-source')
+const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, refreshUsageFromConnection } = await import('./usage')
 
@@ -136,7 +137,6 @@ class FakeAgentProc extends EventEmitter {
 
   sendInterrupt(): void {}
   sendPermissionResponse(): void {}
-  sendToolResult(): void {}
   sendHookResponse(): void {}
 
   isAlive(): boolean {
@@ -156,9 +156,7 @@ class FakeAgentProc extends EventEmitter {
   async setModelSettings(model: string, effort: string): Promise<void> {
     this.setModelSettingsCalls.push([model, effort])
   }
-  async setModel(): Promise<void> {}
   async compactThread(): Promise<void> {}
-  async injectThreadItems(): Promise<void> {}
 }
 
 afterEach(() => {
@@ -1594,6 +1592,67 @@ describe('Session provider switching', () => {
 
 })
 
+describe('Session waits for its model catalog', () => {
+  for (const resume of [false, true]) {
+    test(`${resume ? 'resume' : 'fresh start'} waits for models and keeps the selected model and effort`, async () => {
+      const previousSources = listTokenSources()
+      resetTokenSourceRegistry()
+      let releaseModels!: () => void
+      const modelsGate = new Promise<void>(resolve => { releaseModels = resolve })
+      const source: import('./token-source').TokenSource = {
+        id: 'catalog-test', kind: 'test', agent: 'codex', display: 'Test Codex', enabled: true,
+        models: [], defaultModel: '', modelCatalogState: { status: 'idle', updatedAt: null },
+        async refreshModels() {
+          source.modelCatalogState = { status: 'loading', updatedAt: null }
+          await modelsGate
+          source.models = [{ model: 'gpt-6-astra', display: 'Astra', efforts: ['max', 'ultra'], defaultEffort: 'max' }]
+          source.defaultModel = 'gpt-6-astra'
+          source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+        },
+        spawnEnv: env => env,
+        resolveSpawnModel: model => model,
+        readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+      }
+      registerTokenSource(source)
+      const refresh = refreshAllTokenSourceModels()
+      const name = resume ? 'catalog-resume' : 'catalog-start'
+      modelSelections.set(name, { provider: 'codex', model: 'gpt-6-astra', effort: 'ultra', tokenSourceId: source.id })
+      const savedRef = { provider: 'codex' as const, sessionId: 'original-session', cwd: `/tmp/lodestar-projects/${name}` }
+      if (resume) resumeRefs.set(`${name}:codex`, savedRef)
+      const session = new Session(name, 'chat_id') as any
+      const proc = new FakeAgentProc('codex', resume ? savedRef.sessionId : 'new-session', source.id)
+      let spawns = 0
+      session.spawnAgent = (ref?: typeof savedRef) => {
+        spawns++
+        expect(source.modelCatalogState?.status).toBe('ready')
+        expect(session.selectedModel).toBe('gpt-6-astra')
+        expect(session.selectedEffort).toBe('ultra')
+        expect(ref).toEqual(resume ? savedRef : undefined)
+        return proc
+      }
+      const opts = { announce: false, onStatus: () => {} }
+      const starting = resume ? session.restart(true, opts) : session.start(opts)
+      try {
+        await waitUntil(() => session.status === 'starting')
+        expect(spawns).toBe(0)
+        expect(session.proc).toBeNull()
+        releaseModels()
+        expect(await starting).toBe(true)
+        expect(spawns).toBe(1)
+        expect(session.proc).toBe(proc)
+        if (resume) expect(session.lastSessionId).toBe(savedRef.sessionId)
+      } finally {
+        releaseModels()
+        await refresh
+        await starting
+        await session.stop('test cleanup', { announce: false })
+        resetTokenSourceRegistry()
+        for (const item of previousSources) registerTokenSource(item)
+      }
+    })
+  }
+})
+
 describe('Session turn close vs mid-turn rotation race', () => {
   const renderedFormula = {
     blocks: [
@@ -2002,7 +2061,7 @@ describe('Session turn close vs mid-turn rotation race', () => {
       expect(turn.cardId).toBe('card_deferred_second')
       expect(turn.rotating).toBeNull()
       expect(sentRawTexts).toHaveLength(1)
-      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+      expect(sentRawTexts[0]).toContain('未识别为卡片容量超限')
       expect(sentTexts).toEqual([])
     } finally {
       if (firstRotation) await firstRotation.catch(() => {})
@@ -2084,6 +2143,121 @@ describe('Session turn close vs mid-turn rotation race', () => {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
       renderSpy.mockRestore()
+    }
+  })
+})
+
+describe('Session card size capacity', () => {
+  for (const provider of ['codex', 'claude'] as const) {
+    for (const operation of ['addElement', 'replaceElement', 'footer'] as const) {
+      test(`${provider} preserves tool output when ${operation} exceeds card size below the element count limit`, async () => {
+        const session = new Session('card-size', 'chat_id') as any
+        const oldCardId = `card_size_${provider}_${operation}_old`
+        const newCardId = `card_size_${provider}_${operation}_new`
+        const turn = turnState(oldCardId)
+        turn.provider = provider
+        turn.userOpenId = ''
+        turn.toolByUseId.set('tool_use_size', {
+          i: 0, name: 'Bash', input: { command: '# desc: 查看结果\nprintf result' },
+          ...(operation !== 'footer' ? { output: 'retained tool result', isError: false } : {}),
+        })
+        session.proc = new FakeAgentProc(provider, 'native-session')
+        session.currentTurn = turn
+        let rotation: Promise<void> | null = null
+        cardkit.recordCardCreated(oldCardId, 2, (code, failure) => {
+          session.onCardWriteFailure(turn, oldCardId, code, failure)
+          rotation = turn.rotating
+        })
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+          const method = String(init?.method ?? 'GET')
+          calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+          const rejected = operation === 'addElement'
+            ? method === 'POST' && path === `/cards/${oldCardId}/elements`
+            : method === 'PUT' && path === `/cards/${oldCardId}/elements/${operation === 'footer' ? 'footer' : 'tool_0'}`
+          return new Response(JSON.stringify(rejected
+            ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+            : { code: 0, data: path === '/cards/id_convert' ? { card_id: newCardId } : {} }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }) as typeof fetch
+
+        try {
+          const landed = operation === 'addElement'
+            ? await cardkit.addElementChecked(oldCardId, {
+                tag: 'markdown', element_id: 'tool_0', content: 'retained tool result',
+              }, { type: 'insert_before', targetElementId: 'footer' })
+            : await cardkit.replaceElementChecked(oldCardId, operation === 'footer' ? 'footer' : 'tool_0', {
+                tag: 'markdown', element_id: operation === 'footer' ? 'footer' : 'tool_0', content: 'retained tool result',
+              })
+          expect(landed).toBe(false)
+          expect(rotation).not.toBeNull()
+          await rotation
+          if (operation === 'footer') sessionTools.completeTool(session, 'tool_use_size', 'retained tool result', false)
+          await cardkit.flush(newCardId)
+
+          expect(turn.cardId).toBe(newCardId)
+          expect(turn.rotateCount).toBe(1)
+          expect(turn.failureRotateCount).toBe(1)
+          expect(turn.rotateGivenUp).toBe(false)
+          expect(sentCards).toHaveLength(1)
+          const migrated = calls.filter(call => call.path.startsWith(`/cards/${newCardId}/elements`))
+          expect(JSON.stringify(migrated)).toContain('retained tool result')
+          expect(turn.toolByUseId.has('tool_use_size')).toBe(true)
+          expect(sentRawTexts.join('\n')).not.toContain('未识别为卡片容量超限')
+          expect(calls.filter(call => call.method === 'POST' && call.path === `/cards/${newCardId}/elements`)).toHaveLength(1)
+        } finally {
+          if (rotation) await rotation
+          session.stopFooterStatus(turn)
+          await cardkit.dispose(oldCardId)
+          await cardkit.dispose(newCardId)
+        }
+      })
+    }
+  }
+
+  test('a tool too large for every replacement card exhausts the existing rotation cap', async () => {
+    const session = new Session('card-size-persistent', 'chat_id') as any
+    const turn = turnState('card_size_persistent_0')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    let replacementCount = 0
+    cardkit.recordCardCreated(turn.cardId, 2, (code, failure) => {
+      session.onCardWriteFailure(turn, 'card_size_persistent_0', code, failure)
+    })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const response = path === '/cards/id_convert'
+        ? { code: 0, data: { card_id: `card_size_persistent_${++replacementCount}` } }
+        : method === 'POST' && path.endsWith('/elements')
+          ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+          : { code: 0, data: {} }
+      return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+
+    try {
+      sessionTools.addTool(session, 'oversized-tool', 'Bash', { command: '# desc: 超大工具结果\nprintf result' })
+      await cardkit.flush('card_size_persistent_0')
+      for (let attempt = 0; attempt < 7 && !turn.rotateGivenUp; attempt++) {
+        await turn.rotating
+        await cardkit.flush(turn.cardId)
+      }
+      expect(replacementCount).toBe(5)
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(turn.failureRotateCount).toBe(5)
+      expect(turn.footerStatusHandle).toBeNull()
+      expect(sentRawTexts.join('\n')).toContain('卡片容量超限换卡 5 次')
+      const before = calls.length
+      expect(await cardkit.addElementChecked(turn.cardId, {
+        tag: 'markdown', element_id: 'after_cap', content: 'x',
+      })).toBe(false)
+      expect(calls).toHaveLength(before)
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_size_persistent_${i}`)
     }
   })
 })
@@ -2273,7 +2447,7 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       expect(sentCards).toHaveLength(0)
       expect(calls.some(call => call.path === '/cards/id_convert')).toBe(false)
       expect(sentRawTexts).toHaveLength(1)
-      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+      expect(sentRawTexts[0]).toContain('未识别为卡片容量超限')
     } finally {
       await cardkit.dispose(turn.cardId)
     }
@@ -2700,14 +2874,6 @@ describe('Session claude subagent tool calls stay off the main card', () => {
   // 2026-08-18 对齐 codex 侧 isSubagentThread 分流(cf41941):claude 子 agent 的
   // 工具调用按 parent_tool_use_id 归属后台 task,只累积 steps,不上主卡面板 ——
   // 主卡只承载主 agent,多 agent 时面板数不爆表。
-  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
-    const t0 = Date.now()
-    while (!cond()) {
-      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
-  }
-
   test('子 agent tool_use/tool_result 只进 bg steps,不 addTool/completeTool', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -3878,7 +4044,7 @@ describe('Session lifecycle reliability', () => {
     session.attachProc(proc)
 
     proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: false })
-    await session.waitForLifecycleIdle()
+    await session.lifecycleTail
 
     expect(session.proc).toBeNull()
     expect(session.currentTurn).toBeNull()

@@ -10,20 +10,20 @@ import {
 } from './temp'
 
 test('writeBodyFromToolInput:Write 取 content', () => {
-  expect(writeBodyFromToolInput('Write', { file_path: '/a', content: 'hello' })).toBe('hello')
+  expect(writeBodyFromToolInput({ file_path: '/a', content: 'hello' })).toBe('hello')
 })
 
 test('writeBodyFromToolInput:Edit 取 new_string', () => {
-  expect(writeBodyFromToolInput('Edit', { file_path: '/a', old_string: 'x', new_string: 'y' })).toBe('y')
+  expect(writeBodyFromToolInput({ file_path: '/a', old_string: 'x', new_string: 'y' })).toBe('y')
 })
 
 test('writeBodyFromToolInput:MultiEdit 拼接所有 new_string', () => {
-  expect(writeBodyFromToolInput('MultiEdit', { edits: [{ new_string: 'a' }, { new_string: 'b' }] })).toBe('a\n---\nb')
+  expect(writeBodyFromToolInput({ edits: [{ new_string: 'a' }, { new_string: 'b' }] })).toBe('a\n---\nb')
 })
 
 test('writeBodyFromToolInput:无可识别字段返回空串', () => {
-  expect(writeBodyFromToolInput('Write', { file_path: '/a' })).toBe('')
-  expect(writeBodyFromToolInput('Write', null as any)).toBe('')
+  expect(writeBodyFromToolInput({ file_path: '/a' })).toBe('')
+  expect(writeBodyFromToolInput(null as any)).toBe('')
 })
 
 test('writeLogEntriesFromToolInput:保留 Claude Write/Edit 记录', () => {

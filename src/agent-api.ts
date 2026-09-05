@@ -127,10 +127,6 @@ function serializeCatalog(catalog: ReturnType<typeof getAgentIdentityCatalog>): 
   }
 }
 
-export function serializeAgentRun(run: AgentRunSnapshot): object {
-  return serializeRun(run)
-}
-
 function serializeRun(run: AgentRunSnapshot): object {
   return {
     run_id: run.runId,

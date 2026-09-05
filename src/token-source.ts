@@ -1,15 +1,6 @@
 /**
- * Token Source 抽象层 —— agent 的额度/凭据来源管理。
- *
- * 三层架构:
- *   飞书层(model 面板 = 唯一入口) ─┐
- *                                   ├→ TokenSource 层(本文件,真相源)
- *   Agent 进程层(codex/claude)     ┘    ↓ spawnEnv / resolveSpawnModel / readUsage
- *
- * 声明式 provider:每个 token source 是一个自包含模块(token-source-<name>.ts),
- * 加载时 registerTokenSourceFactory(...) 登记。buildTokenSourcesFromConfig 遍历
- * factory registry 构建 —— 加新 source = 新建一个模块文件 + builtins import,
- * 不改本文件的枚举、不改 sources 数组。
+ * 账号、模型、启动环境和额度的共享接口及 registry。
+ * 每个 token-source-*.ts 模块注册 factory，由 token-source-builtins.ts 构建实例。
  */
 
 import type { AgentReasoningEffort } from './agent-process'
@@ -18,17 +9,13 @@ import { log } from './log'
 
 export type TokenSourceAgent = 'claude' | 'codex'
 
-/** 已知 kinds(文档用;TokenSource.kind 是 string,加新 source 不必扩这里)。 */
-export type TokenSourceKind = 'codex-subscription' | 'glm-coding-plan' | 'claude-native'
-
-/** 该账号下可选的具体模型(codex 订阅 7 个、glm 账号 8 个) */
+/** 账号模型目录中的一个可选模型。 */
 export interface TokenSourceModel {
   model: string
   display: string
   efforts: AgentReasoningEffort[]
   defaultEffort: AgentReasoningEffort
-  /** 1M context 能力(refreshModels 时自动实测,anthropic 兼容端点适用;
-   *  undefined = 未探/不适用,spawn 不加 [1m] 后缀)。 */
+  /** 真实 turn 已观测到 1M 上下文；undefined 表示未确认，仅供面板展示。 */
   context1m?: boolean
 }
 
@@ -183,10 +170,6 @@ export function listEnabledTokenSourcesByAgent(agent: TokenSourceAgent): TokenSo
   return listTokenSourcesByAgent(agent).filter(s => s.enabled)
 }
 
-export function defaultTokenSourceId(): string | null {
-  return defaultId
-}
-
 export function setDefaultTokenSource(id: string): void {
   if (registry.has(id)) defaultId = id
 }
@@ -224,4 +207,11 @@ export function refreshAllTokenSourceModels(): Promise<void> {
  * loading-only catalog immediately after boot/setup. */
 export function pendingTokenSourceModelRefresh(): Promise<void> | null {
   return refreshAllInFlight?.promise ?? null
+}
+
+/** 等待当前目录加载；等待期间若配置重建了 registry，继续等待新一轮。
+ * 只等待已有请求，不自行重新拉取模型。 */
+export async function waitForTokenSourceModelRefresh(): Promise<void> {
+  let pending: Promise<void> | null
+  while ((pending = pendingTokenSourceModelRefresh())) await pending
 }

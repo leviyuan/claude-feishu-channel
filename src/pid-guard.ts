@@ -1,27 +1,6 @@
 /**
- * 防 PID 回收的 daemon 守卫 —— 比 `process.kill(pid, 0)` 多一层验证:
- * 不光问 OS "这个 pid 活着吗", 还要问 "这个 pid 的 cmdline 跟我们启
- * 动时记下来的一不一样"。
- *
- * 起因: 2026-05-18 用户在 Windows 上看到 `already running (pid 5504)`,
- * 怀疑那个 pid 是不是早死了 —— Windows 上 PID 回收很快, 单 `kill(pid,
- * 0)` 探活会把"占了同一个号的无关进程"误判成"我们的 daemon 还在跑",
- * 把后续启动一直锁住。
- *
- * 设计:
- *   写 PID 文件时, 多写一行: 当前进程的 argv[1] (入口脚本绝对路径)。
- *   两个无关 lodestar 实例的入口路径不会撞, 所以这串字就是"我们这个
- *   实例"的唯一指纹。
- *
- *   检查时: 读出 pid + 保存的 marker → 查 pid 当前真正的 cmdline → 看
- *   marker 是不是 cmdline 的子串。在就是我们, 不在就是 PID 被回收, 把
- *   stale 文件删掉继续启动。
- *
- * 平台拿 cmdline 的路子:
- *   Linux  — 读 `/proc/<pid>/cmdline` (无 spawn, 最快)
- *   macOS  — `ps -p <pid> -o args=` (没 /proc, ps 退而求其次)
- *   Windows — PowerShell + Get-CimInstance Win32_Process 拿真 cmdline
- *             (~500ms 冷启动, 但只在 PID 文件存在时启动一次, 可以忍)
+ * PID 文件同时保存进程号和入口路径，检查时对照实际命令行，避免 PID 回收误判。
+ * Linux 读 /proc，macOS 用 ps，Windows 用 Get-CimInstance Win32_Process。
  */
 
 import { execSync } from 'node:child_process'

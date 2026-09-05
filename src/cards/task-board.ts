@@ -1,26 +1,8 @@
 /**
- * Claude Code Task 工具(TaskCreate/Update/List/Get)的累积状态板 + 渲染。
- *
- * 为什么需要这层:codex 的 TodoWrite 一次调用就带完整 todos 数组,直接渲染
- * 即可。但 Claude Code 把它拆成了 4 个工具 —— TaskCreate/Update/Get 都是
- * 单点操作,只有 TaskList 才返回完整快照。只看单次工具调用的数据,渲染出来
- * 就是碎片。官方文档(code.claude.com/docs/en/agent-sdk/todo-tracking)建议
- * 维护一份以 task id 为 key 的 map,跨调用累积。
- *
- * 数据形状的坑(2026-06-25 实测 test 项目 transcript + 官方文档双证):
- * - 官方说 TaskCreate 的 tool_result 是 JSON {task:{id,subject}},但实际
- *   Claude Code 流出来的是**纯文本** "Task #N created successfully: <subject>"。
- *   id 藏在 #N 里,必须正则解析,不能只按 JSON 解 —— 否则拿不到 id,只能用
- *   subject 当 fallback key,后续 TaskUpdate 的 taskId 对不上,触发兜底把
- *   taskId 当内容显示(就是曾经出现的 "1/2/3")。
- * - TaskUpdate input 是 {taskId, status?, subject?, addBlockedBy?, ...},
- *   status 可缺省(addBlockedBy / addBlocks 等不是状态变更)。taskId 字段名
- *   SDK 会把 id/task_id 修成 taskId,但修复不反映在流里 → 三种名都要认。
- * - TaskUpdate 找不到 id 时**绝不**用 taskId 当 subject 兜底(会显示成裸
- *   "1/2/3"),等 TaskCreate/List 校正(no-fallbacks)。
- *
- * 本模块纯函数 + 类型;session-tools.ts 持有 board 并在每次 Task 工具完成时
- * 调 applyTaskTool 累积,再调 taskBoardElement 渲染整个 board。
+ * Claude TaskCreate/Update/List/Get 的累积状态与卡片渲染。
+ * TaskCreate 结果兼容 JSON 和 "Task #N created successfully: ..." 文本；
+ * TaskUpdate 兼容 taskId/id/task_id，缺失任务等待 Create/List 补齐。
+ * session-tools.ts 在工具完成时应用更新，再渲染整个任务板。
  */
 
 import { ELEMENTS } from './elements'

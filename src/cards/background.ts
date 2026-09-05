@@ -438,12 +438,6 @@ const TYPE_LABEL: Record<BgTaskType, string> = {
   unknown: '任务',
 }
 
-function fmtTokens(n: number): string {
-  if (n < 1000) return `${n}`
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`
-  return `${(n / 1_000_000).toFixed(1)}M`
-}
-
 /** ms → "45s" / "2m13s" / "1h5m"。 */
 function fmtElapsed(ms: number): string {
   if (!ms || ms < 0) return '0s'

@@ -33,22 +33,32 @@ afterEach(() => {
 })
 
 describe('cardkit card operations', () => {
-  test('classifies only a real nested 300305 as component capacity', () => {
-    expect(cardkit.isElementLimitFailure(300305, { message: 'component limit' })).toBe(true)
-    expect(cardkit.isElementLimitFailure(300315, {
+  test('classifies card size and component limits without treating schema errors as capacity', () => {
+    expect(cardkit.isCardCapacityFailure(200860, { message: 'ErrMsg: card over max size;' })).toBe(true)
+    expect(cardkit.isCardCapacityFailure(300315, {
+      message: 'Failed to add element: inner code: 200860, card over max size',
+    })).toBe(true)
+    expect(cardkit.isCardCapacityFailure(300315, {
+      message: 'Failed to add element: ErrMsg: card over max size;',
+    })).toBe(true)
+    expect(cardkit.isCardCapacityFailure(300305, { message: 'component limit' })).toBe(true)
+    expect(cardkit.isCardCapacityFailure(300315, {
       message: 'Failed to add element: inner code: 300305, element exceeds limit',
     })).toBe(true)
-    expect(cardkit.isElementLimitFailure(300315, {
+    expect(cardkit.isCardCapacityFailure(300315, {
       message: 'Duplicate ID, inner code: 300301',
     })).toBe(false)
-    expect(cardkit.isElementLimitFailure(300315, {
+    expect(cardkit.isCardCapacityFailure(300315, {
       message: 'elementID format error. Only alphabets, numbers, and underscores are allowed. It must start with an alphabet and not exceed 20 characters; code: 300301',
     })).toBe(false)
-    expect(cardkit.isElementLimitFailure(300315, {
+    expect(cardkit.isCardCapacityFailure(300315, {
       message: 'number of elements in a column exceeds the maximum; code: 300301',
     })).toBe(false)
-    expect(cardkit.isElementLimitFailure(200570, { message: 'invalid image keys' })).toBe(false)
-    expect(cardkit.isElementLimitFailure(300308, { message: 'server internal error' })).toBe(false)
+    expect(cardkit.isCardCapacityFailure(300315, {
+      message: 'markdown element content exceeds maximum length; code: 300301',
+    })).toBe(false)
+    expect(cardkit.isCardCapacityFailure(200570, { message: 'invalid image keys' })).toBe(false)
+    expect(cardkit.isCardCapacityFailure(300308, { message: 'server internal error' })).toBe(false)
     expect(cardkit.isDuplicateElementFailure(300315, { message: 'Duplicate ID; code: 300301' })).toBe(true)
     expect(cardkit.isDuplicateElementFailure(300315, { message: 'elementID format error; code: 300301' })).toBe(false)
   })
@@ -230,6 +240,33 @@ describe('checked card writes', () => {
       tag: 'markdown', element_id: 'assistant_0', content: 'x',
     })).toBe(false)
     await cardkit.dispose(cardId)
+  })
+
+  test('a size rejection in an isolated replacement leaves the original element writable', async () => {
+    const cardId = 'card_local_size_failure'
+    let notifications = 0
+    let attempts = 0
+    cardkit.recordCardCreated(cardId, 1, () => { notifications++ })
+    globalThis.fetch = (async () => new Response(JSON.stringify(++attempts === 1
+      ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+      : { code: 0, data: {} }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+
+    try {
+      expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+        tag: 'column_set', element_id: 'assistant_0',
+        columns: [{ tag: 'column', elements: [{ tag: 'img', img_key: 'uploaded_formula' }] }],
+      }, { notifyCardFailure: false })).toBe(false)
+      expect(notifications).toBe(0)
+      expect(cardkit.isDeadElement(cardId, 'assistant_0')).toBe(false)
+      expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+        tag: 'markdown', element_id: 'assistant_0', content: '原始公式 $$x^2$$',
+      })).toBe(true)
+      expect(attempts).toBe(2)
+    } finally {
+      await cardkit.dispose(cardId)
+    }
   })
 
   test('add/delete checked variants return false on rejected mutations', async () => {

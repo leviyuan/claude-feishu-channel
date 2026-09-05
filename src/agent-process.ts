@@ -91,7 +91,6 @@ export interface AgentProcess extends EventEmitter {
     decision: 'allow' | 'deny',
     payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void
-  sendToolResult(toolUseId: string, content: string, isError?: boolean): void
   sendHookResponse(requestId: string, output?: object): void
   isAlive(): boolean
   /** Resolve only after the backend's real lifecycle has ended. Reject when
@@ -100,9 +99,7 @@ export interface AgentProcess extends EventEmitter {
 
   listModels(): Promise<CodexModel[]>
   setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void>
-  setModel(model: string): Promise<void>
   compactThread(): Promise<void>
-  injectThreadItems(items: any[]): Promise<void>
   /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
    *  claude:无此通道,返回 null(session 的额度走 token source)。 */
   readRateLimits?(): Promise<any>

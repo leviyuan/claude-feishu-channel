@@ -1,17 +1,20 @@
-# `scripts/` 局部指引
+# 脚本使用
 
-这里的脚本面向安装、真实飞书探针和人工 smoke。多数脚本直接加载生产配置、XDG 状态与 `src/` 实现，不是隔离测试；`Session` 按目标群持久选择启动对应后端。
+这里包含安装脚本、真实飞书探针和人工 smoke。多数脚本会加载生产配置与 XDG 状态；`Session` 按群保存的选择启动后端。
 
-## 边界与副作用
+| 脚本 | 副作用 |
+| --- | --- |
+| `smoke.ts`、`test-all.ts` | 在真实群发送文本、卡片、reaction 和文件，自行创建 Session |
+| `test-inject.ts` | 向 debug context 指定的群发送可见消息，再注入正在运行的 daemon |
+| `test-mid-turn-rotation.ts` | 通过 debug socket 发送 `kill` 和长任务，读取日志 |
+| `cardkit-probe.ts` | 发多张测试卡，直调 Card Kit API |
+| `seed-debug-ctx.ts` | 查询群成员，将指定成员写入本机 debug context |
+| `postinstall.cjs` | 提示安装步骤，检查或补装 Claude SDK 当前平台 native binary |
 
-- `smoke.ts` 与 `test-all.ts` 会在真实群发送消息、卡片、reaction 和文件，并自行创建 `Session`；同一群的 live daemon 必须停止以免双 session 争用。运行脚本和停止 daemon 分别需要用户在当前消息中明确授权。
-- `test-inject.ts` 依赖正在运行的 debug socket，每次注入都会先向已 seed 的群发送成员可见消息；`test-mid-turn-rotation.ts` 还会发送 `kill` 和长 turn。不要把它们当成无副作用单元测试。
-- `cardkit-probe.ts` 会发送多张探针卡并直调真实 Card Kit API；`seed-debug-ctx.ts` 会查询群成员并写 XDG debug context。执行前显式复核 chat/group，禁止依赖硬编码或 `test1` 默认值。
-- 脚本复用 `src/feishu.ts`、`src/session.ts` 与 `src/paths.ts`，不要复制生产 API、provider 选择、凭据解析或状态路径；不得把 debug context、成员信息或 token 写进仓库。
-- `postinstall.cjs` 只输出安装提示，并检查/补装 Claude Agent SDK 当前平台的 native binary；不得在 npm lifecycle 中启动交互向导。首次向导由 `cli.ts` 在真实 TTY 触发，native 最终不可用时由 agent 启动路径显式报错。
-- Smoke 覆盖声明必须与实际 provider 能力一致；不要把默认 Claude session 注释成强制 Codex，也不要用单后端通过冒充双后端验证完成。
+`smoke-session.ts` 共用账号、持久状态加载和完成检查；`debug-client.ts` 共用注入请求。它们不作为独立命令运行。
 
-## 验证
-
-- 修改脚本后先运行其导入模块的单元测试；修改 npm lifecycle、native dependency、构建产物引用或跨平台入口后运行 `bun run build`。
-- 真实 smoke 不是默认验证。只有目标群、副作用、provider/source 和 live daemon 前置条件都获授权后，才执行 `bun scripts/<name>.ts ...`，完成后报告发送内容与本地状态变更。
+- 真实 smoke 需要明确账号、目标群和副作用。自行创建 Session 的脚本要求目标群的 live daemon 已停止；停止 daemon 仍需当前消息单独授权。
+- 探针必须显式指定目标，不使用硬编码群或 `test1` 默认值。凭据、成员和 debug context 不写进仓库。
+- 复用 `src/feishu.ts`、`src/session.ts` 和 `src/paths.ts`，不复制生产 API、账号路由和状态路径。覆盖说明与实际 provider 一致。
+- npm lifecycle 不启动交互向导；首次向导由 `cli.ts` 在 TTY 中触发。native binary 不可用时由启动路径明确报错。
+- 修改后先运行相关单元测试。npm lifecycle、native 依赖、构建引用或跨平台入口有变动时运行 `bun run build`。真实 smoke 完成后报告发送内容和本地状态变化。

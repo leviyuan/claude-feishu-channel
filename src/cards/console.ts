@@ -467,35 +467,6 @@ export function consoleCard(opts: ConsoleOpts): object {
   }
 }
 
-interface MenuOpts {
-  question: string
-  options: string[]
-  requestId: string
-}
-
-export function menuCard(opts: MenuOpts): object {
-  const { question, options, requestId } = opts
-  return {
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: '📋 等待选择' },
-      template: 'turquoise',
-    },
-    body: {
-      elements: [
-        { tag: 'markdown', content: question || '_请选择一项：_' },
-        ...options.map((opt, i) => ({
-          tag: 'button',
-          text: { tag: 'plain_text', content: opt },
-          type: 'default',
-          behaviors: [{ type: 'callback', value: { kind: 'menu', request_id: requestId, choice: i } }],
-        })),
-      ],
-    },
-  }
-}
-
 export interface ProviderChoice {
   provider?: AgentProvider
   sourceId: string
@@ -704,16 +675,6 @@ export function modelCustomResultPanelElement(
         : `❌ \`${model}\` 未加入 — ${reason}`,
     }],
   }
-}
-
-/** 补录结果卡(整卡,消息形态):备用导出。 */
-export function modelCustomResultCard(
-  sessionName: string,
-  ok: boolean,
-  model: string,
-  reason: string,
-): object {
-  return modelCard(sessionName, modelCustomResultPanelElement(ok, model, reason), ok ? 'green' : 'red')
 }
 
 export function modelEffortSelectionPanelElement(opts: ModelEffortSelectionCardOpts): object {

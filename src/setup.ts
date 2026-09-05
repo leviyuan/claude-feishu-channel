@@ -1,26 +1,7 @@
 /**
- * Interactive setup wizard — runs after `npm i -g @leviyuan/lodestar`,
- * triggered either by the postinstall hook (via /dev/tty on unix,
- * \\.\CON{IN,OUT}$ on Windows) or manually via `lodestar-setup`.
- *
- * Lodestar 默认后端是 Claude Code (Agent SDK),Codex 是可选第二后端
- * (群里发 `model` 切换)。本向导依次做 4 件事:
- *
- *   1. 确保 Claude Code CLI 在 PATH (npm i -g @anthropic-ai/claude-code)。
- *      特别提醒: 受 Claude 官方限制, Claude 订阅 (Pro/Max OAuth 登录)
- *      不支持本项目; 必须走 API 方式 —— GLM Coding Plan 或 Anthropic API key。
- *   2. GLM Coding Plan API key (推荐, 可选) —— 给了就自动写入
- *      ~/.claude/settings.json 的 env (1M context + 中文优化); 不给就
- *      沿用本机 Claude Code 现有配置启动。同一歩末尾可选顺带配置 Codex。
- *   3. Feishu 自建应用 —— 打开 https://open.feishu.cn/app, 列出每个
- *      权限 scope + 事件订阅步骤, 粘贴的 app_id / app_secret 先调
- *      tenant_access_token endpoint 验证再收。失败循环重试。
- *   4. projects_root —— 默认 = 用户主目录; 写 config.toml 后 detached
- *      自动拉起 lodestar-daemon, 向导退出后继续跑。
- *
- * GLM 路由的真相源是 ~/.claude/settings.json (SDK 经 settingSources:
- * ['user'] 读取, 见 docs/claude-agent-backend.md), 不走 config.toml 的
- * [claude.env] —— 后者仅作可选 escape hatch。
+ * lodestar-setup 交互向导；cli.ts 首次启动且配置缺失时也可调用。
+ * 配置 Claude Code、可选 GLM API key 和 Codex、飞书应用及项目目录。
+ * GLM key 写入本机 Claude settings，由 daemon 的 Token Source 检测并加载。
  */
 
 import { execSync, spawn } from 'node:child_process'

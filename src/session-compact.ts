@@ -7,7 +7,6 @@ import {
 import type { AgentProcess } from './agent-process'
 import { NothingToCompactError } from './agent-process'
 import * as feishu from './feishu'
-import { log } from './log'
 import {
   contextLimitFromAppServer,
   contextTokenRatioLabel,
@@ -16,9 +15,6 @@ import {
 } from './context-window'
 import { diagnosticIdLabel, messageOf } from './session-util'
 
-// 10min:claude 大上下文压缩实测 5min+(user-reported 2026-08-04)。codex 正常压缩
-// 快得多,设大对 codex 无害 —— timeout 只在压缩完成 notification 不到时兜底触发。
-const CONTEXT_COMPACT_TIMEOUT_MS = 600_000
 const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
 
 type ManualCompactionWatch = {
@@ -38,17 +34,12 @@ type ManualCompactionUsageWatch = {
   cancel(): void
 }
 
-function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCompactionWatch {
+function watchManualCompaction(proc: AgentProcess): ManualCompactionWatch {
   let settled = false
-  let timer: ReturnType<typeof setTimeout> | null = null
   let resolvePromise: (notice: ContextCompactedNotification) => void = () => {}
   let rejectPromise: (e: Error) => void = () => {}
   const threadId = proc.sessionId
   const cleanup = () => {
-    if (timer) {
-      clearTimeout(timer)
-      timer = null
-    }
     proc.off('context_compacted', onCompacted)
     proc.off('exit', onExit)
     proc.off('error', onError)
@@ -70,14 +61,13 @@ function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCom
     if (notice.threadId && threadId && notice.threadId !== threadId) return
     finish(notice)
   }
-  const onExit = () => fail(new Error('codex app-server exited before context compaction completed'))
+  const onExit = () => fail(new Error(`${proc.provider} process exited before context compaction completed`))
   const onError = (e: unknown) => fail(e instanceof Error ? e : new Error(String(e)))
   const promise = new Promise<ContextCompactedNotification>((resolve, reject) => {
     resolvePromise = resolve
     rejectPromise = reject
-    // 不设 timeout(user-requested 2026-08-05):大上下文压缩可能 >10min,固定 timeout 误杀。
-    // 死等 context_compacted;proc exit/error 兜底 fail(onExit/onError 已注册)。
   })
+  // 大上下文压缩不设固定时限；等待完成通知，进程退出或报错时失败。
   proc.on('context_compacted', onCompacted)
   proc.once('exit', onExit)
   proc.once('error', onError)
@@ -195,7 +185,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
     if (statusCard) await s.closeStatusCard(statusCard, status)
     else await feishu.sendText(s.chatId, status)
   }
-  const watch = watchManualCompaction(proc, CONTEXT_COMPACT_TIMEOUT_MS)
+  const watch = watchManualCompaction(proc)
   const usageWatch = watchManualCompactionUsage(proc, proc.sessionId)
   s.manualContextCompactionPending = true
   try {

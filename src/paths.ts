@@ -1,25 +1,7 @@
 /**
- * Filesystem layout — XDG Base Directory spec on unix, Windows
- * standard dirs on Win32, with env-var overrides on every platform.
- *
- *   Unix config:    $LODESTAR_CONFIG_DIR | $XDG_CONFIG_HOME/lodestar | ~/.config/lodestar
- *   Unix data:      $LODESTAR_DATA_DIR   | $XDG_DATA_HOME/lodestar   | ~/.local/share/lodestar
- *   Windows config: $LODESTAR_CONFIG_DIR | %APPDATA%\Lodestar
- *   Windows data:   $LODESTAR_DATA_DIR   | %LOCALAPPDATA%\Lodestar
- *   (XDG_* env vars still honored on Windows for power-users.)
- *
- *   config.toml             — credentials + preferences (in CONFIG_DIR)
- *   daemon.pid              — single-instance lock          (in DATA_DIR)
- *   daemon-YYYY-MM-DD.log   — 按日滚动运行日志, 保留近 7 天  (in DATA_DIR)
- *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
- *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
- *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
- *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
- *   agent-runs/             — durable delegated-agent runs    (in DATA_DIR)
- *   agent-session-ids.json  — delegated native session ids    (in DATA_DIR)
- *   managed-claude-plugin/  — daemon-owned Skills for SDK     (in DATA_DIR)
- *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
- *   inbox/                  — downloaded attachments        (in DATA_DIR)
+ * 配置和状态路径：Unix 遵循 XDG，Windows 使用 APPDATA/LOCALAPPDATA。
+ * LODESTAR_CONFIG_DIR、LODESTAR_DATA_DIR 优先于 XDG 和平台默认目录；
+ * LODESTAR_CONFIG 可单独指定配置文件。运行状态统一放在 DATA_DIR。
  */
 
 import { homedir } from 'node:os'

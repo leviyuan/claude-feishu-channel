@@ -26,7 +26,7 @@ import {
   logContextCompactionPayload,
   logUnhandledAppServerPayload,
 } from './codex-compaction'
-import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
+import { usageFromTokenUsagePayload } from './codex-usage'
 import { shellCommandDescription } from './cards/shell-command'
 import type { AgentReasoningEffort } from './agent-process'
 import { diagnosticIdLabel } from './session-util'
@@ -780,7 +780,7 @@ export class CodexProcess extends EventEmitter {
       return
     }
     // 多 agent 编排 item 不走通用 tool_use 映射,先喂给 collab 状态机。
-    if (this.feedCollabItem(item, 'started', params)) return
+    if (this.feedCollabItem(item, 'started')) return
     const mapped = mapStartedItem(item, this.opts.workDir)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_STARTED_UNMAPPED', { method: 'item/started', params })
@@ -794,7 +794,7 @@ export class CodexProcess extends EventEmitter {
   private handleSubagentItemStarted(params: any): void {
     const item = params?.item
     if (!item?.id) return
-    if (this.feedCollabItem(item, 'started', params)) return
+    if (this.feedCollabItem(item, 'started')) return
     this.emitSubagentStep(item, 'started', params)
   }
 
@@ -812,7 +812,7 @@ export class CodexProcess extends EventEmitter {
       }
       return
     }
-    if (this.feedCollabItem(item, 'completed', params)) return
+    if (this.feedCollabItem(item, 'completed')) return
     this.emitSubagentStep(item, 'completed', params)
   }
 
@@ -827,7 +827,7 @@ export class CodexProcess extends EventEmitter {
       this.emit('assistant_block_stop', { index: item.id, parentToolUseId: null })
       return
     }
-    if (this.feedCollabItem(item, 'completed', params)) return
+    if (this.feedCollabItem(item, 'completed')) return
     const mapped = mapCompletedItem(item, this.opts.workDir, this.sessionId ?? undefined)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
@@ -931,7 +931,7 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  private feedCollabItem(item: any, phase: 'started' | 'completed', params?: any): boolean {
+  private feedCollabItem(item: any, phase: 'started' | 'completed'): boolean {
     if (item.type === 'subAgentActivity') {
       const threadId = typeof item.agentThreadId === 'string' ? item.agentThreadId : ''
       if (!threadId) return true // 吞掉,不进通用映射也不进 UNHANDLED 噪音
@@ -1727,26 +1727,9 @@ export class CodexProcess extends EventEmitter {
     return { provider: 'codex', sessionId, cwd: thread.cwd }
   }
 
-  async injectThreadItems(items: any[]): Promise<void> {
-    if (!Array.isArray(items) || items.length === 0) return
-    if (!this.readyPromise) this.sendInitialize()
-    await this.readyPromise
-    if (!this.sessionId) throw new Error('codex thread not initialized')
-    await this.request('thread/inject_items', {
-      threadId: this.sessionId,
-      items,
-    })
-  }
-
   async setModelSettings(_model: string, _effort: AgentReasoningEffort): Promise<void> {
-    // codex 后端走 ~/.codex/config.toml:model / effort 由 codex 决定,lodestar 不下发
-    // thread/settings/update。保留方法签名以满足 AgentProcess 接口(session-model 切换时仍会调用)。
-    log('codex-process: setModelSettings no-op (codex model/effort governed by ~/.codex/config.toml)')
-  }
-
-  async setModel(_model: string): Promise<void> {
-    // codex 走配置:setModel/setModelSettings 均 no-op(model 由 ~/.codex/config.toml 决定)
-    log('codex-process: setModel no-op (codex model governed by ~/.codex/config.toml)')
+    // Session 保存目标设置，重启时由启动参数应用；不修改运行中的 thread。
+    log('codex-process: model settings require a process restart')
   }
 
   async compactThread(): Promise<void> {
@@ -1953,10 +1936,6 @@ export class CodexProcess extends EventEmitter {
         })
         this.respondError(requestId, payload?.denyMessage ?? 'unsupported approval request')
     }
-  }
-
-  sendToolResult(_toolUseId: string, _content: string, _isError = false): void {
-    log('codex-process: sendToolResult ignored; Codex app-server server requests are answered via sendPermissionResponse')
   }
 
   sendHookResponse(requestId: string, output: object = {}): void {

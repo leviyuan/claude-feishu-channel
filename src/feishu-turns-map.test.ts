@@ -22,16 +22,12 @@ function runFreshState(
   const feishuModule = pathToFileURL(join(import.meta.dir, 'feishu.ts')).href
   const script = `
     import {
-      appendTurnAnchor,
-      bindSessionResume,
+      appendTurnAnchorChecked,
       bindSessionResumeChecked,
       clearSessionConversationState,
-      clearSessionResume,
       clearSessionResumeChecked,
-      clearTurnAnchors,
       getSessionBranchBase,
       getSessionModelSelection,
-      getSessionResume,
       getSessionResumeRef,
       getPendingConversationLaunch,
       getTurnAnchors,
@@ -40,7 +36,6 @@ function runFreshState(
       loadSessionTurnsMap,
       replaceTurnAnchors,
       setPendingConversationLaunchChecked,
-      setSessionBranchBase,
     } from ${JSON.stringify(feishuModule)}
     import { mkdirSync, readFileSync, rmSync } from 'node:fs'
     import { join } from 'node:path'
@@ -213,13 +208,13 @@ describe('session turn checkpoint persistence', () => {
         },
         preview: 'first', ts: 1, writes: [],
       }
-      setSessionBranchBase('fresh', { kind: 'fresh' })
+      replaceTurnAnchors('fresh', [], { kind: 'fresh' })
       replaceTurnAnchors('forked', [first], {
         kind: 'fork',
         source: { provider: 'codex', sessionId: 'source-thread', cwd },
       })
       replaceTurnAnchors('cleared', [first], { kind: 'fresh' })
-      clearTurnAnchors('cleared')
+      replaceTurnAnchors('cleared', [], null, null)
       loadSessionTurnsMap()
       __out({
         fresh: getSessionBranchBase('fresh'),
@@ -251,9 +246,9 @@ describe('session turn checkpoint persistence', () => {
   test('advances the branch base through the discarded checkpoint at 201 anchors', () => {
     const result = runFreshState(`
       const cwd = '/srv/lodestar/project'
-      setSessionBranchBase('project', { kind: 'fresh' })
+      replaceTurnAnchors('project', [], { kind: 'fresh' })
       for (let i = 1; i <= 201; i++) {
-        appendTurnAnchor('project', {
+        appendTurnAnchorChecked('project', {
           checkpoint: {
             provider: 'codex', kind: 'turn', id: 'turn-' + i,
             source: { provider: 'codex', sessionId: 'thread-1', cwd },
@@ -376,7 +371,7 @@ describe('session turn checkpoint persistence', () => {
       }
       const pending = { launch, previousSessionId: 'previous-session' }
       replaceTurnAnchors('project', [], launch, pending)
-      appendTurnAnchor('project', {
+      appendTurnAnchorChecked('project', {
         checkpoint: {
           provider: 'claude', kind: 'assistant-message', id: 'assistant-1',
           source: {
@@ -454,14 +449,14 @@ describe('conversation cwd validation', () => {
 describe('session conversation state cleanup', () => {
   test('round-trips provider conversation refs with their absolute cwd', () => {
     const result = runFreshState(`
-      bindSessionResume('project', {
+      bindSessionResumeChecked('project', {
         provider: 'codex', sessionId: 'codex-thread', cwd: '/srv/codex-project',
       })
       bindSessionResumeChecked('project', 'claude-session', 'claude', '/srv/claude-project')
       loadSessionResumeMap()
       __out({
-        codexId: getSessionResume('project', 'codex'),
-        claudeId: getSessionResume('project', 'claude'),
+        codexId: (getSessionResumeRef('project', 'codex')?.sessionId ?? null),
+        claudeId: (getSessionResumeRef('project', 'claude')?.sessionId ?? null),
         codexRef: getSessionResumeRef('project', 'codex'),
         claudeRef: getSessionResumeRef('project', 'claude'),
         persisted: __read('session-resume-map.json'),
@@ -495,7 +490,7 @@ describe('session conversation state cleanup', () => {
     const result = runFreshState(`
       const errors = []
       for (const bind of [
-        () => bindSessionResume('missing', {
+        () => bindSessionResumeChecked('missing', {
           provider: 'codex', sessionId: 'thread', cwd: null,
         }),
         () => bindSessionResumeChecked('relative', 'session', 'claude', 'relative/project'),
@@ -523,18 +518,18 @@ describe('session conversation state cleanup', () => {
   test('keeps legacy resume compatibility and clears only the requested provider', () => {
     const result = runFreshState(`
       loadSessionResumeMap()
-      const legacyCodex = getSessionResume('legacy')
-      const legacyClaude = getSessionResume('legacy-claude', 'claude')
+      const legacyCodex = (getSessionResumeRef('legacy')?.sessionId ?? null)
+      const legacyClaude = (getSessionResumeRef('legacy-claude', 'claude')?.sessionId ?? null)
       const legacyRef = getSessionResumeRef('legacy-ref', 'codex')
-      clearSessionResume('target', 'codex')
+      clearSessionResumeChecked('target', 'codex')
       __out({
         legacyCodex,
         legacyClaude,
         legacyRef,
         legacyCodexRef: getSessionResumeRef('legacy'),
         legacyClaudeRef: getSessionResumeRef('legacy-claude', 'claude'),
-        targetCodex: getSessionResume('target', 'codex'),
-        targetClaude: getSessionResume('target', 'claude'),
+        targetCodex: (getSessionResumeRef('target', 'codex')?.sessionId ?? null),
+        targetClaude: (getSessionResumeRef('target', 'claude')?.sessionId ?? null),
         targetClaudeRef: getSessionResumeRef('target', 'claude'),
         persisted: __read('session-resume-map.json'),
       })
@@ -619,13 +614,13 @@ describe('session conversation state cleanup', () => {
       clearSessionConversationState('target')
       __out({
         target: {
-          codex: getSessionResume('target', 'codex'),
-          claude: getSessionResume('target', 'claude'),
+          codex: (getSessionResumeRef('target', 'codex')?.sessionId ?? null),
+          claude: (getSessionResumeRef('target', 'claude')?.sessionId ?? null),
           model: getSessionModelSelection('target'),
           turns: getTurnAnchors('target'),
         },
         keep: {
-          resume: getSessionResume('keep', 'codex'),
+          resume: (getSessionResumeRef('keep', 'codex')?.sessionId ?? null),
           model: getSessionModelSelection('keep'),
           turns: getTurnAnchors('keep'),
         },

@@ -95,10 +95,23 @@ describe('Claude model profiles', () => {
 
   test('maps claude profiles to SDK model alias', () => {
     const previousModels = config.claude.models
-    config.claude.models = {}
+    config.claude.models = {
+      custom: { model: ' sonnet ' },
+      empty: {},
+      'real-model': { model: 'haiku' },
+      default: { model: 'haiku' },
+    }
     try {
+      expect(resolveClaudeSdkModel(null)).toBe('opus')
       expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
       expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
+      expect(resolveClaudeSdkModel('claude:custom')).toBe('sonnet')
+      expect(resolveClaudeSdkModel('claude:empty')).toBe('opus')
+      expect(resolveClaudeSdkModel('claude:unlisted')).toBe('unlisted')
+      expect(resolveClaudeSdkModel('real-model')).toBe('real-model')
+      expect(resolveClaudeSdkModel('GLM-5.2[1m]')).toBe('GLM-5.2[1m]')
+      config.claude.models.glm = { model: 'custom-glm' }
+      expect(resolveClaudeSdkModel('claude:glm')).toBe('custom-glm')
     } finally {
       config.claude.models = previousModels
     }

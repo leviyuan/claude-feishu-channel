@@ -1,9 +1,4 @@
-/**
- * Shared types split out of session.ts so the main file stays under
- * agent per-read token budgets. Pure type-only — no
- * runtime imports here. Companion modules: session-tools.ts,
- * session-ask.ts, session-permission.ts.
- */
+/** Session 与 session-*.ts helper 共用的类型定义，不包含运行时导入。 */
 
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
@@ -156,17 +151,8 @@ export interface TurnState {
    * reactive combined. Informational (logging) — NOT what the cap reads.
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
-  /** Rotations triggered by confirmed card-capacity failures only
-   * (onCardWriteFailure). This is the counter MAX_MIDTURN_ROTATES caps.
-   * Deterministic payload/schema errors and network failures must not consume
-   * it because replaying the same mutation on a fresh card cannot repair
-   * them. The proactive path
-   * (maybeMidTurnRotate) deliberately does NOT consume this budget: it
-   * needs ~50 genuinely-successful elements per card to fire again, so
-   * it's naturally throttled by real output. Sharing one counter was the
-   * 2026-07-04 bug — a long turn's 5 legitimate full-card rotations
-   * exhausted the cap, and the next transient 300308 flipped the turn to
-   * log-only. */
+  /** 仅统计容量错误触发的换卡，受 MAX_MIDTURN_ROTATES 限制。
+   * 主动换卡不计入；schema、内容和网络错误不能通过换卡修复。 */
   failureRotateCount: number
   /** A non-capacity write failure is surfaced once per turn while the exact
    * failed element remains dead/checked-false. Prevents footer/tool refreshes

@@ -1,31 +1,81 @@
-import { describe, expect, test } from 'bun:test'
-import { removeTokenSourceSectionText } from './token-source-config'
+import { expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-describe('token source config section editing', () => {
-  test('removes a whole section even when values contain [1m]', () => {
-    const input = [
-      '[feishu]',
-      'app_id = "x"',
-      '',
-      '[token_source.glm]',
-      'slots = "opus=GLM-5.3[1m],sonnet=GLM-5.3[1m]"',
-      'auth_token = "secret"',
-      '',
-      '[notify]',
-      'port = "9876"',
-      '',
-    ].join('\n')
+// 配置模块在 import 时读取文件；子进程同时隔离模块 mock 和真实配置。
+function runConfigUpdate(work: string): void {
+  const root = mkdtempSync(join(tmpdir(), 'lodestar-source-config-'))
+  const configFile = join(root, 'config.toml')
+  writeFileSync(configFile, [
+    '[feishu]',
+    'app_id = "test"',
+    'app_secret = "test"',
+    '[token_source.glm]',
+    'slots = "opus=GLM-5.3[1m],sonnet=GLM-5.3[1m]"',
+    'auth_token = "old-token"',
+    '[notify]',
+    'port = 9876',
+    '',
+  ].join('\n'))
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    import { readFileSync, rmSync } from 'node:fs'
+    let rebuilds = 0
+    let refreshes = 0
+    let releaseRefresh
+    const refresh = new Promise(resolve => { releaseRefresh = resolve })
+    mock.module(${JSON.stringify(join(import.meta.dir, 'token-source-builtins.ts'))}, () => ({
+      buildTokenSourcesFromConfig: () => { rebuilds++ },
+    }))
+    mock.module(${JSON.stringify(join(import.meta.dir, 'token-source.ts'))}, () => ({
+      refreshAllTokenSourceModels: () => { refreshes++; return refresh },
+    }))
+    const { addTokenSource } = await import(${JSON.stringify(join(import.meta.dir, 'token-source-config.ts'))})
+    const { config } = await import(${JSON.stringify(join(import.meta.dir, 'config.ts'))})
+    const configFile = ${JSON.stringify(configFile)}
+    ${work}
+  `
+  try {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, '--eval', script],
+      env: { ...process.env, LODESTAR_CONFIG: configFile },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
 
-    const result = removeTokenSourceSectionText(input, 'glm')
-    expect(result.removed).toBe(true)
-    expect(result.text).not.toContain('token_source.glm')
-    expect(result.text).not.toContain('auth_token')
-    expect(result.text).toContain('[notify]')
-    expect(result.text).toContain('port = "9876"')
-  })
+test('updates credentials without losing slots or adjacent sections and waits for one catalog refresh', () => {
+  runConfigUpdate(`
+    let completed = false
+    const pending = addTokenSource('glm', { auth_token: 'new-token' }).then(() => { completed = true })
+    await Promise.resolve()
+    assert.equal(completed, false)
+    assert.equal(rebuilds, 1)
+    assert.equal(refreshes, 1)
+    const saved = readFileSync(configFile, 'utf8')
+    assert.equal((saved.match(/\\[token_source\\.glm\\]/g) || []).length, 1)
+    assert.ok(saved.includes('slots = "opus=GLM-5.3[1m],sonnet=GLM-5.3[1m]"'))
+    assert.ok(saved.includes('[notify]\\nport = 9876'))
+    assert.ok(!saved.includes('old-token'))
+    assert.equal(config.token_sources.glm.auth_token, 'new-token')
+    releaseRefresh()
+    await pending
+    assert.equal(completed, true)
+    assert.equal(refreshes, 1)
+  `)
+})
 
-  test('returns the original text when the source does not exist', () => {
-    const input = '[feishu]\napp_id = "x"\n'
-    expect(removeTokenSourceSectionText(input, 'missing')).toEqual({ text: input, removed: false })
-  })
+test('does not rebuild or refresh when reading the configuration fails', () => {
+  runConfigUpdate(`
+    rmSync(configFile)
+    await assert.rejects(addTokenSource('glm', { auth_token: 'new-token' }), /ENOENT/)
+    assert.equal(rebuilds, 0)
+    assert.equal(refreshes, 0)
+  `)
 })

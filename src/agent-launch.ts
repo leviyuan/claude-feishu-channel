@@ -39,6 +39,12 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   if (source && source.agent !== opts.provider) {
     throw new Error(`token source ${source.id} belongs to ${source.agent}, not ${opts.provider}`)
   }
+  if (source?.modelCatalogState?.status === 'failed') {
+    throw new Error(`model catalog refresh failed for ${source.id}: ${source.modelCatalogState.error ?? 'MISS'}`)
+  }
+  if (source?.modelCatalogState?.status === 'idle' || source?.modelCatalogState?.status === 'loading') {
+    throw new Error(`model catalog is not ready for ${source.id}: ${source.modelCatalogState.status}`)
+  }
   const requestedModel = opts.model ?? source?.defaultModel
   if (source && requestedModel && !source.models.some(entry => entry.model === requestedModel)) {
     throw new Error(`model is not present in token source ${source.id}: ${requestedModel}`)

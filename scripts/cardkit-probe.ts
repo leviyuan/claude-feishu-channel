@@ -4,26 +4,30 @@
  *
  * Tests two paths and three IM-reference syntaxes:
  *
- *   Path A: sendCard(JSON) → id_convert → PUT element/content   ← current
- *   Path B: createCardEntity → IM message {type:"card", data:{card_id}}
- *           → PUT element/content                              ← candidate
+ *   Path A: sendCard(JSON) → id_convert → PUT element/content
+ *   Path B: POST /cards → IM message {type:"card", data:{card_id}}
+ *           → PUT element/content
  *
  *   Then try IM type values: "card", "card_id", "card_template"
  *
  * Prints which combo lets PUT element/content succeed.
  */
 
+const targetName = process.argv[2]
+if (!targetName) {
+  console.error('usage: bun scripts/cardkit-probe.ts <chat_name|chat_id>')
+  process.exit(1)
+}
+
 const feishu = await import('../src/feishu')
 await feishu.refreshChatList()
 
-const targetName = process.argv[2] ?? 'test1'
-let chatId = ''
-for (const [id, name] of feishu.chatNameCache) if (name === targetName) { chatId = id; break }
-if (!chatId) { console.error('group not found'); process.exit(1) }
+const matches = [...feishu.chatNameCache].filter(([id, name]) => id === targetName || name === targetName)
+if (matches.length !== 1) throw new Error(`expected one chat for ${targetName}, found ${matches.length}; use chat_id`)
+const [chatId] = matches[0]
 
-async function tenantToken(): Promise<string> { return feishu.getTenantToken() }
 async function http(method: string, url: string, body?: object): Promise<any> {
-  const token = await tenantToken()
+  const token = await feishu.getTenantToken()
   const res = await fetch(url, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -56,7 +60,7 @@ if (aCardId) {
   console.log('  PUT element/content:', JSON.stringify(aPut))
 }
 
-console.log('\n=== PATH B: createCardEntity ===')
+console.log('\n=== PATH B: POST /cards ===')
 const bCreate = await http('POST', 'https://open.feishu.cn/open-apis/cardkit/v1/cards', {
   type: 'card_json',
   data: JSON.stringify({ ...minimalCard, body: { elements: [{ tag: 'markdown', element_id: 'probeB_md', content: '[B] initial' }] } }),

@@ -1,14 +1,4 @@
-/**
- * Schema 2.0 Feishu card templates — barrel re-export. Each call site
- * uses `import * as cards from './cards'` and reaches everything through
- * this file. Internal split so each module stays under practical
- * per-read token budget:
- *   - cards/elements.ts — ELEMENTS (shared element-id helpers)
- *   - cards/turn.ts     — main turn card, plan/goal/context/ask panels
- *   - cards/tool.ts     — tool summaries, tool panels, permission panels
- *   - cards/console.ts  — console + menu cards, formatters,
- *                          streamingOffSettings
- */
+/** Feishu Card Kit schema 2.0 模板的统一导出入口。 */
 
 export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
 export {
@@ -21,7 +11,6 @@ export {
   footerContextPercentLabel,
   footerTokenDetailLine,
   mainConversationCard,
-  assistantSegmentElement,
   contextCompactionElement,
   goalDisplaySignature,
   goalElement,
@@ -58,11 +47,9 @@ export {
   modelResultPanelElement,
   modelCancelledCard,
   modelCustomPromptCard,
-  modelCustomResultCard,
   modelCustomResultPanelElement,
   statusCard,
   statusCardContent,
-  menuCard,
   streamingOffSettings,
   fmtResetIn,
 } from './cards/console'

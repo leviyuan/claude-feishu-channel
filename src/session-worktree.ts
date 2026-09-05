@@ -121,12 +121,11 @@ async function buildWorktreeListCard(s: Session, notice?: { type: 'success' | 'e
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
   return await worktree.withProjectWorktreeLock(projectDir, async () => {
-    return await buildWorktreeListCardUnlocked(s, projectName, projectDir, notice)
+    return await buildWorktreeListCardUnlocked(projectName, projectDir, notice)
   })
 }
 
 async function buildWorktreeListCardUnlocked(
-  s: Session,
   projectName: string,
   projectDir: string,
   notice?: { type: 'success' | 'error' | 'info'; content: string },

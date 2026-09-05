@@ -12,6 +12,8 @@
     "noEmit": true,
     "skipLibCheck": true,
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "types": ["bun"]
   },
   "include": ["*.ts", "src/**/*.ts", "scripts/**/*.ts"],

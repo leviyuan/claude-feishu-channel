@@ -50,8 +50,7 @@ import {
 import { config } from './config'
 import { createAgentProcess } from './agent-launch'
 import { agentApiUrl } from './agent-runtime'
-import { getTokenSource, listEnabledTokenSourcesByAgent, type TokenSource } from './token-source'
-import { clearRollbackWatchdog } from './rollback-watchdog'
+import { getTokenSource, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, type TokenSource } from './token-source'
 import {
   claudeTranscriptPath,
   type BgTaskStartedEvent,
@@ -162,23 +161,13 @@ const FOOTER_WORKING = 'Working...'
  * initialize + thread launch + materialization read and any lifecycle defect. */
 const CODEX_INIT_NOTICE_MS = 10_000
 const CODEX_INIT_TIMEOUT_MS = 120_000
-/** Soft cap on element count per Feishu card before we proactively
- * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
- * a 2026-05-23 dogfood turn hit `300305 [element exceeds the limit]` at
- * ~76 elements (tool_60 + assistant_13 + base). The old soft cap of 80
- * sat ABOVE the real ceiling, so `getElementCount() >= 80` never became
- * true before Feishu rejected the add — rotation never fired and the card
- * froze mid-turn. Keep this comfortably under the observed ~75; 50 leaves
- * headroom for in-flight stream handlers that already chose the old cardId
- * before this check fired, and for heavier element mixes that trip the
- * limit earlier. This number is no longer the only line of defense:
- * a confirmed 300305 capacity failure now forces a rotate directly (see
- * Session.onCardWriteFailure), so a wrong guess here still self-heals. */
+/** 提前换卡，为在途写入和复杂嵌套元素留出余量。
+ * Feishu 的容量按卡片结构计数；实际 300305 容量错误另触发换卡。 */
 const CARD_ELEMENT_SOFT_LIMIT = 50
 
 /** Max mid-turn card rotations per turn. Past this we stop opening fresh
  * cards and fall back to log-only for the rest of the turn. Only confirmed
- * component-capacity failures enter this path; schema/content/network errors
+ * card-capacity failures enter this path; schema/content/network errors
  * stay on the current card because replaying the same mutation cannot repair
  * them. The cap remains as a final guard against a malformed single element
  * that itself exceeds the component ceiling. */
@@ -1167,10 +1156,6 @@ export class Session {
     }
   }
 
-  private async waitForLifecycleIdle(): Promise<void> {
-    await this.lifecycleTail
-  }
-
   private beginTurnOpen(
     proc: AgentProcess | null = this.proc,
     procEpoch = this.procEpoch,
@@ -1432,6 +1417,7 @@ export class Session {
     report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
     let proc: AgentProcess
     try {
+      await waitForTokenSourceModelRefresh()
       proc = this.spawnAgent()
     } catch (e) {
       const message = `${this.backendLabel()} 启动失败: ${messageOf(e)}`
@@ -1948,6 +1934,7 @@ export class Session {
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`))
       let proc: AgentProcess
       try {
+        await waitForTokenSourceModelRefresh()
         proc = this.spawnAgent(prevSessionRef ?? undefined)
       } catch (e) {
         const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
@@ -3495,9 +3482,6 @@ export class Session {
       } else {
         this.persistResumableSessionId(true)
       }
-      // Dead-man's switch clears only after the checked resume-state
-      // transaction succeeds; an fsync failure means startup is not complete.
-      clearRollbackWatchdog()
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
@@ -4346,7 +4330,7 @@ export class Session {
     this.startMidTurnRotate(turn)
   }
 
-  /** Reactive rotation is reserved for a confirmed card component ceiling.
+  /** Reactive rotation is reserved for a confirmed card size or component ceiling.
    * `300315` is only a generic add wrapper and also carries duplicate-ID or
    * invalid-schema failures; replaying those (or a timeout/5xx) on a new card
    * deterministically poisons every replacement. The callback is bound to the
@@ -4369,7 +4353,7 @@ export class Session {
     }
     if (turn.rotating) return
     if (turn.rotateGivenUp) return
-    if (!cardkit.isElementLimitFailure(code, failure)) {
+    if (!cardkit.isCardCapacityFailure(code, failure)) {
       const operation = failure?.operation ?? 'unknown operation'
       const element = failure?.elementId ? ` element=${failure.elementId}` : ''
       log(`session "${this.sessionName}": non-capacity card write failure card=${sourceCardId.slice(0, 12)} operation=${operation}${element} code=${code ?? 'n/a'} — not rotating`)
@@ -4377,7 +4361,7 @@ export class Session {
         turn.cardWriteFailureNotified = true
         void feishu.sendTextRaw(
           this.chatId,
-          `⚠️ 对话卡片有一项写入失败(code=${code ?? 'MISS'}, ${operation})。该错误不是卡片元素上限，已停止无效换卡；其余输出继续处理。`,
+          `⚠️ 对话卡片有一项写入失败(code=${code ?? 'MISS'}, ${operation})。未识别为卡片容量超限，未自动换卡；其余输出继续处理。`,
         )
       }
       return
@@ -4390,16 +4374,16 @@ export class Session {
       this.stopFooterStatus(turn)
       cardkit.markCardWriteDead(turn.cardId)
       log(`session "${this.sessionName}": failure-rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only`)
-      void feishu.sendTextRaw(this.chatId, `⚠️ 本轮已因元素容量超限换卡 ${MAX_MIDTURN_ROTATES} 次，现停止继续换卡；本轮后续输出仅日志可见。`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ 本轮已因卡片容量超限换卡 ${MAX_MIDTURN_ROTATES} 次，现停止继续换卡；本轮后续输出仅日志可见。`)
       return
     }
-    log(`session "${this.sessionName}": confirmed element limit (${code}) on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
+    log(`session "${this.sessionName}": confirmed card capacity limit (${code}) on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
     turn.failureRotateCount++
     this.startMidTurnRotate(turn)
   }
 
   /** Open a fresh card under the **same** SDK turn number to dodge
-   * Feishu's per-card element limit. The old card stays in the chat —
+   * Feishu's per-card size or element limit. The old card stays in the chat —
    * we flip its footer to "📨 已续至下一张卡", turn streaming off, and
    * dispose its cardkit state — but it never becomes the writable one
    * again. Turn state is reset so subsequent stream handlers wire up
@@ -4457,7 +4441,7 @@ export class Session {
           }
           await feishu.sendTextRaw(
             this.chatId,
-            '⚠️ 卡片元素超出飞书上限,本轮后续输出仅日志可见(开新卡失败)。',
+            '⚠️ 卡片容量超出飞书上限，本轮后续输出仅日志可见(开新卡失败)。',
           )
           return
         }

@@ -1,10 +1,4 @@
-/**
- * Token source 配置写入 —— 飞书 config 命令的持久化层。
- *
- * daemon 进程直接读写 ~/.config/lodestar/config.toml 的 [token_source.*] 节,
- * 改完 reloadTokenSources() + buildTokenSourcesFromConfig() 热更新 registry
- * (不重启 daemon)。让用户飞书里增删 token source,不依赖 SSH 改 config.toml。
- */
+/** 群内账号启用和模型补录的配置写入；重建账号目录并等待模型刷新。 */
 
 import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
@@ -37,20 +31,10 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   return lines.join('\n')
 }
 
-/** 写后热更新:reload config 单例 + rebuild token source registry + 全量刷新 models。
- *  rebuild(resetTokenSourceRegistry)丢弃旧实例重建空实例,必须重新 refresh,否则非当前
- *  操作的 source models 永远空(setup deepseek 后 glm/codex 变空)。在此统一兜底,
- *  addTokenSource/removeTokenSource 的调用方不必各自记得 refresh。 */
-function reloadAndRebuild(): void {
-  reloadTokenSources()
-  buildTokenSourcesFromConfig()
-  void refreshAllTokenSourceModels()
-}
-
 /** 新增/覆盖一个 token source:追加 [token_source.<id>] 节到 config.toml。
  * 已存在则与新 cfg 字段级合并(新值优先,旧键保留)—— 重跑 <source>-setup
  * 只更新凭据,不洗掉 models/slots/usage 等既有配置。写完热更新 registry。 */
-export function addTokenSource(id: string, cfg: TokenSourceConfig): void {
+export async function addTokenSource(id: string, cfg: TokenSourceConfig): Promise<void> {
   const existing = readFileSync(CONFIG_FILE, 'utf8')
   // 逐行状态机找节:节边界 = 行首 [xxx](值里可含 '[',如 slots = "opus=GLM-5.2[1m]",
   // regex 硬截断会吞值,故不用正则切多行节体)。
@@ -78,33 +62,8 @@ export function addTokenSource(id: string, cfg: TokenSourceConfig): void {
   // 去掉 kept 尾部空行再拼新节,保持节间一个空行的布局。
   while (kept.length && kept[kept.length - 1] === '') kept.pop()
   writeStateFileAtomic(CONFIG_FILE, kept.join('\n') + '\n\n' + cfgToToml(id, merged) + '\n')
-  reloadAndRebuild()
-}
-
-/** 删除一个 token source:从 config.toml 移除 [token_source.<id>] 节。返回是否真删了。 */
-export function removeTokenSource(id: string): boolean {
-  const existing = readFileSync(CONFIG_FILE, 'utf8')
-  const { text: next, removed } = removeTokenSourceSectionText(existing, id)
-  if (!removed) return false
-  writeStateFileAtomic(CONFIG_FILE, next)
-  reloadAndRebuild()
-  return true
-}
-
-export function removeTokenSourceSectionText(existing: string, id: string): { text: string; removed: boolean } {
-  const header = `[token_source.${id}]`
-  const kept: string[] = []
-  let inSection = false
-  let found = false
-  for (const line of existing.split('\n')) {
-    const section = line.match(/^\s*(\[[^\]]+\])\s*(?:#.*)?$/)?.[1]
-    if (section) {
-      inSection = section === header
-      if (inSection) found = true
-    }
-    if (!inSection) kept.push(line)
-  }
-  if (!found) return { text: existing, removed: false }
-  const next = kept.join('\n').replace(/\n{3,}/g, '\n\n')
-  return { text: next, removed: true }
+  reloadTokenSources()
+  buildTokenSourcesFromConfig()
+  // 重建会清空各账号的目录；所有调用方共用这次刷新。
+  await refreshAllTokenSourceModels()
 }

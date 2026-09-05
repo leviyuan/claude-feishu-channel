@@ -3,6 +3,7 @@ import {
   refreshAllTokenSourceModels,
   registerTokenSource,
   resetTokenSourceRegistry,
+  waitForTokenSourceModelRefresh,
   type TokenSource,
 } from './token-source'
 import { tokenSourceSpawnRevision } from './token-source-builtins'
@@ -53,6 +54,38 @@ describe('token source model refresh', () => {
     expect(freshCalls).toBe(1)
     releaseOld()
     await oldRefresh
+  })
+
+  test('a startup waiter follows a registry rebuild without starting another refresh', async () => {
+    resetTokenSourceRegistry()
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+    registerTokenSource(source('old', () => oldGate))
+    const oldRefresh = refreshAllTokenSourceModels()
+    let ready = false
+    const waiting = waitForTokenSourceModelRefresh().then(() => { ready = true })
+
+    resetTokenSourceRegistry()
+    let releaseNew!: () => void
+    const newGate = new Promise<void>(resolve => { releaseNew = resolve })
+    let refreshes = 0
+    registerTokenSource(source('new', async () => { refreshes++; await newGate }))
+    const newRefresh = refreshAllTokenSourceModels()
+    try {
+      releaseOld()
+      await oldRefresh
+      await Promise.resolve()
+      expect(ready).toBe(false)
+      releaseNew()
+      await waiting
+      expect(ready).toBe(true)
+      expect(refreshes).toBe(1)
+    } finally {
+      releaseOld()
+      releaseNew()
+      await Promise.all([oldRefresh, newRefresh, waiting])
+      resetTokenSourceRegistry()
+    }
   })
 })
 

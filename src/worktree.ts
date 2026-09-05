@@ -86,14 +86,6 @@ export function expectedWorktreePath(projectDir: string, projectName: string, sl
   return join(dirname(projectDir), worktreeChatName(projectName, slug))
 }
 
-export function worktreeInstructionsPathForManagedBranch(
-  workDir: string,
-  projectDir: string,
-  projectName: string,
-): string | null {
-  return managedWorktreeInstructionContext(workDir, projectDir, projectName)?.path ?? null
-}
-
 export function readWorktreeInstructionsForManagedBranch(
   workDir: string,
   projectDir: string,
@@ -122,7 +114,6 @@ export function listProjectWorktrees(projectDir: string, projectName: string): W
     const chatName = worktreeChatName(projectName, slug)
     const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
     const mountedPath = mountedByBranch.get(branch) ?? null
-    const worktreePath = mountedPath ?? expectedPath
     const mounted = !!mountedPath && existsSync(mountedPath)
     const state = branchState(projectDir, branch, mounted)
     const entry: WorktreeEntry = {

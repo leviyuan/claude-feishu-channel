@@ -1168,10 +1168,10 @@ async function boot(): Promise<void> {
   // config.toml [token_source.*] 在此落地为可用的 TokenSource。
   const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
   buildTokenSourcesFromConfig()
-  // 各 source 后台拉模型填 models(codex 拉 model/list,几秒;glm 内置同步)。
-  // 不阻塞 boot —— 拉完前面板显 MISS,拉完自动有。失败如实留空,绝不假数据。
+  // 先完成模型目录加载，再接受群消息和恢复会话。空的加载中目录不能用于
+  // 判断已保存的模型是否存在；刷新失败由对应 source 保留明确错误。
   const { refreshAllTokenSourceModels } = await import('./src/token-source')
-  void refreshAllTokenSourceModels()
+  await refreshAllTokenSourceModels()
   feishu.loadTempSessionLeases()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()

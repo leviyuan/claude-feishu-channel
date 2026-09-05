@@ -3,7 +3,6 @@
  *
  * Endpoints used (base = https://open.feishu.cn/open-apis/cardkit/v1):
  *   POST   /cards/id_convert                              message_id → card_id
- *   POST   /cards                                         create a card entity
  *   POST   /cards/:card_id/elements                       add element
  *   PUT    /cards/:card_id/elements/:element_id           replace element
  *   DELETE /cards/:card_id/elements/:element_id           remove element
@@ -37,11 +36,8 @@ interface CardState {
    * addElement won't bump it, so the count tracks "elements Feishu
    * believes exist" not "elements we tried to create"). */
   elementCount: number
-  /** element_ids that must no longer receive writes. Usually this means
-   * `addElement` was rejected by Feishu, so the element does NOT exist on Feishu's
-   * side and every subsequent `replaceElement`/`deleteElement`
-   * would 300313/300121. Per-card and dropped on `dispose`, so a rotated-to
-   * fresh card starts clean. */
+  /** 停止写入并等待迁移的元素。add 失败时远端不存在该元素；容量超限的
+   * replace 失败时远端仍是旧内容，需要在新卡重建最新版本。按卡隔离。 */
   deadElements: Set<string>
   /** Card-level write kill-switch (see markCardWriteDead). Once set, every
    * write op short-circuits to a resolved promise — no HTTP, no onFailure.
@@ -82,19 +78,16 @@ interface CardKitRequestError extends Error {
   logId?: string
 }
 
-/** `300305` is the actual component-count ceiling. `300315` only means
- * "failed to add element" and also wraps deterministic payload failures
- * such as duplicate/invalid element IDs (`300301`). Only classify a
- * `300315` as card-full when its nested diagnostic explicitly names
- * `300305` or an element/component count overflow. */
-export function isElementLimitFailure(
+/** 整卡容量包括组件数量（300305）和体积（200860）。300315 是通用插入
+ * 错误，只在内层明确报告整卡容量超限时换卡；ID、布局等校验错误不换卡。 */
+export function isCardCapacityFailure(
   code?: number,
   failure?: Pick<CardWriteFailure, 'message'>,
 ): boolean {
-  if (code === 300305) return true
+  if (code === 300305 || code === 200860) return true
   if (code !== 300315) return false
   const message = failure?.message ?? ''
-  return /(?:code\s*[:=]\s*300305\b|number of card components[^\n.]{0,60}exceed)/i.test(message)
+  return /(?:code\s*[:=]\s*(?:300305|200860)\b|number of card components[^\n.]{0,60}exceed|\bcard over max size\b)/i.test(message)
 }
 
 export function isDuplicateElementFailure(
@@ -184,10 +177,7 @@ export function getElementCount(cardId: string): number {
   return cards.get(cardId)?.elementCount ?? 0
 }
 
-/** True if `elementId` was recorded dead on this card (its addElement was
- * rejected, so the element doesn't exist on Feishu). Mid-turn rotation reads
- * this for tool panels: dead ⇒ rebuild on the fresh card, alive ⇒ leave it on
- * the old card. */
+/** 元素插入失败或更新因容量超限被拒时，换卡需要重建它的本地最新版本。 */
 export function isDeadElement(cardId: string, elementId: string): boolean {
   return cards.get(cardId)?.deadElements.has(elementId) ?? false
 }
@@ -372,16 +362,6 @@ export async function convertMessageToCard(
   throw lastErr
 }
 
-/** Create a card entity from raw schema-2.0 card JSON. */
-export async function createCardEntity(card: object): Promise<string> {
-  const safeCard = neutralizeMarkdownImagesInCard(card)
-  const data = await call('POST', '/cards', {
-    type: 'card_json',
-    data: JSON.stringify(safeCard),
-  })
-  return data.card_id
-}
-
 /** Wait for all currently queued writes for a card. */
 export async function flush(cardId: string): Promise<void> {
   const s = cards.get(cardId)
@@ -431,7 +411,7 @@ export function addElement(
       // Add rejected ⇒ this element_id does not exist on Feishu's side.
       // Mark it dead so subsequent replace/delete aimed at it
       // short-circuit instead of spraying 300313/300121. Then forward the
-      // structured failure: session rotates only a confirmed 300305 capacity
+      // structured failure: session rotates only a confirmed card-capacity
       // error. Validation/content failures keep the current card and preserve
       // this element as dead.
       if (elementId) markElementDead(s, elementId)
@@ -466,7 +446,12 @@ export function replaceElement(
         sequence: seq,
       })
     },
-    failure => onFailure?.(failure.code, failure),
+    failure => {
+      // 工具已完成不代表结果已写入。标记失败的更新，避免换卡时把最新结果
+      // 留在旧卡。公式增强等局部事务自行处理失败，保留原始元素可写。
+      if (notifyCardFailure && isCardCapacityFailure(failure.code, failure)) markElementDead(s, elementId)
+      onFailure?.(failure.code, failure)
+    },
     !notifyCardFailure,
     { elementId },
   ))

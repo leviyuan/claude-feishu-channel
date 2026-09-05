@@ -359,7 +359,7 @@ function noticeMarkdown(notice: TempListNotice): string {
 }
 
 /** 截断 Write/Edit 工具 input → 卡片用的 body 文本(给 writeLogCard 喂数据)。 */
-export function writeBodyFromToolInput(tool: string, input: any): string {
+export function writeBodyFromToolInput(input: any): string {
   if (!input || typeof input !== 'object') return ''
   if (typeof input.content === 'string') return input.content
   if (typeof input.new_string === 'string') return input.new_string
@@ -402,6 +402,6 @@ export function writeLogEntriesFromToolInput(tool: string, input: any): WriteLog
   return [{
     tool,
     path: typeof path === 'string' && path ? path : '?',
-    body: writeBodyFromToolInput(tool, input),
+    body: writeBodyFromToolInput(input),
   }]
 }

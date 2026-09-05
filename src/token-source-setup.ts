@@ -1,18 +1,7 @@
-/**
- * Token source 启用交互 —— 未配置 source 的「启用」入口(model 面板是唯一配置入口)。
- *
- * - 点 model 面板「启用」按钮 → onTokenSourceEnable → 据 factory 的 setup.hint 弹引导
- *   (codex 走 login,native 无 setup —— 各自特例)。
- * - `<source>-setup <args>` 文本命令 → runTokenSourceSetup → 路由到 factory 的 setup.parseArgs
- *   → 写 config + 热更新 registry + 全量刷新 models。
- *
- * 加新 source:token-source-<name>.ts 声明 setup 字段(hint + parseArgs + commandSuffix),
- * 自动接入「启用」引导 + `<source>-setup` 命令 —— 不改本文件、不改 session-commands。
- * 不再有 config 命令/面板 —— 配置与切换统一在 model 面板。
- */
+/** model 面板的账号启用引导，以及 factory 声明的 <source>-setup 命令。 */
 
 import * as feishu from './feishu'
-import { getTokenSource, tokenSourceFactories, refreshAllTokenSourceModels } from './token-source'
+import { getTokenSource, tokenSourceFactories } from './token-source'
 import { addTokenSource } from './token-source-config'
 import type { Session } from './session'
 
@@ -55,9 +44,7 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
     return
   }
   try {
-    addTokenSource(def.configSectionId, parsed.config)
-    // rebuild registry 后全量刷新 —— 否则 glm/codex 新实例 models 永远空。
-    await refreshAllTokenSourceModels()
+    await addTokenSource(def.configSectionId, parsed.config)
     const ts = getTokenSource(def.configSectionId)
     await feishu.sendText(s.chatId, `✅ ${ts?.display ?? sourceId} 已启用。发 \`model\` 重新选择。`)
   } catch (e: any) {

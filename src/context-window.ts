@@ -35,15 +35,6 @@ export function contextRemainingPercent(
   return Math.round(Math.min(100, Math.max(0, (remaining / effectiveWindow) * 100)))
 }
 
-export function contextUsedPercent(
-  tokens: number,
-  limit: number | null | undefined,
-  baseline?: number,
-): number | null {
-  const remaining = contextRemainingPercent(tokens, limit, baseline ?? DEFAULT_CONTEXT_BASELINE_TOKENS)
-  return remaining == null ? null : Math.min(100, Math.max(0, 100 - remaining))
-}
-
 export function contextPercentSummary(
   tokens: number,
   limit: number | null | undefined,

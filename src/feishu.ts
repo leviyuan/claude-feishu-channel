@@ -9,7 +9,7 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join } from 'node:path'
@@ -23,7 +23,6 @@ import {
 } from './agent-process'
 import {
   ALIVE_MARKER_FILE,
-  DATA_DIR,
   INBOX_DIR,
   SESSION_CHAT_MAP_FILE,
   SESSION_MODEL_MAP_FILE,
@@ -112,17 +111,6 @@ export function hasTempSessionLease(sessionName: string, chatId: string): boolea
   return lease?.sessionName === sessionName && lease.chatId === chatId
 }
 
-export function clearTempSessionLease(sessionName: string, chatId?: string): void {
-  const matches = [...tempSessionLeaseByChat.entries()]
-    .filter(([id, lease]) => lease.sessionName === sessionName && (!chatId || id === chatId))
-  if (!matches.length) return
-  for (const [id] of matches) tempSessionLeaseByChat.delete(id)
-  try { saveTempSessionLeases() } catch (error) {
-    for (const [id, lease] of matches) tempSessionLeaseByChat.set(id, lease)
-    throw error
-  }
-}
-
 /** Per-project launch profile for `sessionName`, or undefined when the
  * project runs with Lodestar defaults. Sourced from `[projects.<name>].*`
  * in config.toml. Lets an external project (e.g. evolving) override cwd,
@@ -131,10 +119,7 @@ export function projectProfile(sessionName: string): ProjectProfile | undefined 
   return config.projects[sessionName]
 }
 
-/** Canonical configured root for a project name. Session, worktree and task
- * automation must share this resolver so a `[projects.<name>].cwd` profile
- * cannot make the interactive agent operate one repository while automation
- * mutates a same-named directory under PROJECTS_ROOT. */
+/** Session 与 worktree 共用项目目录解析，遵循 [projects.<name>].cwd。 */
 export function resolveProjectDir(projectName: string): string {
   const override = projectProfile(projectName)?.cwd?.trim()
   return override || join(PROJECTS_ROOT, projectName)
@@ -309,11 +294,6 @@ export function loadSessionResumeMap(): void {
   }
 }
 
-function saveSessionResumeMap(): void {
-  try { saveSessionResumeMapChecked() }
-  catch (e) { log(`feishu: save session-resume-map failed: ${e}`) }
-}
-
 function saveSessionResumeMapChecked(): void {
   const obj: Record<string, Partial<Record<AgentProvider, ConversationRef>>> = {}
   for (const [sessionName, refs] of lastSessionRefByName) {
@@ -323,26 +303,6 @@ function saveSessionResumeMapChecked(): void {
     obj[sessionName] = persisted
   }
   writeJsonStateAtomic(SESSION_RESUME_MAP_FILE, obj)
-}
-
-export function bindSessionResume(sessionName: string, ref: ConversationRef): void
-export function bindSessionResume(
-  sessionName: string,
-  sessionId: string,
-  provider: AgentProvider,
-  cwd: string,
-): void
-export function bindSessionResume(
-  sessionName: string,
-  sessionIdOrRef: string | ConversationRef,
-  provider?: AgentProvider,
-  cwd?: string,
-): void {
-  const ref = sessionResumeRefFromArgs(sessionIdOrRef, provider, cwd)
-  const prev = lastSessionRefByName.get(sessionName)?.[ref.provider]
-  if (prev?.sessionId === ref.sessionId && prev.cwd === ref.cwd) return
-  setSessionResumeInMemory(sessionName, ref)
-  saveSessionResumeMap()
 }
 
 export function bindSessionResumeChecked(sessionName: string, ref: ConversationRef): void
@@ -371,10 +331,6 @@ export function bindSessionResumeChecked(
   }
 }
 
-export function getSessionResume(sessionName: string, provider: AgentProvider = 'codex'): string | null {
-  return lastSessionRefByName.get(sessionName)?.[provider]?.sessionId ?? null
-}
-
 export function getSessionResumeRef(
   sessionName: string,
   provider: AgentProvider = 'codex',
@@ -384,20 +340,6 @@ export function getSessionResumeRef(
 }
 
 /** Remove one provider's resume id, or every provider id when omitted. */
-export function clearSessionResume(sessionName: string, provider?: AgentProvider): void {
-  const entry = lastSessionRefByName.get(sessionName)
-  if (!entry) return
-  if (!provider) {
-    lastSessionRefByName.delete(sessionName)
-    saveSessionResumeMap()
-    return
-  }
-  if (entry[provider] === undefined) return
-  delete entry[provider]
-  if (!entry.codex && !entry.claude) lastSessionRefByName.delete(sessionName)
-  saveSessionResumeMap()
-}
-
 export function clearSessionResumeChecked(sessionName: string, provider?: AgentProvider): void {
   const previous = lastSessionRefByName.get(sessionName)
   if (!previous || (provider && previous[provider] === undefined)) return
@@ -692,21 +634,10 @@ export function loadSessionTurnsMap(): void {
   }
 }
 
-function saveSessionTurnsMap(): void {
-  try {
-    saveSessionTurnsMapChecked()
-  } catch (e) { log(`feishu: save session-turns-map failed: ${e}`) }
-}
-
 function saveSessionTurnsMapChecked(): void {
   const obj: Record<string, SessionTurnsState> = {}
   for (const [k, v] of turnsBySession) obj[k] = v
   writeJsonStateAtomic(SESSION_TURNS_MAP_FILE, obj)
-}
-
-export function appendTurnAnchor(sessionName: string, anchor: TurnAnchor): void {
-  try { appendTurnAnchorChecked(sessionName, anchor) }
-  catch (error) { log(`feishu: append turn anchor failed: ${error}`) }
 }
 
 export function appendTurnAnchorChecked(sessionName: string, anchor: TurnAnchor): void {
@@ -775,21 +706,6 @@ export function setPendingConversationLaunchChecked(
   }
 }
 
-/** back 回滚后:截断该 session 锚点到 keepCount 条(回滚点之后作废,reset 语义)。 */
-export function truncateTurnAnchors(sessionName: string, keepCount: number): void {
-  const state = turnsBySession.get(sessionName)
-  if (!state || state.anchors.length <= keepCount) return
-  turnsBySession.set(sessionName, { ...state, anchors: state.anchors.slice(0, keepCount) })
-  saveSessionTurnsMap()
-}
-
-/** fork/back 派生新会话时,把分叉点之前的锚点继承给新群(不含分叉点本身)。 */
-export function seedTurnAnchors(sessionName: string, from: TurnAnchor[]): void {
-  if (from.length === 0) return
-  turnsBySession.set(sessionName, { base: null, anchors: from.slice() })
-  saveSessionTurnsMap()
-}
-
 /** Atomically replace a branch's baseline and anchors with one checked state write. */
 export function replaceTurnAnchors(
   sessionName: string,
@@ -815,17 +731,6 @@ export function replaceTurnAnchors(
     else turnsBySession.delete(sessionName)
     throw error
   }
-}
-
-/** Persist an explicit baseline; fresh must be set explicitly rather than inferred from empty anchors. */
-export function setSessionBranchBase(sessionName: string, base: ConversationBranchBase): void {
-  replaceTurnAnchors(sessionName, getTurnAnchors(sessionName), base)
-}
-
-export function clearTurnAnchors(sessionName: string): void {
-  if (!turnsBySession.has(sessionName)) return
-  turnsBySession.delete(sessionName)
-  saveSessionTurnsMap()
 }
 
 // ── 临时群名(*MMDD-HHMM 后缀,同目录多会话) ─────────────────────────
@@ -960,17 +865,6 @@ export function getSessionModelSelection(sessionName: string): SessionModelSelec
   if (direct) return direct
   const parent = tempProjectName(sessionName)
   return parent ? (selectedModelByName.get(parent) ?? null) : null
-}
-
-export function getSessionModel(sessionName: string): string | null {
-  return selectedModelByName.get(sessionName)?.model ?? null
-}
-
-/** Remove the exact session's persisted model selection (no parent forwarding). */
-export function clearSessionModelSelection(sessionName: string): void {
-  if (!selectedModelByName.has(sessionName)) return
-  selectedModelByName.delete(sessionName)
-  saveSessionModelMap()
 }
 
 /**

@@ -1,18 +1,6 @@
 /**
- * Claude 兜底 token source —— 无显式 claude-side source(glm/deepseek/...)启用时的"裸跑"通路。
- *
- * buildTokenSourcesFromConfig 后处理:有任何 claude-side source 显式启用 → 本 source 让位(disabled);
- * 都没启用(本机配的是真 Anthropic / 订阅 login / 未识别中转)→ 本 source enabled,代表
- * 「直接用本机 Claude Code 配置裸跑」。用户在面板看到的是「Claude」(真后端),不是抽象的 native。
- *
- * 设计要点(no_fallbacks):
- *   spawnEnv       零注入、零 scrub —— 透传 base,Claude SDK 自己读 settings.json / 默认。
- *   settingSources 含 'user' —— 透传型需读本机 settings.json(env/API key/中转);
- *                  注入 env 的 source(glm/deepseek)不读 user,spawnEnv 权威。
- *   models         SDK alias 四档(fable/opus/sonnet/haiku),具体解析交给本机 ANTHROPIC_DEFAULT_*_MODEL。
- *   readUsage      无法判定后端 provider → not_applicable(显示 —),绝不假数据。
- *
- * 模块加载时 registerTokenSourceFactory 声明式登记。
+ * 沿用本机 Claude 环境和 user settings 的账号来源。
+ * 有其他已启用的 Claude 侧来源时禁用；模型使用 SDK aliases，额度不适用。
  */
 
 import { type TokenSourceConfig } from './config'
@@ -37,10 +25,8 @@ const NATIVE_MODELS: TokenSourceModel[] = [
 
 registerTokenSourceFactory({
   kind: 'claude-native',
-  // 无独立 config 节 —— 它的 enabled 由 GLM 判定取反决定,与 [token_source.glm] 共用真相源。
+  // enabled 由 buildTokenSourcesFromConfig 根据其他 Claude 侧来源决定。
   build: (_cfg: TokenSourceConfig): TokenSource => {
-    // native 是兜底:无显式 claude-side source 启用时,buildTokenSourcesFromConfig 置 enabled=true。
-    // 代表"裸跑本机 Claude Code 配置"(真 Anthropic / 订阅 login),不注入凭据。
     const ts: TokenSource = {
       id: 'claude-native',
       kind: 'claude-native',
@@ -70,7 +56,7 @@ registerTokenSourceFactory({
         return model
       },
       async readUsage(): Promise<UsageSnapshotUnified> {
-        // 无法判定后端 provider,无额度查询 → 显式 MISS,绝不假数据。
+        // 本机配置不提供可统一查询的额度来源。
         return { state: 'not_applicable', windows: [] }
       },
     }

@@ -1,125 +1,58 @@
-# Claude Agent SDK Backend Memo
+# 后端与模型路由
 
-## Goal
-让 Lodestar 在保留 Codex 支持的同时，可以把非 GPT 模型交给 Claude Agent SDK 执行。外层飞书群、Card Kit、`hi` / `stop` / `restart` / `model` 等会话体验保持不变；差异只落在 session 后端进程。
+Lodestar 通过 `AgentProcess` 接口连接 Codex app-server 和 Claude Agent SDK。`Session` 负责群会话、消息排队和卡片；具体进程类负责协议转换。主会话和委派 Agent 共用 `agent-launch.ts` 的启动入口。
 
-## Confirmed Facts
-- 不能使用 `claude -p` 作为每轮一次的命令。
-- Claude Agent SDK 的推荐长驻模式是 `query({ prompt: AsyncIterable<SDKUserMessage> })`，它会启动一个 Claude Code SDK transport 进程，并通过 `--input-format stream-json` / `--output-format stream-json` 做双向流。
-- 本机 SDK 长驻探针已验证：同一个 `query()` 后端可连续处理多轮 user message，并保持同一个 `session_id`。
-- SDK 在没有第一条用户输入时不会发 `init`；收到第一条 input 后才返回 `system/init`。
-- 本机 Claude Code 已可用，当前上游由用户侧配置路由到 GLM-5.2。SDK 需要 `settingSources: ['user']` 才会读取用户配置。
+## 进程与会话
 
-## Design
-新增一个 Lodestar 内部后端接口，让 `Session` 不直接依赖 `CodexProcess` 的具体类：
+| 行为 | Codex | Claude、GLM、DeepSeek |
+| --- | --- | --- |
+| 进程 | `codex app-server --listen stdio://`，通过 JSON-RPC 通信 | SDK `query()`，通过 `AsyncIterable<SDKUserMessage>` 连续输入 |
+| 初始化 | 等待初始化和 thread 启动事务完成 | 首条输入才触发 `system/init`；启动时只检查早期错误 |
+| 恢复与分叉 | `thread/list`、`thread/fork(lastTurnId)` | 同目录 transcript、`forkSession`、`resumeSessionAt` |
+| 澄清提问 | `item/tool/requestUserInput` | `canUseTool` 中处理 `AskUserQuestion` |
+| 主动压缩 | `thread/compact/start` | 向 streaming input 发送 `/compact`，等待 `compact_boundary` |
+| 后台任务 | app-server collab 子 Agent 事件 | SDK `task_*` 事件 |
 
-- `CodexProcess` 继续负责 GPT / Codex app-server。
-- `ClaudeAgentProcess` 负责 Claude Agent SDK streaming input。
-- `model` 命令仍展示 Codex app-server 返回的 GPT 模型，同时追加 Claude 后端选项：
-  - `claude:default`：不注入模型 profile，使用本机 Claude Code / OMC 当前配置。
-  - `claude:glm`：通过 env 把 opus / sonnet / haiku 映射为 `5.2` / `5.2` / `4.7`。
-  - `claude:deepseek`：通过 env 把 opus / sonnet / haiku 映射为 `DeepSeekv4pro` / `v4pro` / `v4flash`。
-- 持久化模型选择扩展为 provider-aware，旧数据默认视为 Codex。
-- 会话 resume id 也按 provider 分开保存，避免 Claude session id 覆盖 Codex thread id。
-- `[[askusr: ...]]` 是 Codex 专属 host marker；Claude 不消费这个 marker，Claude 需要问用户时走 SDK 自己的 `AskUserQuestion` / `request_user_dialog` 路径。
+会话引用包含 provider、原生 session id 和 cwd。两种后端分别保存恢复记录，切换后端不会共用同一段上下文。Claude fork 在首条输入前持久保存启动意图，获得新 session id 后才清除；历史会话通过原生 fork 接入新群，避免两个群写同一个会话。
 
-## Claude Model Profiles
-内置 profile 位于 `src/claude-models.ts`，也可在 `config.toml` 中覆盖或新增：
+主动压缩没有固定完成时限，以完成事件为准，进程退出或报错时失败。Claude 明确返回 `Not enough messages to compact` 时视为无需压缩，普通 `result` 事件不能代替完成通知。
 
-```toml
-[claude.models.glm]
-display_name = "Claude Code · GLM"
-opus = "5.2"
-sonnet = "5.2"
-haiku = "4.7"
+## 账号和模型
 
-[claude.models.deepseek]
-display_name = "Claude Code · DeepSeek"
-opus = "DeepSeekv4pro"
-sonnet = "v4pro"
-haiku = "v4flash"
-```
+Token Source 管理账号凭据、模型目录、启动环境、默认模型、effort 和额度。内置来源如下：
 
-模型路由的真相源是 `~/.claude/settings.json`(SDK 经 `settingSources:['user']` 读取):`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_OPUS_MODEL` 等都在那里配。Lodestar 不再注入这些 env,`[claude.env]` 仅作可选 escape hatch。
+| 来源 | 配置和模型目录 |
+| --- | --- |
+| Codex subscription | 使用 Codex 登录态，模型来自 app-server `model/list` |
+| GLM Coding Plan | `[token_source.glm]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
+| DeepSeek | `[token_source.deepseek]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
+| Claude native | 沿用本机 Claude 配置，提供 SDK aliases；有其他已启用的 Claude 侧来源时让位 |
 
-可执行文件解析:`resolveClaudeExecutableConfig()` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,用于 reclaude 这类参数透传包装器;路径不存在时 `sendInitialize` 直接抛错,不静默回退。日志 `executable=config:<路径>` 确认生效。
+`model` 面板按账号 → 模型 → effort 展示，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
-主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码,而是传 `opus` 档位 alias,Claude Code 再按 settings.json 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
+`[claude.models.<name>].model` 保留旧 `claude:<name>` 路由的解析。账号、显示名和模型目录由 Token Source 管理；Claude 槽位映射使用账号的 `slots`。
 
-## Claude Event Mapping
-`ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：
+## Claude 启动配置
 
-- `system/init` -> `init`
-- assistant text block -> `assistant_text` + `assistant_block_stop`
-- assistant `tool_use` block -> `tool_use`
-- user `tool_result` message -> `tool_result`
-- `result` -> `token_usage` + `result`
-- `system/compact_boundary` -> `context_compacted`
+GLM、DeepSeek 等来源先清除冲突的 Anthropic 环境变量，再注入各自凭据；默认读取 `project`、`local` settings。Claude native 沿用本机环境并读取 `user`、`project`、`local`。Token Source 指定的 settings 来源优先；未绑定 Token Source 时才使用项目 `setting_sources`。给注入凭据的来源加上 `user` 会重新引入本机 settings 中的路由。
 
-权限：Codex 侧走 SDK `canUseTool` callback，callback 挂起并 emit `can_use_tool` 给 Session，飞书按钮回调再通过 `sendPermissionResponse()` resolve。Claude 侧 `bypassPermissions` 全自动，`canUseTool` 不触发（无审批 UI 死代码）；其 `askUserQuestion` 走 `onUserDialog`，同样 emit `can_use_tool` 给 Session 处理。
+`[projects.<name>]` 的 `cwd` 对两个后端生效；`tools`、`setting_sources`、`strict_mcp`、`load_project_mcp` 用于 Claude。主会话默认发现项目 `.mcp.json`。排除 user settings 的 Claude 会话通过 SDK 本地插件加载 daemon 管理的 Skill，安装内容统一由 `managed-skills.ts` 生成。
 
-Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
+`[claude].bin` 可指定包装器，路径无效时启动失败。未指定时由 `resolveClaudeExecutableConfig()` 查找本机 Claude 或 SDK native binary，Windows `.cmd`/`.bat` 通过 shell shim 启动。
 
-- 声明 `supportedDialogKinds = ask_user_question | askUserQuestion | AskUserQuestion`。
-- 将 dialog payload 规范化成现有 `AskUserQuestion` 卡片的 `questions` 结构。
-- 先登记 pending control，再 emit `tool_use` / `can_use_tool`，避免同步回包 race。
-- 用户点击选项或群里回复后，仍通过 `updatedInput.answers` 回填给 SDK。
+Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行，`AskUserQuestion` 等待用户回答。不能改成 `bypassPermissions`，否则 SDK 会绕开提问回调。
 
-## First Version Scope
-- 支持 Claude backend 普通任务执行、工具展示、工具结果展示、打断、停止、重启、模型切换。
-- 支持 Claude usage / cost / context window 在 footer 展示。
-- 跨 Codex / Claude provider 切换只在空闲或下次启动边界生效；当前 turn 或排队消息存在时直接拒绝。
-- `compact` 只对 Codex app-server 生效；Claude backend 明确返回不支持，不做静默替代。
-- host-side `[[askusr: ...]]` 只对 Codex 生效；Claude 使用 SDK ask，不混用 Codex marker。
-- 不重启 live daemon；代码变更后只报告需要重启。
+## 事件和委派
 
-## Codex Parity Audit
-以改动前 Codex 行为为基线逐项对照：
+`claude-agent-process.ts` 将 SDK 文本、工具、结果、用量、压缩和后台任务转换成 `AgentProcess` 事件。共享事件由 Session 和卡片消费，保留两种后端在初始化、上下文和后台任务上的差异。
 
-- 启动与恢复：Codex 仍走 `codex app-server --listen stdio://`，仍检查 `codex login`，仍等待 app-server `init` 后把 session 置为 ready；`restart` 仍用 Codex thread id 恢复。
-- turn 调度：Codex 的 eager-open、cold-start、mid-turn buffer、OneSecond reaction、stop interrupt、result 后 drain 逻辑保持同一条 Session 路径；不会在当前 turn 中途迁移到 Claude。
-- 模型选择：Codex 模型列表仍来自 app-server `model/list`，Codex effort 仍只接受 app-server/Codex 定义的 `none|minimal|low|medium|high|xhigh`。
-- 卡片与控制台：Codex action value 保持旧形状，不额外带 `provider`；Codex 控制台标题保持原来的 `当前模型`，不显示 `(Codex)`。
-- 使用量与上下文：Codex token usage、context window、manual compact、thread goal、plan delta 事件仍按原 app-server 事件处理。
-- 持久化兼容：旧版 `session-resume-map.json` 的 string 值按 Codex thread id 读取；旧版 `session-model-map.json` 的 string/object 若无 provider，按模型名前缀推断，普通 GPT 模型仍按 Codex 读取。
+委派 Agent 使用完整工具集和项目 MCP，并拥有独立、可撤销的调用凭据。`AgentService` 负责并发、父子运行关系、输入回填、原生会话续跑和递归取消。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
 
-## Claude Differences From Codex
-这些差异来自 Claude Agent SDK 能力边界或本机模型路由，不能伪装成 Codex 完全同构：
+## 源码与验证
 
-- 启动时机：Claude SDK 在没有第一条 user input 前不会发 `system/init`，所以 `hi` 启动 Claude 后不会强等 init；首条消息触发 init 和真实 session id。
-- 模型项：Claude 暴露 `claude:default`、`claude:glm`、`claude:deepseek`。GLM/DeepSeek profile 通过 env 做档位映射，SDK 主模型默认请求 `opus` alias。
-- resume id：Claude `session_id` 与 Codex thread id 分开保存；切换 provider 不共享上下文。
-- compact：Claude SDK 没有 Lodestar 所用的 Codex `thread/compact/start` 等价接口，`compact` 会明确失败并说明不支持。
-- ask：Codex 的 `[[askusr: ...]]` host marker 不给 Claude 使用；Claude 的 ask 来自 SDK `AskUserQuestion` / user-dialog，仍渲染成同一套飞书问答卡。
+- 启动与协议：`src/agent-launch.ts`、`src/agent-process.ts`、`src/codex-process.ts`、`src/claude-agent-process.ts`。
+- 路由与配置：`src/token-source*.ts`、`src/session-model.ts`、`src/config.ts`、`src/claude-models.ts`。
+- 会话分支：`src/conversation.ts`、`src/session-temp.ts`、`src/temp-session-runtime.ts`、`src/feishu.ts`。
+- 委派：`src/agent-service.ts`、`src/agent-runner.ts`、`src/agent-session-registry.ts`。
 
-## Audit Fixes
-本轮对照后补掉的遗漏：
-
-- 跨 provider 切换只允许在空闲/启动边界执行；当前 turn 或排队消息存在时直接拒绝，避免中途切换改变原 turn 调度。
-- 旧后端的迟到 `session_id` / exit 事件不会覆盖当前已选择后端的 `lastSessionId` 或新进程状态。
-- Claude 启动前会显式检查 `claude` 可执行文件；找不到时直接启动失败并提示，不让 session 先进入 ready 再异步报错。
-- Claude streaming-input 后端在首条用户输入前不会发 `init`；Lodestar 启动 Claude 时只等待短暂同步/早期错误，不再把“无输入所以没 init”当启动失败。
-- Claude 使用 `bypassPermissions` 全自动;`canUseTool` 在该模式下被 SDK override(旧飞书审批 UI 已清),不再走权限卡。
-- Codex 控制台和启动消息恢复原显示，不新增 `Codex ·` / `(Codex)` 这类额外标记。
-- `claude:default` 运行中重新选择时只更新 effort，不再尝试给 SDK 设置空模型名。
-- Claude profile 变化需要 env 生效；空闲切换时停止当前 Claude 子进程，下轮按新 env 启动；忙碌时拒绝，避免声称当前进程已切换。
-- `claude:glm` 的主线程 SDK model 为 `opus` alias;具体 GLM 代码通过 settings.json 的 env 路由(`claude:deepseek` 已随二元化下线)。
-- `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
-- Claude `onUserDialog` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
-- spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。
-- 跨模型调用已收敛为 daemon-owned `AgentService` + `lodestar-agent` Skill：child 是完整 delegated Agent，使用独立 run-scoped capability，可递归委派、桥接输入工具，并通过 provider 原生 session 做 follow-up；它不接收群消息，也不占用主 `Session.proc`。
-- 对话卡续卡 banner 在 Codex 下保持 `Codex turn` 原文，在 Claude 下显示 `Claude turn`。
-
-## Verification Plan
-- SDK 长驻探针：同一 `ClaudeAgentProcess` 处理两轮输入，返回同一 `session_id`。
-- Claude ask smoke：独立临时目录启动 `ClaudeAgentProcess(model=claude:glm)`，要求模型调用 `AskUserQuestion`，自动回填答案后期待 `DONE`。
-- 单元测试：`bun test`。
-- 构建验证：`bun run build`。
-
-## Verification Result
-- `bun test`: 112 pass。
-- `bun run build`: daemon / setup / stop / update / version 全部 bundle 成功。
-- Claude init probe: `sendInitialize()` 后无首条输入时 8 秒内没有 stream `init`；`start()` 已改为短暂等待早期错误后 ready，冷启动首条用户消息会先发 input 再由 SDK 触发 init。
-- Claude SDK smoke: 临时目录中连续发送“只回复数字 1”和“只回复数字 2”，中途执行 `setModelSettings("claude:default", "low")` 成功；收到两次 `result subtype=success`，且两次 `session_id` 均为 `1e18c8b5-90f8-452f-a39a-e485e3ec4734`。
-- Claude ask smoke: `claude:glm` 启动时 SDK 日志显示 `model=opus`；实际触发 `AskUserQuestion`，自动回答后 assistant 输出 `DONE`，`result subtype=success` 且 `is_error=false`。
-- smoke 结束时本机 Claude 插件的 `SessionEnd` hook 在 stderr 报 `/bin/sh` ENOENT；`/bin/sh` 本机存在，turn 已成功完成。该警告来自外部 Claude 插件 hook，不属于 Lodestar ask/model 路径失败。
+本地检查使用 `bun run typecheck`、`bun test` 和 `bun run build`。真实后端与飞书交互需要单独指定账号、目标群和允许的副作用；历史探针结果不代表当前版本已完成线上验证。

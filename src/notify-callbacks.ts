@@ -133,7 +133,7 @@ export function loadCallbacks(): void {
     const obj = JSON.parse(raw) as Record<string, any>
     const cutoff = Date.now() - MAX_AGE_MS
     let dropped = 0
-    for (const [id, rec] of Object.entries(obj)) {
+    for (const rec of Object.values(obj)) {
       if (!rec || typeof rec !== 'object') continue
       if (typeof rec.notifyId !== 'string' || typeof rec.callbackUrl !== 'string') continue
       if (typeof rec.createdAt !== 'number' || rec.createdAt < cutoff) { dropped++; continue }

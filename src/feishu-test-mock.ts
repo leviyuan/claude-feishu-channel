@@ -67,7 +67,6 @@ export function resetFeishuMock(): void {
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
   resolveProjectDir: (name: string) => projectProfiles.get(name)?.cwd?.trim() || `/tmp/lodestar-projects/${name}`,
-  getSessionResume: (sessionName: string, provider = 'codex') => resumeRefs.get(`${sessionName}:${provider}`)?.sessionId ?? null,
   getSessionResumeRef: (sessionName: string, provider = 'codex') => {
     const ref = resumeRefs.get(`${sessionName}:${provider}`)
     return ref ? { ...ref } : null
@@ -97,13 +96,6 @@ mock.module('./feishu', () => ({
   urgentApp: async (messageId: string, openIds: string[]) => {
     urgentPushes.push([messageId, openIds])
   },
-  bindSessionResume: (sessionName: string, sessionIdOrRef: string | { sessionId: string; provider: string }, provider?: string) => {
-    const normalized = typeof sessionIdOrRef === 'string'
-      ? { sessionId: sessionIdOrRef, provider: provider ?? 'codex', cwd: null }
-      : sessionIdOrRef
-    boundResumes.push([sessionName, normalized.sessionId, normalized.provider])
-    resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized as any)
-  },
   bindSessionResumeChecked: (sessionName: string, sessionIdOrRef: string | { sessionId: string; provider: string }, provider?: string) => {
     if (resumeWriteError) throw resumeWriteError
     const normalized = typeof sessionIdOrRef === 'string'
@@ -132,10 +124,6 @@ mock.module('./feishu', () => ({
     for (let seq = 2; used.has(name); seq++) name = `${project}*0000-0000-${seq}`
     return name
   },
-  appendTurnAnchor: (sessionName: string, anchor: TurnAnchor) => {
-    const current = turnAnchorsBySession.get(sessionName) ?? []
-    turnAnchorsBySession.set(sessionName, [...current, anchor])
-  },
   appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError
     const current = turnAnchorsBySession.get(sessionName) ?? []
@@ -148,23 +136,6 @@ mock.module('./feishu', () => ({
     if (turnAnchorWriteError) throw turnAnchorWriteError
     if (pending) pendingConversationLaunchBySession.set(sessionName, pending)
     else pendingConversationLaunchBySession.delete(sessionName)
-  },
-  truncateTurnAnchors: (sessionName: string, keepCount: number) => {
-    const current = turnAnchorsBySession.get(sessionName)
-    if (current && current.length > keepCount) {
-      turnAnchorsBySession.set(sessionName, current.slice(0, keepCount))
-    }
-  },
-  seedTurnAnchors: (sessionName: string, anchors: TurnAnchor[]) => {
-    const copied = anchors.slice()
-    seededTurnAnchors.push([sessionName, copied])
-    if (copied.length > 0) turnAnchorsBySession.set(sessionName, copied)
-  },
-  clearTurnAnchors: (sessionName: string) => {
-    clearedTurnAnchorSessions.push(sessionName)
-    turnAnchorsBySession.delete(sessionName)
-    branchBaseBySession.delete(sessionName)
-    pendingConversationLaunchBySession.delete(sessionName)
   },
   replaceTurnAnchors: (
     sessionName: string,

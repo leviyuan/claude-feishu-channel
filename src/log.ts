@@ -69,7 +69,7 @@ export function pruneOldLogs(
 /** 一次性迁移:老的 append-only daemon.log(无日期后缀)rename 成按其
  * mtime 日期命名的按日文件,纳入 7 天保留管辖。同分区 rename 原子且 O(1)。
  * 若当天按日文件已存在(迁移中途崩溃重启的罕见情况),内容追加合并后删源。 */
-function migrateLegacyLogFile(now: Date = new Date()): void {
+function migrateLegacyLogFile(): void {
   try {
     if (!existsSync(LOG_FILE)) return
     const st = statSync(LOG_FILE)
@@ -105,6 +105,6 @@ export function log(msg: string): void {
 
 // 启动:先把老 daemon.log 迁移成按日文件,再清理过期日志。
 if (fileLoggingEnabled()) {
-  try { migrateLegacyLogFile() } catch {}
+  migrateLegacyLogFile()
   try { pruneOldLogs(DATA_DIR) } catch {}
 }

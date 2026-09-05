@@ -40,14 +40,20 @@ auth_token = "test-token"
   process.env.LODESTAR_DATA_DIR = join(dir, 'data')
   mkdirSync(join(dir, 'data'))
 
+  let modelFetches = 0
+  let rejectCatalog = false
   // 这些 module mock 只存在于上面的独立子进程，不会污染主测试进程。
   mock.module('./model-existence', () => ({
     verifyModelExists: async (_b: string, _h: Record<string, string>, model: string) =>
-      model.toLowerCase() === 'glm-5.3' ? 'exists' : 'not_found',
+      ['glm-5.3', 'glm-5.4'].includes(model.toLowerCase()) ? 'exists' : 'not_found',
   }))
   mock.module('./token-source-models', () => ({
     CLAUDE_EFFORTS: ['max', 'xhigh', 'high', 'medium', 'low'],
-    fetchGlmModels: async () => [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }],
+    fetchGlmModels: async () => {
+      modelFetches++
+      if (rejectCatalog) throw new Error('catalog unavailable')
+      return [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    },
     fetchCodexModels: async () => [],
   }))
 
@@ -144,7 +150,9 @@ auth_token = "test-token"
     await onModelCustomPrompt(fake, 'glm', 'p1', 'om_card_1')
     expect(fake.modelCustomPrompt?.cardMessageId).toBe('om_card_1')
 
+    const fetchesBeforeUpdate = modelFetches
     await consumeModelCustomMessage(fake, 'GLM-5.3', 'u')
+    expect(modelFetches - fetchesBeforeUpdate).toBe(1)
     const el = elementPatches.at(-1)
     expect(el).toBeTruthy()
     expect(el.header?.title?.content).toBe('选择 effort')
@@ -189,5 +197,14 @@ auth_token = "test-token"
     rejectIdConvert = false
     expect(rawFallbacks.at(-1)).toContain('模型 GLM-5.2 已在列表中')
     expect(rawFallbacks.at(-1)).toContain('重新发送 model')
+
+    rejectCatalog = true
+    convertedCardId = 'card_model_catalog_miss'
+    fake.modelCustomPrompt = { sourceId: 'glm', panelId: 'p6', cardMessageId: 'om_card_6' }
+    await consumeModelCustomMessage(fake, 'GLM-5.4', 'u')
+    expect(JSON.stringify(elementPatches.at(-1))).toContain('catalog unavailable')
+    expect(fake.modelPanels.has('p6')).toBe(false)
+    expect(getTokenSource('glm')?.models).toEqual([])
+    expect(getTokenSource('glm')?.modelCatalogState?.status).toBe('failed')
   })
 }

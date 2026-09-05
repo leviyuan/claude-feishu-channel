@@ -8,7 +8,6 @@ import {
   afterCardActionAck,
   cardActionDedupeKey,
   cardActionDedupeKeys,
-  completeAfterPresentation,
   validateCardActionAdmission,
   type ActionCompletion,
 } from './card-action-runtime'
@@ -80,22 +79,6 @@ describe('ActionDeduper', () => {
     expect(deduper.claimAll(['event:e3', 'semantic:x'])).toBe('completed')
   })
 
-  test('presentation rejection keeps completed keys so duplicate callbacks do not rerun business', async () => {
-    const deduper = new ActionDeduper()
-    const keys = ['event:e1', 'semantic:x']
-    let handlerCalls = 0
-    expect(deduper.claimAll(keys)).toBe('started')
-    handlerCalls++
-    await completeAfterPresentation(
-      deduper,
-      keys,
-      async () => { throw new Error('message.patch failed') },
-    )
-
-    if (deduper.claimAll(['event:e2', 'semantic:x']) === 'started') handlerCalls++
-    expect(handlerCalls).toBe(1)
-    expect(deduper.claimAll(['event:e3', 'semantic:x'])).toBe('completed')
-  })
 })
 
 describe('card action identity', () => {

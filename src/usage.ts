@@ -44,8 +44,6 @@ export type UsageSnapshot =
       fetchedAt: number
     }
 
-type UsageSnapshotOk = Extract<UsageSnapshot, { state: 'ok' }>
-
 let cache: UsageSnapshot | null = null
 let inFlight: Promise<UsageSnapshot> | null = null
 

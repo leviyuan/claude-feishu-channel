@@ -10,163 +10,139 @@ AI 不是帮手,是倍率。它放大的不是体力,是你 —— 你的直觉�
 
 ---
 
-## 🚀 用起来
+在飞书群里使用 Codex 和 Claude Code。每个群对应一个项目目录和会话，回复、工具调用、提问和后台任务通过飞书卡片展示。
 
-跨平台 (Windows / macOS / Linux),npm 全局安装后由 Node.js 运行,需要 Node.js ≥ 18；Bun 只用于源码开发和发布构建。
+支持 Codex、GLM Coding Plan、DeepSeek 和 Claude native。账号、模型与 effort 可在群里切换，选择按群保存。
 
-### 🧠 双后端:Claude Code + Codex
+## 安装
 
-夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 会按“账号 → 动态模型 → effort”选择,结果按群持久化；可用项以当前账号和上游实时返回为准。
-
-使用 GLM Coding Plan 时,夜航星会从端点动态获取模型，并根据真实 turn 观测上下文窗口。`hi` 控制台会展示套餐档位、滚动窗口与月度用量；每条回复的 footer 也会带上当前窗口用量。
-
-**1. 装包**
+支持 Windows、macOS 和 Linux，需要 Node.js ≥ 18.15。Bun 用于源码开发和构建。
 
 ```bash
 npm i -g @leviyuan/lodestar
-```
-
-装完得到 6 个命令:
-
-| 命令 | 作用 |
-| --- | --- |
-| `lodestar-setup` | 首次配置向导 |
-| `lodestar-daemon` | 启动 daemon |
-| `lodestar-stop` | 停止 daemon |
-| `lodestar-update` | 升级到最新版(含 Codex CLI、Claude Code 和 Claude SDK)|
-| `lodestar-version` | 查看 Lodestar 和 Codex CLI 版本 |
-| `lodestar-agent` | 供主 Agent 把完整任务委派给其他模型并续跑原生会话 |
-
-**2. 跑向导**
-
-```bash
 lodestar-setup
 ```
 
-手把手带你装 Claude Code、可选配 GLM Coding Plan(1M 上下文)、建飞书应用、启动 lodestar。Codex 是可选第二后端。
+向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。Claude 按 API key 方式配置。
 
-> Claude 订阅(Pro/Max OAuth 登录)不支持本项目,需走 API 方式(GLM Coding Plan 或自备 Anthropic API key)。
+把机器人拉进群，群名设为 `projects_root` 下的目录名。目录不存在时会自动创建。首次消息默认使用 Claude 侧已配置的账号；发 `model` 可切换到其他账号。
 
-**3. 拉机器人进群**
+安装后提供以下命令：
 
-群名 = `projects_root` 下的目录名(没建会自动建)。发条消息后由当前默认 Claude source 接管；群里发 `model` 可选择其他已配置账号、模型与 effort。
+| 命令 | 作用 |
+| --- | --- |
+| `lodestar-setup` | 配置向导 |
+| `lodestar-daemon` | 启动 daemon |
+| `lodestar-stop` | 停止 daemon |
+| `lodestar-update` | 升级 Lodestar、Codex CLI、Claude Code 和相关 SDK |
+| `lodestar-version` | 查看 Lodestar、Claude Code、Codex CLI 和运行时版本 |
+| `lodestar-agent` | 由会话中的 Agent 调用其他模型执行任务 |
 
-群里发这些**裸词**(不要斜杠,大小写不敏感)可以控 daemon:
+长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
+
+## 群内命令
+
+直接发送下列词语，不加斜杠，大小写不敏感。这些命令控制当前群的 Agent 会话。
 
 | 指令 | 行为 |
 | --- | --- |
-| `hi` | 未运行时同一张卡动态启动并收束为控制台;运行中弹控制台 |
-| `stop` / `st` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
-| `kill` / `kl` | 用状态卡展示关闭当前 agent 进程,resume id 落盘 |
-| `restart` / `rs` | 进程存活:打断 + 放弃后台任务 + 恢复当前会话;进程已停:列出同一 cwd 的历史会话，选一个在本群创建独立分支 |
-| `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
-| `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
-| `model` / `md` | 展示账号→动态模型→effort 面板,按群持久化 |
-| `agents` | 查看当前所有可调用的完整 Agent 身份 |
-| `task` | 打开基础飞书任务清单绑定/删除面板 |
+| `hi` | 打开控制台；会话未运行时先启动 |
+| `stop` / `st` | 打断当前回复并取消排队消息，保留进程 |
+| `kill` / `kl` | 关闭当前 Agent 进程，保存可恢复的会话记录 |
+| `restart` / `rs` | 进程存活时打断并恢复当前会话；已停止时列出同目录的历史会话，选择后创建独立分支 |
+| `clear` / `cl` | 关闭当前进程并开始新会话；已停止时提示先启动 |
+| `compact` / `cm` | 压缩当前会话的上下文 |
+| `model` / `md` | 按账号 → 模型 → effort 选择并保存 |
+| `agents` | 查看可调用的 Agent 身份及可用状态 |
+| `task` | 创建、查看或删除绑定的飞书任务清单 |
 
-**并发 worktree 群**
+模型列表来自各账号的模型目录，获取失败显示 `MISS`。同账号切换 Claude 模型从后续回复生效，Codex 的持久模型设置需重启会话生效；跨账号或后端切换只允许在空闲时进行。
 
-在项目主群发:
+GLM 的套餐与用量显示在 `hi` 控制台，回复底部也会显示当前窗口用量。
 
-| 指令 | 行为 |
-| --- | --- |
-| `wt` / `worktree` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),已合并且未挂载的归档分支会折叠隐藏,卡片上可点 `删`。 |
-| `wt feature-x` / `worktree feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`;重新激活已合并归档分支时会先更新到主线。 |
+## Worktree 与临时会话
 
-`删` 会先确认对应 worktree 群没有正在运行的 Codex session,再检查 worktree 没有未提交变更,然后解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
-
-**临时会话 / 分叉 / 回退**(Codex 与 Claude)
-
-在同一个工作目录里多开会话，并基于后端原生 fork 做语义化分叉/回退。Claude 使用 `forkSession + resumeSessionAt`，Codex 使用 app-server `thread/fork + lastTurnId`；两者都会派生新会话 id，源对话不动：
+需要独立修改文件时，在项目主群使用 worktree：
 
 | 指令 | 行为 |
 | --- | --- |
-| `btw` | 开一个临时群 `<session>*MMDD-HHMM`，继承当前账号/模型/cwd 并启动干净会话 |
-| `bye` | 停止并解散当前临时群(只能在带 `*MMDD-HHMM` 后缀的临时群里用) |
-| `fk` / `fork` | 列出当前会话的每条用户输入(倒序)，选一条 → 从这条**之前**开临时群分叉，原会话不动 |
-| `bk` / `back` | 列用户输入，选一条后才停止当前进程 → 本群改接到这条**之前**的新分支，并附观察到的文件变更记录 |
+| `wt` / `worktree` | 列出项目的 `work/*` 分支和工作区状态 |
+| `wt feature-x` | 创建或加入 `<project>[feature-x]` 群和同级 worktree 目录，使用 `work/feature-x` 分支 |
 
-分叉/回退点以「用户输入」为分界：选第 N 条 = 回到这条发出之前的对话状态，选中的输入本身不包含。临时群和源群共享同一个 cwd；`fk`/`bk` **只改变对话历史，不复制或回滚磁盘文件**，Shell/MCP 等外部副作用也不会被撤销。需要文件隔离时使用 `wt`。
+已合并且未挂载的分支会折叠隐藏，再次启用时更新到主线。卡片上的“删”会检查对应群没有运行中的会话、工作区没有未提交变更，再解散群并删除 worktree；Git 分支保留。
 
-`rs` 的历史发现由后端自己负责：Claude 读取同 cwd 的 transcript，Codex 调用 app-server `thread/list(cwd=...)`；不会扫描/复制 Codex rollout，也不会维护第二套会话索引。选择历史会话时创建独立 fork，避免两个群共同写同一个 thread。
+临时会话共享当前工作目录，适合在同一项目里另开一段对话：
 
-选择后原 `rs` 卡会原位更新，保留所选历史的后端、时间、摘要和源会话，并显示当前群的新分支状态。Codex 会直接显示新 thread；Claude 在首条输入前显示“已准备”，该 fork intent 会持久化，daemon 重启或进程退出后仍会继续同一分支。
+| 指令 | 行为 |
+| --- | --- |
+| `btw` | 创建 `<session>*MMDD-HHMM` 临时群，继承账号、模型和工作目录，启动新会话 |
+| `bye` | 停止并解散当前临时群，仅适用于 Lodestar 创建的临时群 |
+| `fk` / `fork` | 选择一条用户输入，在临时群里从这条输入之前分叉 |
+| `bk` / `back` | 选择一条用户输入，让本群接到这条输入之前的新分支 |
 
----
+`fk`、`bk` 和从历史记录恢复的 `rs` 都使用后端原生 fork，保留源对话。选第 N 条输入表示回到它发出之前，选中的输入不包含在新分支内。Claude 的新分支在首条输入时获得会话 id，准备状态会持久保存。
 
-## 🎁 附加能力
+**分叉和回退只改变对话历史，不回滚文件或撤销 Shell、MCP 等外部操作。** `bk` 会附上已观察到的文件变更记录；需要目录隔离时使用 `wt`。
 
-### 🧠 完整多模型 Agent 委派
+## 多模型任务
 
-daemon 会为每个 Token Source 目录中的每个模型生成一个实时 Agent 身份，并采用模型目录声明的真实默认 effort。项目群发 `agents` 可查看身份、模型、默认 effort 与当前 MISS；身份只负责模型路由，不再自动注入任何评审角色或提示词。
+主 Agent 可以通过 `lodestar-agent` 查询实时身份，再把任务交给一个或多个模型。同一个任务选择多个身份时并发执行；后续追问可继续使用各模型的原生会话。
 
-主 Agent 每次委派前通过 `lodestar-agent identities --json` 获取实时身份，再把完整原始 prompt 交给 `lodestar-agent run`。同一 prompt 选择多个身份时用重复 `--identity` 合并为一个 run，由 daemon 并发 fan-out；不同任务可以建立多个并行 run。daemon 不理解“评审/实现/研究”等任务语义，也不改写输出格式，全部行为约束都来自主 Agent prompt。
+被调用的 Agent 可以编辑文件、执行命令、使用 MCP 和 Skill，也可以继续委派。它们与主 Agent 共享工作区，修改会立即可见。运行状态和结果通过卡片展示；需要用户输入时暂停，由主 Agent 回填答案后继续。委派产生的会话不会混入主群的 `rs` 历史列表。
 
-Delegated Agent 使用完整能力：Codex 固定 `danger-full-access`，保留 apps、plugins、multi-agent、MCP 与 hooks；Claude/GLM/DeepSeek 使用标准 `claude_code` preset、完整工具、项目 MCP 与 daemon-managed Skills。它们可以真实修改文件、运行命令、联网、调用外部系统并再次委派；这些副作用与主 Agent 在同一工作区立即可见。
+`lodestar-agent` 只能在 Lodestar 管理的 Agent 进程里调用。命令用法见 [Agent Skill](src/agent-skill.ts)。
 
-`lodestar-agent` 只能在 Lodestar 管理的 Agent 进程内使用。主 Session 和每个 child 都得到独立随机 capability；child capability 只允许访问自己的 run 子树，父 run 取消时递归吊销。进程治理上限为同时运行 8 个 turn、全局 128 个在途 worker、每 Session 64 个 active run、每子树 32 个 active run、递归深度 8；排队原因会在 run 状态中透明显示，这些上限不改变 Agent 权限。daemon 启动时会安装/更新裸命令和 canonical Skill，并安全清理旧 daemon-owned `lodestar-consult` 命令/Skill。
+## 飞书任务清单
 
-本机 API 为 `GET /agents/identities`、`POST /agents/runs`、`GET|DELETE /agents/runs/<id>`、`POST /agents/runs/<id>/answer` 与 `POST /agents/runs/<id>/follow-up`。模型调用 `AskUserQuestion`/`request_user_input` 时 run 进入 `needs_input`，主 Agent 精确回答后继续；follow-up 新建可追踪 run，但复用同一 provider 原生 session。run 生命周期元数据原子落盘，大 prompt/输出各自存入私有正文文件，避免状态转换反复同步重写巨型 JSON；委派 session 不会混入主会话 `rs`/`fk` 列表。
+发 `task`，点“启用”可创建并绑定 `<project>[lodestar]` 任务清单。删除需要在卡片上再次确认，会删除整个清单及其中任务。该面板管理清单绑定，任务执行由用户和 Agent 安排。
 
-### 📋 基础飞书任务清单
+## 本机通知
 
-在项目群发 `task`,卡片点 `启用`,夜航星会创建并绑定一个 `<project>[lodestar]` 飞书任务清单。`task` 面板里的 `删` 会二次确认,确认后删除整个清单和清单内任务。该能力不运行自动规划、执行、审核或合并 worker。
-
-### 🔔 HTTP 通知端点
-
-本机任意脚本一行 curl 就能往群里推一张 markdown 卡片:`info` / `warn` / `error` 三档染色,正文支持飞书 markdown,还能附本地图片、加交互按钮、把点击结果 POST 回你自己的回调。这条能力对应的 skill,daemon 每次启动会自动装进 `~/.claude/skills/` 和 `~/.codex/skills/`(不用自己放文件),完整字段、按钮和回调协议看 [`feishu-notify` skill](src/notify-skill.ts)。
-
-推一条带图的告警:
+脚本可通过 HTTP 向项目群发送通知，支持 `info`、`warn`、`error`，以及本地图片、按钮和点击回调：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9876/notify \
   -H 'Content-Type: application/json' \
-  -d '{"project":"ops","level":"error","text":"卡点了,截图如下","images":["/abs/shot.png"]}'
+  -d '{"project":"ops","level":"error","text":"构建失败，截图如下","images":["/abs/shot.png"]}'
 ```
 
-发一张带按钮的审批卡,点了按钮 daemon 把选择 POST 回你本机的 callback:
+按钮点击结果可以 POST 到指定的本机 `callback`，或通过 `GET /notify/result/<notify_id>` 查询。字段和协议见 [feishu-notify Skill](src/notify-skill.ts)。daemon 启动时会将该 Skill 同步到 Codex 和 Claude 的 Skill 目录。
 
-```bash
-curl -sS -X POST http://127.0.0.1:9876/notify \
-  -H 'Content-Type: application/json' \
-  -d '{"project":"ops","text":"deploy ready — 审批?",
-       "buttons":[
-         {"id":"approve","text":"✅ 通过","type":"primary"},
-         {"id":"reject","text":"❌ 拒绝","type":"danger"}
-       ],
-       "callback":"http://127.0.0.1:9999/hook"}'
-```
+## 配置
 
----
-
-## ⚙️ 配置参考
-
-配置文件 `~/.config/lodestar/config.toml`,改完重启 daemon 生效。
+默认配置文件是 `~/.config/lodestar/config.toml`，可通过 `LODESTAR_CONFIG` 指定文件。日志和会话状态位于 `~/.local/share/lodestar/`；Windows 使用相应的应用数据目录。完整路径定义见 [src/paths.ts](src/paths.ts)。
 
 ```toml
 [runtime]
-live_elapsed = "second"   # footer/后台卡刷新粒度:bucket(默认,按档位省配额) | second(整秒)
+projects_root = "/abs/projects"
+live_elapsed = "bucket"      # bucket 按档位刷新耗时；second 按秒刷新
 
-[projects.calculator2]            # section 名 = 飞书群名(= projects_root 下目录名);整节仅 Claude 后端生效
-cwd             = "/abs/path/to/calculator2"   # 不填则用 projects_root/<群名>
-setting_sources = "project"   # 只读项目级配置,丢全局 GLM 路由
-strict_mcp      = "true"      # 只挂项目 .mcp.json
-tools           = "Read,Write,Edit,Bash,Glob,Grep"
+[projects.calculator]
+cwd = "/abs/projects/calculator"  # 对两个后端均生效
+setting_sources = "project"       # Claude 后端；仅未绑定 Token Source 时使用
+strict_mcp = "true"               # 以下字段用于 Claude 主会话
+load_project_mcp = "true"
+tools = "Read,Write,Edit,Bash,Glob,Grep"
 
 [claude]
-bin = "~/.local/bin/reclaude"   # 换 claude 包装器;路径错直接报错,不回退
+bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 ```
 
-> `setting_sources="project"` 会丢掉 `~/.claude/settings.json` 的 GLM 路由,要保留把凭据挪到 `[token_source.glm]`。换 `bin` 后清掉 `settings.json` / `[claude.env]` 残留的 GLM 地址,否则流量仍走 GLM。细节见 `docs/claude-agent-backend.md`。
+账号配置使用 `[token_source.glm]`、`[token_source.deepseek]` 等节。GLM 和 DeepSeek 也可以从本机 Claude settings 中识别；识别后由对应 Token Source 注入凭据，避免不同账号的环境变量串用。项目的工具限制只作用于主会话，委派 Agent 使用完整工具集。
 
----
+手动修改配置后需重启 daemon；群内账号启用和模型补录会自行重载相关配置。模型路由、配置优先级和双后端差异见 [后端说明](docs/claude-agent-backend.md)。
 
-> [!TIP]
-> 想 7×24 长跑,Linux 使用 `systemd --user`,macOS 使用 `launchd`,Windows 使用任务计划程序拉起 `lodestar-daemon`。重启后上次活跃的 sessions 会并发自动恢复。
+## 开发
 
----
+```bash
+bun install
+bun run typecheck
+bun test
+bun run build
+```
 
-## 📄 许可
+从源码启动使用 `bun run start`。`scripts/` 中的 smoke 和探针会操作真实飞书群，使用前阅读 [脚本说明](scripts/AGENTS.md)。
+
+## 许可
 
 [MIT](LICENSE)

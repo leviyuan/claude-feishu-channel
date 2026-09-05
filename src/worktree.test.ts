@@ -10,7 +10,6 @@ import {
   readWorktreeInstructionsForManagedBranch,
   removeProjectWorktreeIfClean,
   withProjectWorktreeLock,
-  worktreeInstructionsPathForManagedBranch,
 } from './worktree'
 
 let roots: string[] = []
@@ -161,7 +160,7 @@ describe('project worktrees', () => {
     writeFileSync(join(result.worktreePath, 'agents.avatar.md'), '# extra rules\n')
 
     expect(
-      worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
+      readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')?.path,
     ).toBe(join(result.worktreePath, 'agents.avatar.md'))
   })
 
@@ -170,7 +169,7 @@ describe('project worktrees', () => {
     const result = ensureProjectWorktree(repo, 'feishu', 'avatar-art')
     writeFileSync(join(result.worktreePath, 'agents.avatar-art.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
   test('reads slug-specific AGENTS content for managed worktree branches', () => {
@@ -192,14 +191,14 @@ describe('project worktrees', () => {
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
     writeFileSync(join(result.worktreePath, 'agents.other.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
   test('skips slug-specific AGENTS files outside managed worktree branches', () => {
     const { repo } = initRepo()
     writeFileSync(join(repo, 'agents.main.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(repo, repo, 'feishu')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(repo, repo, 'feishu')).toBeNull()
   })
 
   test('skips managed-branch AGENTS lookup in non-git project directories', () => {
@@ -209,7 +208,6 @@ describe('project worktrees', () => {
     mkdirSync(projectDir)
     writeFileSync(join(projectDir, 'agents.prompt.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
     expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
   })
 
@@ -221,7 +219,6 @@ describe('project worktrees', () => {
     git(projectDir, ['init'])
     writeFileSync(join(projectDir, 'agents.prompt.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
     expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
   })
 })

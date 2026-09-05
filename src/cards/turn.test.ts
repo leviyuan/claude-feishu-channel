@@ -4,7 +4,6 @@ import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, m
 import {
   askUserQuestionElement,
   contextCompactionElement,
-  editBatchElement,
   footerContextPercentLabel,
   footerTokenDetailLine,
   goalElement,
@@ -12,11 +11,8 @@ import {
   mainConversationCard,
   planElement,
   planLiveElement,
-  readBatchElement,
-  summarizeToolInput,
-  toolCallElement,
-  toolCallPermissionElement,
 } from './turn'
+import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
 describe('main conversation card rendering', () => {
   test('starts with a stable footer status element and no disposable ticker', () => {

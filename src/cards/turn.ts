@@ -269,8 +269,7 @@ interface MainCardOpts {
   effort?: string
   /** What started this turn:
    *   'user_message'   — user input batch(panel "📥 收到 (N)" 渲染原文)
-   *   'card_full'      — 同一 Codex turn 的"续卡":前一张卡写满(element 数
-   *                     触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
+   *   'card_full'      — 同一 turn 的续卡：前卡体积或组件数量超限后创建，
    *                     (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                     相同)
    *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息,
@@ -339,19 +338,6 @@ export function mainConversationCard(opts: MainCardOpts): object {
     },
   }
 }
-
-/** Empty assistant segment to be inserted just before the footer. */
-export function assistantSegmentElement(i: number): object {
-  return { tag: 'markdown', element_id: ELEMENTS.assistant(i), content: ' ' }
-}
-
-export {
-  summarizeToolInput,
-  toolCallElement,
-  readBatchElement,
-  editBatchElement,
-  toolCallPermissionElement,
-} from './tool'
 
 /** Schema of an AskUserQuestion question, projected to just the fields
  * the panel needs. Mirrors the SDK tool's input — kept loose since the

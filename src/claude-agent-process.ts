@@ -171,12 +171,6 @@ function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
   return child as unknown as SpawnedProcess
 }
 
-export function resolveClaudeBin(): string {
-  const found = findClaudeBin()
-  if (found) return found
-  throw new Error('Claude Code executable not found. Install Claude Code or add `claude` to PATH.')
-}
-
 function findClaudeBin(lookup: ClaudePathLookup = {}): string | null {
   const platform = lookup.platform ?? process.platform
   const exists = lookup.exists ?? existsSync
@@ -488,20 +482,11 @@ function mapModelInfo(info: ModelInfo): CodexModel {
   }
 }
 
-// default(非 bypassPermissions):AskUserQuestion 经 canUseTool 下发,host 才能
-// 拦下渲染卡片。bypassPermissions 会 shadow 掉 canUseTool(SDK 警告
-// CLAUDE_SDK_CAN_USE_TOOL_SHADOWED),AskUserQuestion 被秒批空答案、模型不等用户。
-// 普通工具的"不弹审批"语义改由 canUseTool 内部秒放复刻。
+// default 模式保留 canUseTool 回调，使 AskUserQuestion 能等待用户回答。
 export const CLAUDE_PERMISSION_MODE = 'default' as const
 
-/** Default setting sources when no project profile overrides them.
- * 刻意不含 'user':lodestar spawn 的 agent 是无头子进程,env 全由 token source
- * 的 spawnEnv 注入(token-source-*.ts)。若读 user settings(~/.claude/settings.json
- * 的 env 段),其 ANTHROPIC_BASE_URL/AUTH_TOKEN/slots 会**覆盖** spawnEnv —— 导致
- * 只有和 settings.json 一致的 source(如本机配的 GLM)能跑通,切 DeepSeek 等其他
- * source 被覆盖打到错误端点。故 user settings 的 env 段不参与;permissions/hooks
- * 由 lodestar canUseTool 自管,project 的 CLAUDE.md/skills/agents 仍经 project/local 生效。
- * 只影响 lodestar spawn 的子进程;裸 claude CLI 不经 lodestar,不受影响。 */
+/** 未指定来源时读取项目配置。Token Source 可覆盖；注入凭据的来源不读 user，
+ * 避免本机 settings 中的 Anthropic env 覆盖所选账号。 */
 const DEFAULT_SETTING_SOURCES: readonly string[] = ['project', 'local']
 
 /** Resolve SDK `settingSources` from a project profile's comma-separated
@@ -675,7 +660,6 @@ export class ClaudeAgentProcess extends EventEmitter {
   private resolveExit!: () => void
   private started = false
   private pendingPermissions = new Map<string, PendingControl>()
-  private pendingInjectedContext: string[] = []
   private requestCounter = 0
   private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
@@ -797,16 +781,13 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     if (!this.started) this.sendInitialize()
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
-    const injected = this.pendingInjectedContext.length
-      ? this.pendingInjectedContext.splice(0).join('\n\n') + '\n\n'
-      : ''
     try {
       this.input.push({
         type: 'user',
         session_id: this.sessionId ?? '',
         message: {
           role: 'user',
-          content: [{ type: 'text', text: injected + fileHints + text }],
+          content: [{ type: 'text', text: fileHints + text }],
         },
         parent_tool_use_id: null,
         priority: 'now',
@@ -846,10 +827,6 @@ export class ClaudeAgentProcess extends EventEmitter {
       // deny 的 message 同样必填;空字符串=无附加说明。
       pending.resolve({ behavior: 'deny', message: payload?.denyMessage ?? '' })
     }
-  }
-
-  sendToolResult(_toolUseId: string, _content: string, _isError = false): void {
-    log('claude-agent-process: sendToolResult ignored; Claude Agent SDK executes built-in tools internally')
   }
 
   sendHookResponse(_requestId: string, _output: object = {}): void {
@@ -921,26 +898,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastEffort = effort
   }
 
-  async setModel(model: string): Promise<void> {
-    await this.setModelSettings(model, this.opts.effort)
-  }
-
   async compactThread(): Promise<void> {
-    // claude-agent-sdk 没暴露主动 compact 的 control request(control 枚举里只有只读的
-    // GetContextUsage)。但 /compact 是 claude code CLI 的本地命令 —— 往 streaming input
-    // push 一条 text="/compact" 的 SDKUserMessage,SDK 会路由到 CLI 命令处理器执行真压缩
-    // 并吐 compact_boundary(由 handleSystemMessage 接成 context_compacted 事件)。
-    //
-    // 判定(2026-08-04/05 实测确立):
-    //   1. context_compacted → 真压缩完成 resolve(大上下文可能 >10min,死等)。
-    //   2. assistant_text 含 "Not enough messages to compact" → transcript 不足,无需压缩。
-    //   3. proc exit/error → reject(proc 死了才 fail,不靠固定时长)。
-    // **不设 timeout**(user-requested 2026-08-05)—— 大上下文压缩 >10min 正常,固定 timeout
-    // 会误杀(600s 超时报错);真挂起靠 proc exit/error 兜底,或用户 stop 命令中断。
-    //
-    // ⚠️ 之前用 onResult 兜底("result 到了没 boundary 就是无需压缩")是错的 —— 大上下文压缩
-    // 极慢时 boundary 会晚于 result,被误判成"无需压缩"。只有 "Not enough" 这句固定文案才是
-    // 明确的无需压缩信号。
+    // /compact 通过 streaming input 执行，以 compact_boundary 为完成信号。
+    // 不设固定时限；仅明确的 "Not enough messages to compact" 表示无需压缩。
+    // result 可能先于 boundary 到达，不能据此提前结束等待。
     if (!this.input) throw new Error('claude thread not initialized')
     this.input.push({
       type: 'user',
@@ -991,14 +952,6 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.once('exit', onExit)
       this.once('error', onError)
     })
-  }
-
-  async injectThreadItems(items: any[]): Promise<void> {
-    if (!Array.isArray(items) || items.length === 0) return
-    this.pendingInjectedContext.push([
-      'Host-injected prior tool context for this continuation:',
-      JSON.stringify(items, null, 2),
-    ].join('\n'))
   }
 
   private canUseTool(

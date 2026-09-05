@@ -11,8 +11,7 @@ export interface TasklistDeletionState {
   lastError?: string
 }
 
-/** Basic project ↔ Feishu tasklist binding. The retired AI automation
- * worker state is intentionally not part of this contract. */
+/** 项目与飞书任务清单的绑定及未完成的删除请求。 */
 export interface TasklistBinding {
   guid: string
   name: string
@@ -35,10 +34,6 @@ export function tasklistNameForProject(projectName: string): string {
 export function getTasklistBinding(projectName: string): TasklistBinding | null {
   const binding = bindings.get(projectName)
   return binding ? cloneBinding(binding) : null
-}
-
-export function listTasklistBindings(): TasklistBinding[] {
-  return [...bindings.values()].map(cloneBinding)
 }
 
 /** Serialize remote create/delete lifecycles per project. */

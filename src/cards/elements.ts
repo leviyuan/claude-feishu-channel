@@ -72,7 +72,7 @@ function escapeHtmlEntities(s: string): string {
 function downgradeExternalImagesInProse(s: string): string {
   const downgraded = s.replace(
     /!\[([^\]]*)\]\(([^)]*)\)/g,
-    (m, alt: string, url: string) => {
+    (_, alt: string, url: string) => {
       const u = url.trim()
       return alt.trim() ? `🖼️ ${alt.trim()} (${u})` : `🖼️ ${u}`
     },

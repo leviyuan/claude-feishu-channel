@@ -1,10 +1,4 @@
-/**
- * 从 config 构建 token source(遍历 factory registry,声明式)。
- *
- * 每个 source 是自包含模块(token-source-<name>.ts),import 它 = 触发
- * registerTokenSourceFactory 登记。加新 source = 新建一个模块文件 +
- * 下面 import 一行,不改本文件、不改枚举、不改 sources 数组。
- */
+/** 加载各 Token Source factory，按配置和本机 Claude settings 构建账号目录。 */
 
 import { createHash } from 'node:crypto'
 import { config, type TokenSourceConfig } from './config'
@@ -37,7 +31,7 @@ export function buildTokenSourcesFromConfig(): number {
     source.spawnRevision = tokenSourceSpawnRevision(def.kind, cfg, detected)
     return source
   })
-  // native 兜底:有显式 claude-side source(glm/deepseek/...)启用则让位;否则 native 启用(真 Claude)。
+  // 有其他已启用的 Claude 侧来源时，native 让位。
   const native = sources.find(s => s.kind === 'claude-native')
   if (native) {
     const hasClaudeSource = sources.some(s => s.agent === 'claude' && s.enabled && s.kind !== 'claude-native')

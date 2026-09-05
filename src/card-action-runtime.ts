@@ -162,23 +162,6 @@ export class ActionDeduper {
   }
 }
 
-/** Once business work succeeds, presentation failure must never release its
- * idempotency keys: retrying could repeat a destructive side effect. */
-export async function completeAfterPresentation(
-  deduper: ActionDeduper,
-  keys: string[],
-  present: () => Promise<void>,
-  onPresentationError: (error: unknown) => Promise<void> | void = () => {},
-): Promise<void> {
-  try {
-    await present()
-  } catch (error) {
-    try { await onPresentationError(error) } catch { /* completion wins */ }
-  } finally {
-    deduper.completeAll(keys)
-  }
-}
-
 function stableValue(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableValue).join(',')}]`
   if (value === undefined) return 'undefined'
