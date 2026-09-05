@@ -3634,7 +3634,10 @@ export class Session {
       log(`session "${this.sessionName}": ${message} thread=${sessionId} source=${source}`)
       if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
     })
-    on('turn_started', () => {
+    on('turn_retry', () => {
+      if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
+    })
+    on('turn_started', ({ retry }) => {
       // Codex app-server emits init only at process startup, not for every
       // turn. turn_started is its authoritative claim for an input that was
       // already given an eager-opened card. Claude normally consumed it in
@@ -3644,6 +3647,12 @@ export class Session {
         this.pendingUserMessageCount = 0
       }
       this.persistResumableSessionId()
+      if (retry) {
+        if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
+        // Capacity retries belong to the same visible task. Keep its original
+        // usage baseline so work preceding the capacity error is still counted.
+        return
+      }
       const total = this.proc?.lastTotalUsage
       if (this.usageTotalsSeedUnknown && !total) {
         this.currentTurnUsageBaseline = null
@@ -5367,6 +5376,12 @@ export class Session {
   private startFooterStatus(turn: TurnState, status: string): void {
     // log-only 之后 phase 切换(Thinking/Writing/Working)不再重渲 —— 卡已拒写。
     if (turn.rotateGivenUp) return
+    const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
+    if (retry) {
+      status = retry.phase === 'waiting'
+        ? `⏳ 模型满载 · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
+        : `⏳ 模型满载 · 正在重试 #${retry.attempt}`
+    }
     if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status

@@ -1,4 +1,4 @@
-import type { AgentProcess, AgentReasoningEffort } from './agent-process'
+import type { AgentProcess, AgentReasoningEffort, AgentTurnRetry } from './agent-process'
 import type { AgentIdentity } from './agent-identities'
 import { createAgentProcess } from './agent-launch'
 import { rememberAgentSession } from './agent-session-registry'
@@ -120,6 +120,7 @@ export function collectAgentTurn(
     proc.off('hook_callback', onHook)
     proc.off('init', onInit)
     proc.off('error', onError)
+    proc.off('turn_retry', onRetry)
     proc.off('result', onResult)
     proc.off('exit', onExit)
   }
@@ -211,6 +212,16 @@ export function collectAgentTurn(
     if (error) void finish(error)
   }
   const onError = (error: unknown) => { lastError = error instanceof Error ? error : new Error(String(error)) }
+  const onRetry = (retry: AgentTurnRetry) => {
+    if (retry.phase === 'waiting') clearWatchdog()
+    else if (!waiting) armWatchdog()
+    emitProgress({
+      at: new Date().toISOString(), phase: 'info', tool: 'Codex 容量重试',
+      detail: retry.phase === 'waiting'
+        ? `${retry.message} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
+        : `正在重试 #${retry.attempt}`,
+    })
+  }
   const onResult = (result: { is_error?: boolean; error?: unknown; subtype?: unknown; checkpoint?: unknown }) => {
     const error = result?.is_error
       ? new Error(String(result.error ?? result.subtype ?? proc.lastResult.subtype ?? 'delegated agent failed'))
@@ -231,6 +242,7 @@ export function collectAgentTurn(
   proc.on('hook_callback', onHook)
   proc.on('init', onInit)
   proc.on('error', onError)
+  proc.on('turn_retry', onRetry)
   proc.on('result', onResult)
   proc.on('exit', onExit)
   armWatchdog()

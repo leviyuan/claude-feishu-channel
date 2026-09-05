@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import { collectAgentTurn } from './agent-runner'
 
@@ -29,6 +29,40 @@ class FakeProcess extends EventEmitter {
 }
 
 describe('full delegated Agent runner', () => {
+  test('capacity backoff pauses the watchdog, reports progress and stays out of the agent output', async () => {
+    const timers = new Map<number, number>()
+    let nextId = 100_000
+    const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((_callback: () => void, delay: number) => {
+      const id = nextId++
+      timers.set(id, delay)
+      return id as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'
+    const progress: any[] = []
+    const handle = collectAgentTurn(proc, 'do work', { onProgress: step => progress.push(step) }, () => {})
+    try {
+      expect([...timers.values()]).toEqual([30 * 60 * 1000])
+      const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message: 'Selected model is at capacity' }
+      proc.emit('turn_retry', retry)
+      expect(timers.size).toBe(0)
+      expect(proc.alive).toBe(true)
+      expect(progress.at(-1).detail).toContain(retry.message)
+      proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
+      expect([...timers.values()]).toEqual([30 * 60 * 1000])
+      proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
+      proc.emit('result', { is_error: false })
+      await expect(handle.done).resolves.toMatchObject({ output: 'finished' })
+      expect(timers.size).toBe(0)
+      expect(proc.listenerCount('turn_retry')).toBe(0)
+    } finally {
+      await handle.cancel()
+      timeout.mockRestore()
+      clear.mockRestore()
+    }
+  })
+
   test('auto-allows ordinary permissions but pauses and resumes exact input requests', async () => {
     const proc = new FakeProcess() as any
     const waiting: any[] = []

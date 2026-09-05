@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +10,7 @@ import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
   CodexProcess,
+  CodexRpcResponseError,
   codexAppServerArgs,
   codexAppServerSpawnOptions,
   imageGenerationOutput,
@@ -53,6 +54,8 @@ function makeCodexProtocolHarness(
   const calls: ProtocolCall[] = []
   const writes: any[] = []
   const events: Array<[string, any]> = []
+  proc.alive = true
+  proc.capacityRetryEnabled = true
   proc.opts = { workDir: '/repo', ...opts }
   proc.readyPromise = null
   proc.initializePromise = null
@@ -110,6 +113,285 @@ function makeCodexProtocolHarness(
   }
   return { proc, calls, writes, events }
 }
+
+const CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model'
+
+async function withCapacityClock(run: (clock: {
+  timers: Map<number, { callback: () => void; delay: number }>
+  tick(): Promise<void>
+}) => Promise<void>): Promise<void> {
+  let nextId = 100_000
+  const timers = new Map<number, { callback: () => void; delay: number }>()
+  const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    const id = nextId++
+    timers.set(id, { callback, delay })
+    return id as unknown as ReturnType<typeof setTimeout>
+  }) as typeof setTimeout)
+  const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
+  try {
+    await run({
+      timers,
+      async tick() {
+        const next = timers.entries().next().value
+        if (!next) throw new Error('no scheduled capacity retry')
+        timers.delete(next[0])
+        next[1].callback()
+        await flushCapacityMicrotasks()
+      },
+    })
+  } finally {
+    timeout.mockRestore()
+    clear.mockRestore()
+  }
+}
+
+async function flushCapacityMicrotasks(): Promise<void> {
+  for (let i = 0; i < 12; i++) await Promise.resolve()
+}
+
+function capacityHarness(respond?: (method: string, params: any) => any | Promise<any>) {
+  let turn = 0
+  const harness = makeCodexProtocolHarness({ model: 'selected-model', effort: 'high' }, respond ?? (method => {
+    if (method === 'turn/start') return { turn: { id: `capacity-turn-${++turn}` } }
+    if (method === 'turn/interrupt') return {}
+    throw new Error(`unexpected request ${method}`)
+  }))
+  harness.proc.sessionId = 'capacity-thread'
+  harness.proc.readyPromise = Promise.resolve()
+  harness.proc.conversationResumable = true
+  return harness
+}
+
+function completeCapacityTurn(proc: any, error: any = { message: CAPACITY_MESSAGE }): void {
+  proc.handleNotification('turn/completed', {
+    threadId: 'capacity-thread',
+    turn: { id: proc.currentTurnId, status: error ? 'failed' : 'completed', error },
+  })
+}
+
+describe('codex model capacity recovery', () => {
+  test('waits for terminal failure, keeps one logical task open and continues its existing history', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('original task', ['/tmp/input.png'])
+      await flushCapacityMicrotasks()
+      for (const willRetry of [true, false]) {
+        proc.handleNotification('error', {
+          threadId: 'capacity-thread', turnId: proc.currentTurnId,
+          error: { message: CAPACITY_MESSAGE }, willRetry,
+        })
+      }
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([event]) => event === 'error').map(([, error]) => error.message))
+        .toEqual([CAPACITY_MESSAGE, CAPACITY_MESSAGE])
+
+      // The completion may omit the error already supplied by the notification.
+      const failedId = proc.currentTurnId
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread', turn: { id: failedId, status: 'failed' },
+      })
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread', turn: { id: failedId, status: 'failed', error: { message: CAPACITY_MESSAGE } },
+      })
+      expect(events.filter(([event]) => event === 'result')).toEqual([])
+      expect(proc.lastCompletedTurnId).toBeNull()
+      expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([5_000])
+      expect(proc.turnRetry).toMatchObject({ phase: 'waiting', attempt: 1, message: CAPACITY_MESSAGE })
+      await clock.tick()
+
+      const starts = calls.filter(call => call.method === 'turn/start')
+      expect(starts).toHaveLength(2)
+      expect(starts[0]!.params.input[0].text).toBe('[file: /tmp/input.png]\n\noriginal task')
+      expect(starts[1]!.params.input[0].text).toContain('继续完成用户尚未完成的任务')
+      expect(starts[1]!.params.input[0].text).not.toContain('original task')
+      expect(starts[1]!.params).toEqual({ ...starts[0]!.params, input: starts[1]!.params.input })
+      expect(proc.opts).toMatchObject({ model: 'selected-model', effort: 'high' })
+      expect(events.filter(([event]) => event === 'turn_started').at(-1)?.[1].retry).toBe(true)
+      completeCapacityTurn(proc, null)
+      expect(events.filter(([event]) => event === 'result')).toEqual([
+        ['result', expect.objectContaining({ is_error: false, turn_id: 'capacity-turn-2' })],
+      ])
+      expect(proc.turnRetry).toBeNull()
+      expect(clock.timers.size).toBe(0)
+    })
+  })
+
+  test('keeps retrying with capped backoff and resets after a successful task', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const delay of [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000]) {
+        completeCapacityTurn(proc)
+        expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
+        expect(events.filter(([event]) => event === 'result')).toEqual([])
+        await clock.tick()
+      }
+      completeCapacityTurn(proc, null)
+      proc.sendUserText('next task')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc)
+      expect(proc.turnRetry).toMatchObject({ attempt: 1, delayMs: 5_000 })
+    })
+  })
+
+  test('retries an explicitly rejected turn/start with its original input and files', async () => {
+    await withCapacityClock(async clock => {
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
+        if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, CAPACITY_MESSAGE)
+        return { turn: { id: 'accepted-retry' } }
+      })
+      proc.sendUserText('unaccepted task', ['/tmp/data.csv'])
+      await flushCapacityMicrotasks()
+      expect(events.filter(([event]) => event === 'result')).toEqual([])
+      await clock.tick()
+      expect(calls[1]).toEqual(calls[0])
+      // No earlier accepted turn: this boundary must seed the usage baseline.
+      expect(events.find(([event]) => event === 'turn_started')?.[1].retry).toBeUndefined()
+      completeCapacityTurn(proc, null)
+    })
+  })
+
+  test('unrelated failures and initialization errors remain terminal', async () => {
+    await withCapacityClock(async clock => {
+      for (const error of [
+        new CodexRpcResponseError('turn/start', 1, -32000, 'Usage limit exceeded'),
+        new CodexRpcResponseError('thread/start', 1, -32000, CAPACITY_MESSAGE),
+        new Error('turn/start request timed out'),
+      ]) {
+        const { proc, events } = capacityHarness(() => { throw error })
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+        expect(proc.lastResult.is_error).toBe(true)
+        expect(clock.timers.size).toBe(0)
+      }
+      for (const message of ['Context window capacity exceeded', 'Unauthorized', 'Usage limit exceeded']) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc, { message })
+        expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+        expect(clock.timers.size).toBe(0)
+      }
+    })
+  })
+
+  test('interrupt during backoff cancels even an already-queued timer callback', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc)
+      const staleTimer = [...clock.timers.values()][0]!
+      proc.sendInterrupt()
+      expect(clock.timers.size).toBe(0)
+      staleTimer.callback()
+      await flushCapacityMicrotasks()
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+      expect(events.filter(([event]) => event === 'result')).toEqual([
+        ['result', expect.objectContaining({ subtype: 'interrupted', checkpoint: null })],
+      ])
+    })
+  })
+
+  test('interrupt also cancels a retry awaiting its turn/start acknowledgement', async () => {
+    await withCapacityClock(async clock => {
+      let resolveRetry!: (value: any) => void
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (method === 'turn/interrupt') return {}
+        if (++starts === 1) return { turn: { id: 'first-turn' } }
+        return new Promise(resolve => { resolveRetry = resolve })
+      })
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc)
+      await clock.tick()
+      proc.sendInterrupt()
+      proc.sendInterrupt()
+      resolveRetry({ turn: { id: 'cancelled-retry' } })
+      await flushCapacityMicrotasks()
+      expect(proc.currentTurnId).toBeNull()
+      expect(calls.at(-1)).toEqual({
+        method: 'turn/interrupt', params: { threadId: 'capacity-thread', turnId: 'cancelled-retry' },
+      })
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread',
+        turn: { id: 'cancelled-retry', status: 'failed', error: { message: CAPACITY_MESSAGE } },
+      })
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+      expect(clock.timers.size).toBe(0)
+    })
+  })
+
+  test('a synchronous stop at the retry progress event prevents the request from being sent', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      const emit = proc.emit
+      proc.emit = (event: string, payload: any) => {
+        emit(event, payload)
+        if (event === 'turn_retry' && payload.phase === 'retrying') proc.sendInterrupt()
+        return true
+      }
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc)
+      await clock.tick()
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    })
+  })
+
+  test('new input, native continuation, kill and OS exit all retire the waiting timer', async () => {
+    await withCapacityClock(async clock => {
+      for (const action of ['input', 'native', 'kill', 'exit']) {
+        const { proc, calls, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc)
+        const staleTimer = [...clock.timers.values()][0]!
+        if (action === 'input') proc.sendUserText('new instruction')
+        if (action === 'native') proc.handleNotification('turn/started', {
+          threadId: 'capacity-thread', turn: { id: 'native-continuation' },
+        })
+        if (action === 'kill') {
+          proc.sendSignal = () => {}
+          proc.waitForExit = async () => true
+          await proc.kill()
+        }
+        if (action === 'exit') proc.handleChildExit(1, null)
+        expect(clock.timers.size).toBe(0)
+        staleTimer.callback()
+        await flushCapacityMicrotasks()
+        expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(action === 'input' ? 2 : 1)
+        if (action === 'native') {
+          expect(proc.currentTurnId).toBe('native-continuation')
+          expect(events.filter(([event]) => event === 'turn_retry').at(-1)?.[1].phase).toBe('retrying')
+        }
+      }
+    })
+  })
+
+  test('child-thread and stale capacity errors cannot turn an unrelated failure into a retry', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const [threadId, turnId] of [['child-thread', proc.currentTurnId], ['capacity-thread', 'old-turn']]) {
+        proc.handleNotification('error', { threadId, turnId, error: { message: CAPACITY_MESSAGE }, willRetry: false })
+        proc.handleNotification('turn/completed', { threadId, turn: { id: turnId, status: 'failed', error: { message: CAPACITY_MESSAGE } } })
+      }
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread', turn: { id: proc.currentTurnId, status: 'failed' },
+      })
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    })
+  })
+})
 
 describe('codex JSON-RPC lifecycle reliability', () => {
   test('starts the complete app-server feature surface without isolation overrides', () => {
