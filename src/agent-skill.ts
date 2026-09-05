@@ -3,7 +3,7 @@ import { removeManagedSkill, syncManagedSkill } from './managed-skills'
 export const AGENT_SKILL_NAME = 'lodestar-agent'
 
 export function agentSkillBody(): string {
-  const description = 'Call a configured identity as its corresponding Agent through Lodestar for implementation, debugging, research, planning, review, testing, or parallel work. Use whenever the user asks to call another model, AI, or Agent, or when the main Agent deliberately delegates a task.'
+  const description = 'Call a configured identity as its corresponding Agent through Lodestar for implementation, debugging, research, planning, review, testing, or parallel work. Use only for delegation to a different model or Agent. Self-calls MUST use your own Agent\'s native delegation capabilities and MUST NOT use this Skill.'
   return [
     '---',
     `name: ${AGENT_SKILL_NAME}`,
@@ -16,9 +16,22 @@ export function agentSkillBody(): string {
     'Each identity resolves to its configured Token Source, provider Agent backend,',
     'model, and effort. The caller-supplied prompt becomes that Agent run\'s task.',
     '',
+    '## Hard rule: native Agent capabilities for self-calls',
+    '',
+    '- When calling yourself or your own model/Agent, you MUST use your current',
+    '  Agent\'s native Agent/subagent capabilities. You MUST NOT use this Skill',
+    '  or the `lodestar-agent` command for self-calls.',
+    '- For example, Codex calling Codex uses Codex native subagents; Claude',
+    '  calling Claude uses Claude native Agent capabilities.',
+    '- This rule applies at every delegation depth and within multi-model tasks:',
+    '  handle self-calls natively and include only other models/Agents in this Skill.',
+    '- If native delegation is unavailable, report that limitation. It does not',
+    '  permit routing a self-call through this Skill.',
+    '',
     '## Required workflow',
     '',
-    '1. Query the live identity catalog immediately before every new task:',
+    '1. For another model/Agent, query the live identity catalog immediately before',
+    '   every new task:',
     '',
     '```bash',
     '# desc: 查询当前可用的 Agent 身份',
@@ -29,7 +42,7 @@ export function agentSkillBody(): string {
     '   substitute, or silently downgrade an identity/model/effort.',
     '3. Give the child the complete task, relevant context, authority boundaries,',
     '   expected deliverable, and verification requirements in the raw prompt.',
-    '4. For the same prompt sent to several models, pass every identity to one run',
+    '4. For the same prompt sent to several other models, pass every identity to one run',
     '   with repeated `--identity`; the daemon fans them out concurrently.',
     '5. Wait for the result. Attribute each result to its actual model and surface',
     '   failures. Child file changes are live in the same workspace.',
