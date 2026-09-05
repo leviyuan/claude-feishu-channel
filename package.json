@@ -72,6 +72,9 @@
     "mathjax-full": "^3.2.2",
     "zod": "^4.4.3"
   },
+  "bundleDependencies": [
+    "mathjax-full"
+  ],
   "optionalDependencies": {
     "@anthropic-ai/claude-agent-sdk-darwin-arm64": "^0.3.251",
     "@anthropic-ai/claude-agent-sdk-darwin-x64": "^0.3.251",

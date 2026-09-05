@@ -35,6 +35,12 @@ jobs:
         run: bun run test:randomized
       - name: Build distributable entry points
         run: bun run build
+      - name: Audit installed release package
+        run: |
+          mkdir -p "$RUNNER_TEMP/lodestar-release/pack" "$RUNNER_TEMP/lodestar-release/install"
+          npm pack --pack-destination "$RUNNER_TEMP/lodestar-release/pack"
+          npm install --prefix "$RUNNER_TEMP/lodestar-release/install" --ignore-scripts --no-fund --no-audit "$RUNNER_TEMP"/lodestar-release/pack/*.tgz
+          npm audit --prefix "$RUNNER_TEMP/lodestar-release/install" --omit=dev
       - name: Set up minimum supported Node.js
         uses: actions/setup-node@v4
         with:
@@ -46,6 +52,7 @@ jobs:
           node --check dist/lodestar-stop.js
           node --check dist/lodestar-update.js
           node --check dist/lodestar-version.js
+          node --check dist/lodestar-agent.js
           node -e "Promise.all([import('@anthropic-ai/claude-agent-sdk'), import('@larksuiteoapi/node-sdk'), import('cross-spawn')])"
 
   dependency-audit:
