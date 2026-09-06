@@ -389,6 +389,19 @@ describe('CardActionAdmission integration', () => {
     expect(h.admission.accept(event)).toEqual({ state: 'completed' })
   })
 
+  test('paging back and refreshing again stay available while duplicate deliveries remain suppressed', async () => {
+    const h = admissionHarness()
+    for (const [index, page] of [1, 0, 1, 1].entries()) {
+      const event = actionEvent(`page-click-${index}`, 'chat-a', {
+        kind: 'agent_identity_page', panel_id: 'panel-1', page,
+      })
+      expect(h.admission.accept(event)).toEqual({ state: 'accepted' })
+      await h.drain()
+      expect(h.admission.accept(event)).toEqual({ state: 'completed' })
+    }
+    expect(h.executeCalls()).toBe(4)
+  })
+
   test('presentation rejection cannot rerun successful business work', async () => {
     let executeCalls = 0
     let failureReceipts = 0

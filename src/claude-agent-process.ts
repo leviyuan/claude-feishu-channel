@@ -37,7 +37,7 @@ import type {
   SpawnOpts,
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
-import { observeContextWindow, downgradeContextWindow } from './context-window-observe'
+import { observeContextWindow } from './context-window-observe'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -331,11 +331,9 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
   return null
 }
 
-/** SDK contextWindow 历史 max,按 token source + claude 路由 key 在 daemon 进程内全局共享。
- * context window 是模型路由属性(与 session 无关):任一 session 探测到的真实
- * 窗口(GLM-5.2[1m] → 1M)锁定后,同路由所有 session 立即用作分母,不再各自
- * 首轮回落默认 200K。daemon 重启后重新探测(不持久化,重启不常发生)。 */
-const contextWindowMaxByRoute = new Map<string, number>()
+/** Latest SDK contextWindow per source/model route. A fresh smaller value is
+ * authoritative too; smoothing the denominator must not hide a limit change. */
+const contextWindowByRoute = new Map<string, number>()
 
 function claudeRouteKey(model: string | null | undefined, tokenSourceId?: string | null): string {
   // opts.model 形如 'claude:glm' / 'claude:default';null 归一到 default。
@@ -345,8 +343,8 @@ function claudeRouteKey(model: string | null | undefined, tokenSourceId?: string
 }
 
 /** 仅供测试重置全局缓存,保证用例隔离。 */
-export function resetClaudeContextWindowMaxCache(): void {
-  contextWindowMaxByRoute.clear()
+export function resetClaudeContextWindowCache(): void {
+  contextWindowByRoute.clear()
 }
 
 function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
@@ -747,6 +745,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           settingSources: [...settingSources] as SettingSource[],
           ...managedSkillOptions,
           tools: toolsOption,
+          ...(this.opts.allowDelegation === false ? { disallowedTools: ['Agent', 'Task'] } : {}),
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),
           ...(mcpServers ? { mcpServers } : {}),
           toolConfig: {
@@ -1298,19 +1297,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     } else {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
-    // 分母 = 该路由的 SDK contextWindow 历史 max(daemon 全局,按路由 key 共享)。
-    // context window 是模型路由属性,与 session 无关:任一 session 探测到的真实
-    // 窗口(GLM-5.2[1m] → 1M)全局锁定,所有 session 立即用作分母,不再各自首轮
-    // 回落默认 200K。取 max 且单调不降,避免忽高忽低。SDK 从未上报 → null(--)。
+    // Use the current report, including decreases; a prior larger context
+    // window is not evidence that this turn has the same capacity.
     if (total.contextWindow != null) {
       const routeKey = claudeRouteKey(this.opts.model, this.tokenSourceId)
-      const prev = contextWindowMaxByRoute.get(routeKey) ?? 0
-      if (total.contextWindow > prev) {
-        contextWindowMaxByRoute.set(routeKey, total.contextWindow)
-        log(`claude-agent-process: SDK contextWindow ${total.contextWindow} (global max for ${routeKey}, prev ${prev || '-'})`)
-      } else if (total.contextWindow < (contextWindowMaxByRoute.get(routeKey) ?? 0)) {
-        log(`claude-agent-process: SDK contextWindow ${total.contextWindow} ignored (global max ${contextWindowMaxByRoute.get(routeKey)} locked for ${routeKey})`)
-      }
+      contextWindowByRoute.set(routeKey, total.contextWindow)
       // 真实窗口观测落盘(纯被动):token source 模型名 → contextWindow,spawn 侧
       // resolveSpawnModel 据此决定 [1m] 后缀(观测 1M 加 / 200K 裸名)。per-model
       // 粒度(modelUsage 的 key 即模型名),比 routeKey 聚合更准。
@@ -1323,7 +1314,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         }
       }
     }
-    this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model, this.tokenSourceId)) ?? total.contextWindow ?? null
+    this.lastContextWindow = contextWindowByRoute.get(claudeRouteKey(this.opts.model, this.tokenSourceId)) ?? total.contextWindow ?? null
     // 上下文占用 = session 当前上下文 = 最后一次 API call 的输入侧 token。从 claude
     // session transcript 读最后一条 assistant 的 per-call usage(transcript 带 finalize
     // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
@@ -1345,22 +1336,8 @@ export class ClaudeAgentProcess extends EventEmitter {
       })
     }
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
-    // 爆窗降级:带 [1m] 的模型被服务端 200K 挡下 = 端点没给 1M → 记 200K,
-    // resolveSpawnModel 下轮起裸名(200K 记账),不再被拒。纯观测闭环的纠错臂。
-    // 触发条件收紧到窗口类错误文本 —— 任意 API error 都降级会把网络/凭据
-    // 故障误判成"不支持 1M",错锁 200K。
-    if (this.tokenSourceId && raw.is_error === true) {
-      const errText = String(raw.result ?? raw.error ?? raw.api_error_message ?? '')
-      const isWindowError = /context.?window|prompt is too long|exceeds?.*(?:context|token)|too many (?:input )?tokens/i.test(errText)
-      if (isWindowError) {
-        // lastModel 带 'claude:' 前缀(claudeModelKey 归一),观测缓存的 key 是裸模型名
-        // —— 剥前缀+后缀再写,与观测臂/resolveSpawnModel 同一 key 空间。
-        const rawModel = this.lastModel ?? (this.opts.model?.trim() || 'claude:default')
-        const model = rawModel.replace(/^claude:/, '')
-        downgradeContextWindow(this.tokenSourceId, model)
-        log(`claude-agent-process: context window exceeded on ${model} — downgraded to 200K (no [1m] next spawn)`)
-      }
-    }
+    // A context-length error proves this request was too large, not that the
+    // endpoint has a 200K window. Keep the reported capacity and requested model.
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
@@ -1373,6 +1350,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.emit('result', {
       subtype,
       is_error: this.lastResult.is_error,
+      ...(this.lastResult.is_error ? {
+        error: Array.isArray(raw.errors) && raw.errors.length
+          ? raw.errors.map(String).join('\n')
+          : String(raw.result ?? raw.error ?? raw.api_error_message ?? subtype),
+      } : {}),
       duration_ms: this.lastResult.duration_ms,
       usage: this.lastUsage,
       checkpoint: !this.lastResult.is_error && this.lastAssistantUuid && this.sessionId

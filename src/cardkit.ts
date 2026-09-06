@@ -13,14 +13,20 @@
  *   - all writes for a card are serialized through a Promise queue
  */
 
+import { createHash } from 'node:crypto'
 import { getTenantToken } from './feishu'
 import { log } from './log'
-import { neutralizeMarkdownImagesInCard } from './cards/elements'
+import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 const CARDKIT_FETCH_TIMEOUT_MS = 15_000
 
 const ID_CONVERT_RETRY_DELAYS_MS = [0, 250, 750, 1500]
+
+interface ElementPlacement {
+  type?: 'append' | 'insert_before' | 'insert_after'
+  targetElementId?: string
+}
 
 interface CardState {
   sequence: number
@@ -36,16 +42,18 @@ interface CardState {
    * addElement won't bump it, so the count tracks "elements Feishu
    * believes exist" not "elements we tried to create"). */
   elementCount: number
-  /** 停止写入并等待迁移的元素。add 失败时远端不存在该元素；容量超限的
-   * replace 失败时远端仍是旧内容，需要在新卡重建最新版本。按卡隔离。 */
+  /** Hashes of successfully written body elements, without card-local IDs.
+   * Used to recognize an unchanged rejected payload across replacement cards.
+   * Footer timing/status changes do not count as content progress. */
+  contentFingerprints: Map<string, string>
+  /** 最新内容未落地或已经删除的元素，按卡隔离。后续更新可以重建失败的
+   * add 或重试失败的 PUT；显式删除的元素不会被迟到的更新复活。 */
   deadElements: Set<string>
-  /** Card-level write kill-switch (see markCardWriteDead). Once set, every
-   * write op short-circuits to a resolved promise — no HTTP, no onFailure.
-   * Session flips this when it hits the failure-rotate cap and goes
-   * log-only: without it, the per-second footer ticker and stream handlers
-   * keep hammering the unwritable card (2026-07-04: 663 × code=300308 in
-   * 11 minutes against one dead card). */
-  writeDead?: boolean
+  /** Missing adds retain their original placement so a later tool/result
+   * update can create the latest element. Failed PUTs still have a remote
+   * element and may be retried; deleted elements must remain unwritable. */
+  failedAdds: Map<string, ElementPlacement>
+  failedReplacements: Set<string>
   /** Synchronous enqueue gate set by dispose before draining the queue. */
   closing?: boolean
   /** Card-level write-failure callback, set by recordCardCreated. Invoked
@@ -65,6 +73,9 @@ export interface CardWriteFailure {
   httpStatus?: number
   logId?: string
   message: string
+  /** Attempted body content, including the rejected element, independent of
+   * card IDs, element renumbering and footer timers. Capacity failures only. */
+  capacityFingerprint?: string
 }
 
 export interface CardWriteResult {
@@ -110,41 +121,15 @@ const summaryStates = new Map<string, SummaryState>()
 const SUMMARY_FLUSH_MS = 1500
 
 function state(cardId: string): CardState {
-  let s = cards.get(cardId)
-  if (!s) {
-    s = {
-      sequence: 0,
-      queue: Promise.resolve(),
-      elementCount: 0,
-      deadElements: new Set(),
-    }
-    cards.set(cardId, s)
-  }
-  return s
+  const current = cards.get(cardId)
+  if (!current) throw new Error(`cardkit card is not registered: ${cardId}`)
+  return current
 }
 
-/** Card ids that were disposed (turn closed / rotated away). Mutation APIs
- *  on a disposed card must NOT silently re-create state via state() and fire
- *  real HTTP writes at a card whose stream is closed — that both pollutes
- *  the wire and resurrects leaked state. Checked callers observe false /
- *  no-op instead (review #3). */
-const disposedCards = new Set<string>()
-const MAX_DISPOSED_CARD_TOMBSTONES = 5000
-
-function rememberDisposedCard(cardId: string): void {
-  disposedCards.delete(cardId)
-  disposedCards.add(cardId)
-  while (disposedCards.size > MAX_DISPOSED_CARD_TOMBSTONES) {
-    const oldest = disposedCards.values().next().value
-    if (typeof oldest !== 'string') break
-    disposedCards.delete(oldest)
-  }
-}
-
-/** True if this card was disposed. Late async writers (math render promises
- *  landing after turn close) check this before scheduling writes. */
+/** Closed or unregistered cards cannot accept writes. Ownership comes from
+ * the live registry, so evicting old history can never resurrect a card. */
 export function isDisposed(cardId: string): boolean {
-  return disposedCards.has(cardId)
+  return !cards.has(cardId)
 }
 
 /** Session calls this once right after sendCard + convertMessageToCard,
@@ -159,15 +144,17 @@ export function recordCardCreated(
   initialElementCount: number,
   onFailure?: (code?: number, failure?: CardWriteFailure) => void,
 ): void {
-  // 新生命周期开始:同 id 重建(测试复用固定 card id / 飞书同 id 再开卡)
-  // 时清除 disposed 标记,恢复可写。
-  disposedCards.delete(cardId)
-  cards.delete(cardId)
-  const s = state(cardId)
-  s.elementCount = initialElementCount
-  s.onFailure = onFailure
-  s.writeDead = false
-  s.closing = false
+  cards.set(cardId, {
+    sequence: 0,
+    queue: Promise.resolve(),
+    elementCount: initialElementCount,
+    contentFingerprints: new Map(),
+    deadElements: new Set(),
+    failedAdds: new Map(),
+    failedReplacements: new Set(),
+    onFailure,
+    closing: false,
+  })
 }
 
 /** Read the live element count maintained by addElement/deleteElement.
@@ -177,7 +164,15 @@ export function getElementCount(cardId: string): number {
   return cards.get(cardId)?.elementCount ?? 0
 }
 
-/** 元素插入失败或更新因容量超限被拒时，换卡需要重建它的本地最新版本。 */
+/** Body elements whose latest content actually landed. Session uses these
+ * IDs to distinguish completed output left on an old page from live content
+ * that is rebuilt on every replacement. */
+export function getWrittenContentElementIds(cardId: string): string[] {
+  const s = cards.get(cardId)
+  return s ? [...s.contentFingerprints.keys()].filter(id => !s.deadElements.has(id)) : []
+}
+
+/** 最新版本未写入或元素已删除；换卡时据此保留尚未显示的内容。 */
 export function isDeadElement(cardId: string, elementId: string): boolean {
   return cards.get(cardId)?.deadElements.has(elementId) ?? false
 }
@@ -185,19 +180,10 @@ export function isDeadElement(cardId: string, elementId: string): boolean {
 /** A duplicate-id add may mean the element landed but the acknowledgement
  * was lost/raced. Allow one checked PUT reconciliation against that id. */
 export function clearDeadElementForReconcile(cardId: string, elementId: string): void {
-  cards.get(cardId)?.deadElements.delete(elementId)
-}
-
-/** Stop all future writes to this card. Idempotent; cleared only by
- * dispose (a rotated-to fresh card has its own state). Covers both new
- * enqueues and already-queued tasks that haven't reached the wire yet
- * (each op re-checks the flag when it runs). */
-export function markCardWriteDead(cardId: string): void {
-  if (disposedCards.has(cardId)) return
-  const s = state(cardId)
-  if (s.closing) return
-  s.writeDead = true
-  cancelSummary(cardId)
+  const s = cards.get(cardId)
+  s?.deadElements.delete(elementId)
+  s?.failedAdds.delete(elementId)
+  s?.failedReplacements.delete(elementId)
 }
 
 function nextSeq(cardId: string): number {
@@ -208,6 +194,20 @@ function nextSeq(cardId: string): number {
 
 function markElementDead(s: CardState, elementId: string): void {
   s.deadElements.add(elementId)
+}
+
+function contentFingerprint(element: object): string {
+  return createHash('sha256').update(JSON.stringify(element, (key, value) =>
+    key === 'element_id' ? undefined : value,
+  )).digest('hex')
+}
+
+function attemptedContentFingerprint(s: CardState, elementId?: string, fingerprint?: string): string {
+  const contents = [...s.contentFingerprints]
+    .filter(([id]) => id !== elementId)
+    .map(([, hash]) => hash)
+  if (fingerprint && elementId !== ELEMENTS.footer) contents.push(fingerprint)
+  return createHash('sha256').update(contents.sort().join('\n')).digest('hex')
 }
 
 async function call(method: string, path: string, body?: object): Promise<any> {
@@ -271,7 +271,7 @@ async function withReopenOnStreamingClosed(
   op: () => Promise<void>,
   onFailure?: (failure: CardWriteFailure) => void,
   silent = false,
-  meta: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> = {},
+  meta: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> & { contentFingerprint?: string } = {},
 ): Promise<void> {
   // 失败统一出口:card-level handler 先(它同步快照当前段/tool 后再异步
   // 换卡),per-call onFailure 后(addElement 的 deadElements.add + session
@@ -285,11 +285,17 @@ async function withReopenOnStreamingClosed(
     const failure: CardWriteFailure = {
       cardId,
       operation: label,
-      ...meta,
+      elementId: meta.elementId,
+      targetElementId: meta.targetElementId,
       code: requestError?.code,
       httpStatus: requestError?.httpStatus,
       logId: requestError?.logId,
       message: error instanceof Error ? error.message : String(error),
+    }
+    if (isCardCapacityFailure(failure.code, failure)) {
+      failure.capacityFingerprint = attemptedContentFingerprint(
+        state(cardId), meta.elementId, meta.contentFingerprint,
+      )
     }
     try {
       if (!silent) state(cardId).onFailure?.(failure.code, failure)
@@ -381,19 +387,24 @@ export async function flush(cardId: string): Promise<void> {
 export function addElement(
   cardId: string,
   element: object,
-  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+  opts: ElementPlacement = {},
   onFailure?: (code?: number, failure?: CardWriteFailure) => void,
 ): Promise<void> {
-  if (disposedCards.has(cardId)) return Promise.resolve()
+  if (isDisposed(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (s.closing || s.writeDead) return Promise.resolve()
+  if (s.closing) return Promise.resolve()
   const safeElement = neutralizeMarkdownImagesInCard(element)
   const elementId = (safeElement as { element_id?: string }).element_id
+  const fingerprint = contentFingerprint(safeElement)
+  const missing = () => {
+    if (!elementId) return
+    markElementDead(s, elementId)
+    s.failedAdds.set(elementId, opts)
+  }
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
     async () => {
-      if (s.writeDead) return
       const seq = nextSeq(cardId)
       await call('POST', `/cards/${cardId}/elements`, {
         type: opts.type ?? 'append',
@@ -405,20 +416,21 @@ export function addElement(
       // bypass this line, so the count tracks "elements Feishu actually
       // accepted" not "elements we tried to push".
       s.elementCount += 1
-      if (elementId) s.deadElements.delete(elementId)
+      if (elementId !== ELEMENTS.footer) s.contentFingerprints.set(elementId ?? `#${seq}`, fingerprint)
+      if (elementId) {
+        s.deadElements.delete(elementId)
+        s.failedAdds.delete(elementId)
+        s.failedReplacements.delete(elementId)
+      }
     },
     (failure) => {
-      // Add rejected ⇒ this element_id does not exist on Feishu's side.
-      // Mark it dead so subsequent replace/delete aimed at it
-      // short-circuit instead of spraying 300313/300121. Then forward the
-      // structured failure: session rotates only a confirmed card-capacity
-      // error. Validation/content failures keep the current card and preserve
-      // this element as dead.
-      if (elementId) markElementDead(s, elementId)
+      // Retain the missing add's placement. A later tool result must create
+      // its latest content rather than PUT a phantom ID or be discarded.
+      missing()
       onFailure?.(failure.code, failure)
     },
     false,
-    { elementId, targetElementId: opts.targetElementId },
+    { elementId, targetElementId: opts.targetElementId, contentFingerprint: fingerprint },
   ))
   return s.queue
 }
@@ -431,29 +443,49 @@ export function replaceElement(
   onFailure?: (code?: number, failure?: CardWriteFailure) => void,
   notifyCardFailure = true,
 ): Promise<void> {
-  if (disposedCards.has(cardId)) return Promise.resolve()
+  if (isDisposed(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.closing) return Promise.resolve()
   const safeElement = neutralizeMarkdownImagesInCard(element)
+  const fingerprint = contentFingerprint(safeElement)
+  const rejected = () => {
+    markElementDead(s, elementId)
+    s.failedReplacements.add(elementId)
+  }
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
     async () => {
-      if (s.writeDead || s.deadElements.has(elementId)) return
+      const missing = s.failedAdds.get(elementId)
+      if (s.deadElements.has(elementId) && !missing && !s.failedReplacements.has(elementId)) return
       const seq = nextSeq(cardId)
-      await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
-        element: JSON.stringify(safeElement),
-        sequence: seq,
-      })
+      if (missing) {
+        await call('POST', `/cards/${cardId}/elements`, {
+          type: missing.type ?? 'append',
+          ...(missing.targetElementId ? { target_element_id: missing.targetElementId } : {}),
+          elements: JSON.stringify([safeElement]),
+          sequence: seq,
+        })
+        s.elementCount++
+      } else {
+        await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
+          element: JSON.stringify(safeElement),
+          sequence: seq,
+        })
+      }
+      s.deadElements.delete(elementId)
+      s.failedAdds.delete(elementId)
+      s.failedReplacements.delete(elementId)
+      if (elementId !== ELEMENTS.footer) s.contentFingerprints.set(elementId, fingerprint)
     },
     failure => {
       // 工具已完成不代表结果已写入。标记失败的更新，避免换卡时把最新结果
       // 留在旧卡。公式增强等局部事务自行处理失败，保留原始元素可写。
-      if (notifyCardFailure && isCardCapacityFailure(failure.code, failure)) markElementDead(s, elementId)
+      if (notifyCardFailure) rejected()
       onFailure?.(failure.code, failure)
     },
     !notifyCardFailure,
-    { elementId },
+    { elementId, contentFingerprint: fingerprint },
   ))
   return s.queue
 }
@@ -461,7 +493,7 @@ export function replaceElement(
 /** Checked variants for callers that must know whether the write actually
  *  landed (math render: only mark a segment "rendered" when every write
  *  succeeded — a false marker would swallow the formula entirely, review #4).
- *  Resolves false on: card disposed, card write-dead, element dead, or the
+ *  Resolves false on: card disposed, element deleted, or the
  *  API call failing after retries. Never throws. */
 export async function replaceElementChecked(
   cardId: string,
@@ -469,9 +501,9 @@ export async function replaceElementChecked(
   element: object,
   opts: { notifyCardFailure?: boolean } = {},
 ): Promise<boolean> {
-  if (disposedCards.has(cardId)) return false
+  if (isDisposed(cardId)) return false
   const s = state(cardId)
-  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return false
+  if (s.closing) return false
   let failed = false
   await replaceElement(
     cardId,
@@ -480,7 +512,7 @@ export async function replaceElementChecked(
     () => { failed = true },
     opts.notifyCardFailure !== false,
   )
-  return !failed && !s.writeDead && !s.deadElements.has(elementId)
+  return !failed && !s.deadElements.has(elementId)
 }
 
 export async function addElementChecked(
@@ -496,14 +528,14 @@ export async function addElementResult(
   element: object,
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
 ): Promise<CardWriteResult> {
-  if (disposedCards.has(cardId)) return { landed: false }
+  if (isDisposed(cardId)) return { landed: false }
   const s = state(cardId)
-  if (s.closing || s.writeDead) return { landed: false }
+  if (s.closing) return { landed: false }
   const elementId = (element as { element_id?: string }).element_id
   let failure: CardWriteFailure | undefined
   await addElement(cardId, element, opts, (_code, detail) => { failure = detail })
   return {
-    landed: !failure && !s.writeDead && !(elementId && s.deadElements.has(elementId)),
+    landed: !failure && !(elementId && s.deadElements.has(elementId)),
     ...(failure ? { failure } : {}),
   }
 }
@@ -514,19 +546,25 @@ export function deleteElement(
   elementId: string,
   onFailure?: (code?: number, failure?: CardWriteFailure) => void,
 ): Promise<void> {
-  if (disposedCards.has(cardId)) return Promise.resolve()
+  if (isDisposed(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.closing) return Promise.resolve()
+  const deleted = () => s.deadElements.has(elementId)
+    && !s.failedAdds.has(elementId) && !s.failedReplacements.has(elementId)
+  if (deleted()) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
     async () => {
-      if (s.writeDead || s.deadElements.has(elementId)) return
+      if (deleted()) return
       const seq = nextSeq(cardId)
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
       })
       s.elementCount = Math.max(0, s.elementCount - 1)
+      s.contentFingerprints.delete(elementId)
+      s.failedAdds.delete(elementId)
+      s.failedReplacements.delete(elementId)
       markElementDead(s, elementId)
     },
     failure => onFailure?.(failure.code, failure),
@@ -537,10 +575,10 @@ export function deleteElement(
 }
 
 export async function deleteElementChecked(cardId: string, elementId: string): Promise<boolean> {
-  if (disposedCards.has(cardId)) return false
+  if (isDisposed(cardId)) return false
   const s = state(cardId)
-  if (s.closing || s.writeDead) return false
-  if (s.deadElements.has(elementId)) return true
+  if (s.closing) return false
+  if (s.deadElements.has(elementId) && !s.failedAdds.has(elementId) && !s.failedReplacements.has(elementId)) return true
   let failed = false
   await deleteElement(cardId, elementId, () => { failed = true })
   return !failed && s.deadElements.has(elementId)
@@ -552,7 +590,7 @@ export async function deleteElementChecked(cardId: string, elementId: string): P
  * the settings-PATCH endpoint. Whitespace is collapsed and the input
  * is trimmed; empty content is ignored. */
 export function patchSummaryThrottled(cardId: string, content: string): void {
-  if (disposedCards.has(cardId) || cards.get(cardId)?.closing || cards.get(cardId)?.writeDead) return
+  if (isDisposed(cardId) || cards.get(cardId)?.closing) return
   const trimmed = (content ?? '').replace(/\s+/g, ' ').trim()
   if (!trimmed) return
   let s = summaryStates.get(cardId)
@@ -566,7 +604,7 @@ export function patchSummaryThrottled(cardId: string, content: string): void {
   s.timer = setTimeout(() => {
     const st = summaryStates.get(cardId)
     if (!st) return
-    if (disposedCards.has(cardId)) { summaryStates.delete(cardId); return }
+    if (isDisposed(cardId)) { summaryStates.delete(cardId); return }
     st.timer = null
     if (st.latest === st.lastSent) return
     const toSend = st.latest
@@ -607,16 +645,16 @@ export function patchSettings(cardId: string, settings: object): Promise<void> {
  * the legacy fire-and-forget wrapper, callers can distinguish a landed PATCH
  * from a timeout/rejection and must not dispose bookkeeping on false. */
 export async function patchSettingsChecked(cardId: string, settings: object): Promise<boolean> {
-  if (disposedCards.has(cardId)) return false
+  if (isDisposed(cardId)) return false
   const s = state(cardId)
-  if (s.closing || s.writeDead) return false
+  if (s.closing) return false
   let landed = false
   let failed = false
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     'patchSettings',
     async () => {
-      if (disposedCards.has(cardId) || s.writeDead) return
+      if (isDisposed(cardId)) return
       const seq = nextSeq(cardId)
       await call('PATCH', `/cards/${cardId}/settings`, {
         settings: JSON.stringify(settings),
@@ -628,14 +666,13 @@ export async function patchSettingsChecked(cardId: string, settings: object): Pr
     true,
   ))
   await s.queue
-  return landed && !failed && !disposedCards.has(cardId) && !s.writeDead
+  return landed && !failed && !isDisposed(cardId)
 }
 
 /** Drop in-memory bookkeeping for a finished card. */
 export async function dispose(cardId: string): Promise<void> {
   const s = cards.get(cardId)
   if (!s) {
-    rememberDisposedCard(cardId)
     cancelSummary(cardId)
     return
   }
@@ -648,6 +685,5 @@ export async function dispose(cardId: string): Promise<void> {
   s.closing = true
   cancelSummary(cardId)
   await s.queue
-  rememberDisposedCard(cardId)
   cards.delete(cardId)
 }

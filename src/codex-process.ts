@@ -103,6 +103,7 @@ export interface SpawnOpts {
   model?: string
   effort?: CodexReasoningEffort
   appendSystemPrompt?: string
+  allowDelegation?: boolean
   /** Host-owned environment injected before token-source credential routing. */
   hostEnv?: Record<string, string | undefined>
   /** App-server conversation source label. Delegated agents use a distinct
@@ -114,8 +115,8 @@ export interface SpawnOpts {
   tokenSourceId?: string | null
 }
 
-export function codexAppServerArgs(): string[] {
-  return ['app-server', '--listen', 'stdio://']
+export function codexAppServerArgs(allowDelegation = true): string[] {
+  return ['app-server', '--listen', 'stdio://', ...(allowDelegation ? [] : ['--disable', 'multi_agent'])]
 }
 
 export function codexAppServerSpawnOptions(
@@ -389,7 +390,7 @@ export class CodexProcess extends EventEmitter {
     this.tokenSourceId = opts.tokenSourceId ?? null
     this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
-    const args = codexAppServerArgs()
+    const args = codexAppServerArgs(opts.allowDelegation !== false)
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
     const baseEnv = {
       ...(process.env as Record<string, string>),
@@ -722,6 +723,7 @@ export class CodexProcess extends EventEmitter {
         this.emit('result', {
           subtype,
           is_error: isError,
+          ...(isError && typeof error?.message === 'string' ? { error: error.message } : {}),
           duration_ms: this.lastResult.duration_ms,
           usage: this.lastUsage,
           turn_id: completedTurnId,
@@ -1644,6 +1646,7 @@ export class CodexProcess extends EventEmitter {
       // (2026-08-18 探针:effort=ultra 顶层回包 xhigh,config 路径回包 ultra)。
       config: {
         'features.default_mode_request_user_input': true,
+        ...(this.opts.allowDelegation === false ? { 'features.multi_agent': false } : {}),
         ...(this.opts.effort ? { model_reasoning_effort: this.opts.effort } : {}),
       },
       ...(this.opts.model ? { model: this.opts.model } : {}),

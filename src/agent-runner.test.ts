@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
-import { collectAgentTurn } from './agent-runner'
+import { AgentWorkerFailure, collectAgentTurn } from './agent-runner'
 
 class FakeProcess extends EventEmitter {
   provider = 'claude' as const
@@ -29,7 +29,7 @@ class FakeProcess extends EventEmitter {
 }
 
 describe('full delegated Agent runner', () => {
-  test('capacity backoff pauses the watchdog, reports progress and stays out of the agent output', async () => {
+  test('capacity backoff reports progress without imposing a turn deadline or changing output', async () => {
     const timers = new Map<number, number>()
     let nextId = 100_000
     const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((_callback: () => void, delay: number) => {
@@ -43,14 +43,14 @@ describe('full delegated Agent runner', () => {
     const progress: any[] = []
     const handle = collectAgentTurn(proc, 'do work', { onProgress: step => progress.push(step) }, () => {})
     try {
-      expect([...timers.values()]).toEqual([30 * 60 * 1000])
+      expect(timers.size).toBe(0)
       const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message: 'Selected model is at capacity' }
       proc.emit('turn_retry', retry)
       expect(timers.size).toBe(0)
       expect(proc.alive).toBe(true)
       expect(progress.at(-1).detail).toContain(retry.message)
       proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
-      expect([...timers.values()]).toEqual([30 * 60 * 1000])
+      expect(timers.size).toBe(0)
       proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
       proc.emit('result', { is_error: false })
       await expect(handle.done).resolves.toMatchObject({ output: 'finished' })
@@ -60,6 +60,28 @@ describe('full delegated Agent runner', () => {
       await handle.cancel()
       timeout.mockRestore()
       clear.mockRestore()
+    }
+  })
+
+  test('long-running work completes with its entire output beyond the old truncation threshold', async () => {
+    const proc = new FakeProcess() as any
+    const now = Date.now()
+    const time = spyOn(Date, 'now').mockReturnValue(now)
+    const handle = collectAgentTurn(proc, 'long work', {}, () => {})
+    try {
+      const body = '完整输出'.repeat(510_000)
+      proc.emit('assistant_text', { text: body })
+      time.mockReturnValue(now + 2 * 60 * 60 * 1000)
+      proc.emit('tool_use', { name: 'Bash' })
+      expect(proc.alive).toBe(true)
+      proc.emit('assistant_text', { text: '\n最终结论' })
+      proc.emit('result', { is_error: false })
+      await expect(handle.done).resolves.toMatchObject({
+        output: body + '\n最终结论', outputTruncated: false, durationMs: 2 * 60 * 60 * 1000,
+      })
+    } finally {
+      await handle.cancel()
+      time.mockRestore()
     }
   })
 
@@ -101,5 +123,59 @@ describe('full delegated Agent runner', () => {
     const handle = collectAgentTurn(proc, 'edit files', {}, () => {})
     proc.emit('result', { is_error: false, checkpoint: { id: 'checkpoint-1' } })
     await expect(handle.done).resolves.toMatchObject({ output: '', sessionId: 'sid-1' })
+  })
+
+  test('queues simultaneous questions without killing the task or losing answers', async () => {
+    const proc = new FakeProcess() as any
+    const questions: string[] = []
+    const handle = collectAgentTurn(proc, 'ask questions', {
+      onNeedsInput: request => questions.push(request.requestId),
+    }, () => {})
+    for (const id of ['first', 'second']) {
+      proc.emit('can_use_tool', {
+        request_id: id, tool_name: 'AskUserQuestion',
+        input: { questions: [{ id, question: `Question ${id}?` }] },
+      })
+    }
+    expect(questions).toEqual(['first'])
+    expect(proc.alive).toBe(true)
+    handle.answer('first', { first: 'one' })
+    expect(questions).toEqual(['first', 'second'])
+    expect(handle.pendingInput()?.requestId).toBe('second')
+    handle.answer('second', { second: 'two' })
+    expect(handle.pendingInput()).toBeNull()
+    expect(proc.permissionResponses.map((response: any[]) => response[0])).toEqual(['first', 'second'])
+    proc.emit('result', { is_error: false })
+    await handle.done
+  })
+
+  test('cancellation exposes failed process termination and permits a later cleanup attempt', async () => {
+    const proc = new FakeProcess() as any
+    const kill = spyOn(proc, 'kill').mockRejectedValue(new Error('process termination not confirmed'))
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    const failure = handle.done.catch(error => error)
+    try {
+      await expect(handle.cancel('stop')).rejects.toThrow('process termination not confirmed')
+      expect((await failure).message).toContain('process termination not confirmed')
+      expect(handle.isAlive?.()).toBe(true)
+      expect(() => proc.emit('error', new Error('process remains alive'))).not.toThrow()
+    } finally {
+      kill.mockRestore()
+      await handle.cancel('retry stop')
+    }
+    expect(handle.isAlive?.()).toBe(false)
+    expect(proc.listenerCount('error')).toBe(0)
+  })
+
+  test('a failed task preserves the output produced before the error', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    proc.emit('assistant_text', { text: '已完成的调查结果' })
+    proc.emit('result', { is_error: true, error: 'upstream request failed' })
+    const error = await handle.done.catch(error => error)
+    expect(error).toBeInstanceOf(AgentWorkerFailure)
+    expect(error.message).toBe('upstream request failed')
+    expect(error.output).toBe('已完成的调查结果')
+    expect(error.sessionId).toBe('sid-1')
   })
 })

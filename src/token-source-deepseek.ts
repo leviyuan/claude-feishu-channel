@@ -193,7 +193,7 @@ registerTokenSourceFactory({
       },
       resolveSpawnModel(model: string): string | undefined {
         // [1m] 后缀同 GLM 约定:加不加由真实 turn 观测定(见 context-window-observe.ts),
-        // 未观测默认加(端点不支持则首轮爆窗自动降级)。
+        // 未观测时保留已有 [1m] 路由约定；请求错误不改变模型或窗口。
         return resolveModelWithWindow('deepseek', model)
       },
       async verifyModel(model: string) {

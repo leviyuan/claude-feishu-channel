@@ -6,9 +6,7 @@ import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-r
 import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { getTokenSource } from './token-source'
-
-const AGENT_TURN_TIMEOUT_MS = 30 * 60 * 1000
-const MAX_AGENT_OUTPUT_CHARS = 2_000_000
+import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
 
 export interface AgentWorkerResult {
   output: string
@@ -19,6 +17,15 @@ export interface AgentWorkerResult {
   usage: Record<string, number | undefined> | null
 }
 
+/** Failed work may still contain useful output. Preserve it with the actual
+ * failure instead of dropping everything that preceded an error or cancel. */
+export class AgentWorkerFailure extends Error {
+  constructor(cause: Error, readonly output: string, readonly sessionId: string | null) {
+    super(cause.message, { cause })
+    this.name = 'AgentWorkerFailure'
+  }
+}
+
 export interface AgentWorkerCallbacks {
   onNeedsInput?(request: AgentInputRequest): void
   onProgress?(step: AgentStep): void
@@ -27,6 +34,7 @@ export interface AgentWorkerCallbacks {
 
 export interface AgentWorkerHandle {
   done: Promise<AgentWorkerResult>
+  isAlive?(): boolean
   pendingInput(): AgentInputRequest | null
   answer(requestId: string, answers: Record<string, string>): void
   cancel(reason?: string): Promise<void>
@@ -62,10 +70,11 @@ export function startAgentWorker(opts: {
     model: opts.identity.model,
     effort: opts.effort,
     launch,
-    developerInstructions: opts.developerInstructions,
+    developerInstructions: [opts.developerInstructions, DELEGATED_AGENT_INSTRUCTIONS].filter(Boolean).join('\n\n'),
+    allowDelegation: false,
     profile: opts.profile,
     managedSkillPluginPath: opts.managedSkillPluginPath,
-    hostEnv: opts.hostEnv,
+    hostEnv: { ...opts.hostEnv, LODESTAR_AGENT_ROLE: 'worker' },
     serviceName: 'lodestar-agent',
   })
   return collectAgentTurn(proc, opts.prompt, opts.callbacks)
@@ -77,12 +86,12 @@ export function collectAgentTurn(
   callbacks: AgentWorkerCallbacks = {},
   remember: typeof rememberAgentSession = rememberAgentSession,
 ): AgentWorkerHandle {
-  let output = ''
-  let outputTruncated = false
+  const output: string[] = []
   let lastError: Error | null = null
   let settled = false
-  let waiting: { request: AgentInputRequest; originalInput: Record<string, unknown> } | null = null
-  let timeout: ReturnType<typeof setTimeout> | null = null
+  let finishing: Promise<void> | null = null
+  let closeError: Error | null = null
+  const waiting: Array<{ request: AgentInputRequest; originalInput: Record<string, unknown> }> = []
   let resolveDone!: (value: AgentWorkerResult) => void
   let rejectDone!: (error: Error) => void
   const startedAt = Date.now()
@@ -91,16 +100,6 @@ export function collectAgentTurn(
     rejectDone = reject
   })
 
-  const clearWatchdog = () => {
-    if (timeout) clearTimeout(timeout)
-    timeout = null
-  }
-  const armWatchdog = () => {
-    clearWatchdog()
-    timeout = setTimeout(() => {
-      void finish(new Error(`delegated agent timed out after ${AGENT_TURN_TIMEOUT_MS / 1000}s`))
-    }, AGENT_TURN_TIMEOUT_MS)
-  }
   const rememberSession = (sessionId: string | null | undefined): Error | null => {
     if (!sessionId) return null
     try {
@@ -119,52 +118,54 @@ export function collectAgentTurn(
     proc.off('can_use_tool', onPermission)
     proc.off('hook_callback', onHook)
     proc.off('init', onInit)
-    proc.off('error', onError)
+    if (!proc.isAlive()) proc.off('error', onError)
     proc.off('turn_retry', onRetry)
     proc.off('result', onResult)
     proc.off('exit', onExit)
   }
-  const finish = async (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
-    if (settled) return
+  const finish = (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
+    if (finishing) return finishing
     settled = true
-    clearWatchdog()
-    cleanupListeners()
-    const registryError = rememberSession(proc.sessionId)
-    let closeError: Error | null = null
-    try { await proc.kill(3000) }
-    catch (cause) { closeError = cause instanceof Error ? cause : new Error(String(cause)) }
-    const failure = error ?? registryError ?? closeError
-    if (failure) {
-      rejectDone(failure)
-      return
-    }
-    const sessionId = proc.sessionId
-    if (!sessionId) {
-      rejectDone(new Error('delegated agent completed without a native session id'))
-      return
-    }
-    const text = output.trim()
-    const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
-    resolveDone({
-      output: outputTruncated ? `${text}\n\n[delegated agent output truncated at ${MAX_AGENT_OUTPUT_CHARS} chars]` : text,
-      outputTruncated,
-      sessionId,
-      ...(checkpointId ? { checkpointId } : {}),
-      durationMs: Date.now() - startedAt,
-      usage: proc.lastUsage ? { ...proc.lastUsage } : null,
+    waiting.length = 0
+    finishing = Promise.resolve().then(async () => {
+      const registryError = rememberSession(proc.sessionId)
+      try { await proc.kill(3000) }
+      catch (cause) { closeError = cause instanceof Error ? cause : new Error(String(cause)) }
+      cleanupListeners()
+      const failures = [error, registryError, closeError].filter((value): value is Error => !!value)
+      const failure = failures.length > 1
+        ? new AggregateError(failures, failures.map(value => value.message).join('; '))
+        : failures[0]
+      if (failure) {
+        rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId))
+        return
+      }
+      const sessionId = proc.sessionId
+      if (!sessionId) {
+        rejectDone(new AgentWorkerFailure(
+          new Error('delegated agent completed without a native session id'), output.join('').trim(), null,
+        ))
+        return
+      }
+      const text = output.join('').trim()
+      const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
+      resolveDone({
+        output: text,
+        outputTruncated: false,
+        sessionId,
+        ...(checkpointId ? { checkpointId } : {}),
+        durationMs: Date.now() - startedAt,
+        usage: proc.lastUsage ? { ...proc.lastUsage } : null,
+      })
     })
+    return finishing
   }
   const onText = (event: { text?: string; parentToolUseId?: string | null }) => {
-    if (event?.parentToolUseId || typeof event?.text !== 'string' || outputTruncated) return
-    const remaining = MAX_AGENT_OUTPUT_CHARS - output.length
-    if (event.text.length > remaining) {
-      output += event.text.slice(0, Math.max(0, remaining))
-      outputTruncated = true
-      return
-    }
-    output += event.text
+    if (settled || event?.parentToolUseId || typeof event?.text !== 'string') return
+    output.push(event.text)
   }
   const emitProgress = (step: AgentStep) => {
+    if (settled) return
     try { callbacks.onProgress?.(step) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
@@ -183,13 +184,10 @@ export function collectAgentTurn(
     tool_use_id?: string
     input?: Record<string, unknown>
   }) => {
+    if (settled) return
     if (request.tool_name !== 'AskUserQuestion') {
       try { proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: request.input ?? {} }) }
       catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
-      return
-    }
-    if (waiting) {
-      void finish(new Error('delegated agent emitted multiple simultaneous input requests'))
       return
     }
     let normalized: AgentInputRequest
@@ -198,12 +196,13 @@ export function collectAgentTurn(
       void finish(error instanceof Error ? error : new Error(String(error)))
       return
     }
-    waiting = { request: normalized, originalInput: request.input ?? {} }
-    clearWatchdog()
-    try { callbacks.onNeedsInput?.(normalized) }
+    if (waiting.some(pending => pending.request.requestId === normalized.requestId)) return
+    waiting.push({ request: normalized, originalInput: request.input ?? {} })
+    try { if (waiting.length === 1) callbacks.onNeedsInput?.(normalized) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
   const onHook = (request: { request_id: string | number }) => {
+    if (settled) return
     try { proc.sendHookResponse(String(request.request_id), {}) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
@@ -213,8 +212,6 @@ export function collectAgentTurn(
   }
   const onError = (error: unknown) => { lastError = error instanceof Error ? error : new Error(String(error)) }
   const onRetry = (retry: AgentTurnRetry) => {
-    if (retry.phase === 'waiting') clearWatchdog()
-    else if (!waiting) armWatchdog()
     emitProgress({
       at: new Date().toISOString(), phase: 'info', tool: 'Codex 容量重试',
       detail: retry.phase === 'waiting'
@@ -245,7 +242,6 @@ export function collectAgentTurn(
   proc.on('turn_retry', onRetry)
   proc.on('result', onResult)
   proc.on('exit', onExit)
-  armWatchdog()
   try {
     proc.sendInitialize()
     proc.sendUserText(prompt)
@@ -255,20 +251,28 @@ export function collectAgentTurn(
 
   return {
     done,
-    pendingInput: () => waiting?.request ?? null,
+    isAlive: () => proc.isAlive(),
+    pendingInput: () => waiting[0]?.request ?? null,
     answer(requestId: string, answers: Record<string, string>): void {
-      if (!waiting) throw new Error('delegated agent is not waiting for input')
-      if (waiting.request.requestId !== requestId) {
-        throw new Error(`delegated agent input request mismatch: expected ${waiting.request.requestId}`)
+      const pending = waiting[0]
+      if (!pending) throw new Error('delegated agent is not waiting for input')
+      if (pending.request.requestId !== requestId) {
+        throw new Error(`delegated agent input request mismatch: expected ${pending.request.requestId}`)
       }
-      const pending = waiting
       proc.sendPermissionResponse(requestId, 'allow', { updatedInput: { ...pending.originalInput, answers } })
-      waiting = null
-      armWatchdog()
+      waiting.shift()
+      if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request)
     },
     async cancel(reason = 'delegated agent cancelled'): Promise<void> {
+      const wasSettled = settled
       await finish(new Error(reason))
       await done.catch(() => {})
+      if (wasSettled) {
+        if (proc.isAlive()) await proc.kill(3000)
+        closeError = null
+        cleanupListeners()
+      }
+      if (closeError) throw closeError
     },
   }
 }

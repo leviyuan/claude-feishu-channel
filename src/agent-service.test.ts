@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
-import type { AgentWorkerHandle, AgentWorkerResult } from './agent-runner'
+import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -57,6 +57,7 @@ function harness(opts: {
   loadArtifacts?: AgentServiceDeps['loadArtifacts']
   sendCard?: AgentServiceDeps['sendCard']
   patchSettingsChecked?: AgentServiceDeps['patchSettingsChecked']
+  replaceElementChecked?: AgentServiceDeps['replaceElementChecked']
 } = {}) {
   const identities = opts.identities ?? [identity('a', 'Agent A')]
   const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [] }
@@ -69,7 +70,7 @@ function harness(opts: {
     sendTextRaw: async () => true,
     convertMessageToCard: async () => 'card-1',
     recordCardCreated: () => {},
-    replaceElementChecked: async () => true,
+    replaceElementChecked: opts.replaceElementChecked ?? (async () => true),
     patchSummaryThrottled: () => {},
     flush: async () => {},
     cancelSummary: () => {},
@@ -108,7 +109,7 @@ describe('AgentService', () => {
     expect(settings.at(-1)).toEqual({
       config: {
         streaming_mode: false,
-        summary: { content: '✅ agent · 1/1 · depth 0' },
+        summary: { content: '✅ 委派完成 · 1/1' },
       },
     })
   })
@@ -168,27 +169,36 @@ describe('AgentService', () => {
     expect(calls).toEqual([{ prompt: 'first', resume: undefined }, { prompt: 'second', resume: 'sid-first' }])
   })
 
-  test('scopes child capabilities to a run subtree and recursively cancels descendants', async () => {
-    const controls: ReturnType<typeof controlledHandle>[] = []
-    const capabilities: string[] = []
+  test('delegated capabilities cannot create tasks or use follow-up to delegate again', async () => {
+    const control = controlledHandle()
+    let capability = ''
+    let cardCount = 0
+    let starts = 0
     const { service, root } = harness({
+      sendCard: async () => `message-${++cardCount}`,
       startWorker: opts => {
-        capabilities.push(String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY))
-        const control = controlledHandle()
-        controls.push(control)
+        starts++
+        capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
         return control.handle
       },
     })
-    const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
-    for (let i = 0; i < 50 && !capabilities[0]; i++) await new Promise(resolve => setTimeout(resolve, 1))
-    const childPrincipal = service.principalForCapability(capabilities[0])!
-    await expect(service.cancelRun(childPrincipal, parent.runId, 'self-cancel')).rejects.toThrow('containing run')
-    const child = await service.startRun(childPrincipal, { identityIds: ['agent:a'], prompt: 'child' })
-    expect(child.parentRunId).toBe(parent.runId)
-    expect(child.depth).toBe(1)
-    await service.cancelRun(root, parent.runId, 'stop tree')
-    expect(service.getRun(root, parent.runId).status).toBe('cancelled')
-    expect(service.getRun(root, child.runId).status).toBe('cancelled')
+    try {
+      const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
+      for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
+      const worker = service.principalForCapability(capability)!
+      await expect(service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested' }))
+        .rejects.toThrow('cannot delegate again')
+      await expect(service.followUp(worker, parent.runId, { prompt: 'nested follow-up' }))
+        .rejects.toThrow('cannot delegate again')
+      expect(cardCount).toBe(1)
+      expect(starts).toBe(1)
+      expect(service.getRun(worker, parent.runId).runId).toBe(parent.runId)
+      await expect(service.cancelRun(worker, parent.runId, 'self-cancel')).rejects.toThrow('containing run')
+      await service.cancelRun(root, parent.runId, 'stop')
+      expect(service.principalForCapability(capability)).toBeNull()
+    } finally {
+      await service.shutdown('test cleanup')
+    }
   })
 
   test('marks interrupted durable runs failed on daemon restart', () => {
@@ -201,6 +211,30 @@ describe('AgentService', () => {
     }
     const { service, root } = harness({ loadArtifacts: () => [active] })
     expect(service.getRun(root, 'agent_old')).toMatchObject({ status: 'failed', error: expect.stringContaining('daemon restarted') })
+  })
+
+  test('the main Agent can continue a legacy nested run as a new single-level task', async () => {
+    const source = {
+      runId: 'agent_legacy', sessionName: 'project', chatId: 'chat-1', workDir: '/repo', prompt: 'old task', depth: 2,
+      status: 'completed' as const, createdAt: '2026-09-05T00:00:00Z', workers: [{
+        identityId: 'agent:a', identityName: 'A', tokenSourceId: 'a', provider: 'claude' as const,
+        model: 'model-a', effort: 'max', status: 'completed' as const, output: 'old result', steps: [], sessionId: 'legacy-session',
+      }],
+    }
+    let resumed: string | undefined
+    const { service, root } = harness({
+      loadArtifacts: () => [source],
+      startWorker: opts => {
+        resumed = opts.resumeSessionId
+        return resolvedHandle(result(opts.resumeSessionId!))
+      },
+    })
+    const follow = await service.followUp(root, source.runId, { prompt: 'continue' })
+    await waitFor(service, root, follow.runId, 'completed')
+    expect(resumed).toBe('legacy-session')
+    expect(follow.depth).toBe(0)
+    expect(follow.parentKind).toBe('follow_up')
+    expect(service.getRun(root, source.runId).depth).toBe(2)
   })
 
   test('invalidates a root run whose card was opening when the Session was cancelled', async () => {
@@ -222,39 +256,31 @@ describe('AgentService', () => {
     expect(starts).toBe(0)
   })
 
-  test('seals a parent capability before awaiting kill and cancels an in-flight child creation', async () => {
-    const parentControl = controlledHandle()
-    let capability = ''
-    let starts = 0
-    let childCardEntered!: () => void
-    let releaseChildCard!: () => void
-    const childEntered = new Promise<void>(resolve => { childCardEntered = resolve })
-    const childReleased = new Promise<void>(resolve => { releaseChildCard = resolve })
+  test('invalidates a main-Agent follow-up whose card was opening during Session cancellation', async () => {
+    let cardEntered!: () => void
+    let releaseCard!: () => void
+    const entered = new Promise<void>(resolve => { cardEntered = resolve })
+    const released = new Promise<void>(resolve => { releaseCard = resolve })
     let cards = 0
+    let starts = 0
     const { service, root } = harness({
       sendCard: async () => {
-        cards++
-        if (cards === 1) return 'message-parent'
-        childCardEntered()
-        await childReleased
-        return 'message-child'
+        if (++cards === 1) return 'message-original'
+        cardEntered()
+        await released
+        return 'message-follow-up'
       },
-      startWorker: opts => {
-        starts++
-        capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
-        return parentControl.handle
-      },
+      startWorker: opts => { starts++; return resolvedHandle(result(`sid-${opts.identity.id}`)) },
     })
-    const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
-    for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
-    const childPrincipal = service.principalForCapability(capability)!
-    const creatingChild = service.startRun(childPrincipal, { identityIds: ['agent:a'], prompt: 'racing child' })
-    await childEntered
-    await service.cancelRun(root, parent.runId, 'stop parent')
-    expect(service.principalForCapability(capability)).toBeNull()
-    releaseChildCard()
-    const child = await creatingChild
-    expect(child.status).toBe('cancelled')
+    const source = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'original' })
+    await waitFor(service, root, source.runId, 'completed')
+    const creating = service.followUp(root, source.runId, { prompt: 'continue' })
+    await entered
+    await service.cancelSessionRuns('project', 'chat-1', 'stop')
+    releaseCard()
+    const follow = await creating
+    expect(follow.status).toBe('cancelled')
+    expect(follow.depth).toBe(0)
     expect(starts).toBe(1)
   })
 
@@ -278,5 +304,103 @@ describe('AgentService', () => {
       .rejects.toThrow('global Agent worker limit')
     expect(cards).toBe(2)
     await service.shutdown('test cleanup')
+  })
+
+  test('main-Agent tasks share the concurrency limit and queued work starts when a slot is released', async () => {
+    const identities = Array.from({ length: 9 }, (_, i) => identity(`worker-${i}`))
+    const controls: ReturnType<typeof controlledHandle>[] = []
+    const { service, root } = harness({
+      identities,
+      startWorker: () => {
+        const control = controlledHandle()
+        controls.push(control)
+        return control.handle
+      },
+    })
+    try {
+      const run = await service.startRun(root, { identityIds: identities.map(item => item.id), prompt: 'parallel work' })
+      for (let i = 0; i < 200 && controls.length < 8; i++) await new Promise(resolve => setTimeout(resolve, 1))
+      expect(controls).toHaveLength(8)
+      expect(service.getRun(root, run.runId).workers[8]!.status).toBe('queued')
+      expect(service.getRun(root, run.runId).workers[8]!.queuedReason).toContain('等待执行名额')
+      controls[0]!.resolve(result('first-session'))
+      for (let i = 0; i < 200 && controls.length < 9; i++) await new Promise(resolve => setTimeout(resolve, 1))
+      expect(controls).toHaveLength(9)
+    } finally {
+      await service.shutdown('test cleanup')
+    }
+  })
+
+  test('failed cancellation keeps the process tracked, surfaces to Session and can be retried', async () => {
+    const control = controlledHandle()
+    let alive = true
+    let rejectCancel = true
+    const { service, root } = harness({
+      startWorker: () => ({
+        ...control.handle,
+        isAlive: () => alive,
+        cancel: async () => {
+          if (rejectCancel) {
+            const error = new Error('kill was not confirmed')
+            control.reject(error)
+            throw error
+          }
+          alive = false
+        },
+      }),
+    })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'work' })
+    await waitFor(service, root, started.runId, 'running')
+    await new Promise(resolve => setTimeout(resolve, 1))
+    await expect(service.cancelSessionRuns(session.sessionName, session.chatId, 'stop'))
+      .rejects.toThrow('kill was not confirmed')
+    expect(service.getRun(root, started.runId).status).toBe('failed')
+    expect(service.getRun(root, started.runId).error).toContain('kill was not confirmed')
+    expect(alive).toBe(true)
+    await expect(service.followUp(root, started.runId, { prompt: 'resume too early' }))
+      .rejects.toThrow('process has not stopped')
+    rejectCancel = false
+    expect(await service.cancelRun(root, started.runId, 'retry stop')).toBe(true)
+    expect(alive).toBe(false)
+    expect(await service.cancelRun(root, started.runId, 'already stopped')).toBe(false)
+  })
+
+  test('saves partial output even when the worker ultimately fails', async () => {
+    const { service, root, textArtifacts } = harness({
+      startWorker: () => ({
+        ...resolvedHandle(result('partial-session')),
+        done: Promise.reject(new AgentWorkerFailure(new Error('upstream failed'), '调查结果仍应保留', 'partial-session')),
+      }),
+    })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'investigate' })
+    const failed = await waitFor(service, root, started.runId, 'failed')
+    expect(failed.workers[0]!.output).toBe('调查结果仍应保留')
+    expect(failed.workers[0]!.error).toBe('upstream failed')
+    expect([...textArtifacts.values()]).toContain('调查结果仍应保留')
+  })
+
+  test('cancellation updates every worker panel, including tasks that never left the queue', async () => {
+    const identities = Array.from({ length: 9 }, (_, i) => identity(`cancel-${i}`))
+    const panels = new Map<string, any>()
+    let starts = 0
+    const { service, root } = harness({
+      identities,
+      startWorker: () => { starts++; return controlledHandle().handle },
+      replaceElementChecked: async (_cardId, id, element) => {
+        if (id.startsWith('aw_')) panels.set(id, element)
+        return true
+      },
+    })
+    const run = await service.startRun(root, { identityIds: identities.map(item => item.id), prompt: 'tasks' })
+    for (let i = 0; i < 100 && starts < 8; i++) await new Promise(resolve => setTimeout(resolve, 1))
+    expect(starts).toBe(8)
+    await service.cancelRun(root, run.runId, '用户取消')
+    expect(panels.size).toBe(9)
+    for (const panel of panels.values()) {
+      expect(panel.header.title.content).toContain('取消')
+      expect(JSON.stringify(panel)).toContain('停止原因')
+      expect(JSON.stringify(panel)).not.toContain('等待执行名额')
+    }
+    expect(starts).toBe(8)
   })
 })

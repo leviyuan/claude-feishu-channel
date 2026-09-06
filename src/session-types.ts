@@ -148,19 +148,21 @@ export interface TurnState {
    * in flight". */
   rotating: Promise<void> | null
   /** How many times this turn has rotated to a fresh card, proactive and
-   * reactive combined. Informational (logging) — NOT what the cap reads.
+   * reactive combined. Informational only; pagination has no turn-wide cap.
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
-  /** 仅统计容量错误触发的换卡，受 MAX_MIDTURN_ROTATES 限制。
+  /** 仅统计容量错误触发的换卡，不限制次数。
    * 主动换卡不计入；schema、内容和网络错误不能通过换卡修复。 */
   failureRotateCount: number
-  /** A non-capacity write failure is surfaced once per turn while the exact
-   * failed element remains dead/checked-false. Prevents footer/tool refreshes
-   * from flooding the chat with duplicate diagnostics. */
-  cardWriteFailureNotified: boolean
-  /** Latched once we hit the rotate cap and emit the "giving up" notice,
-   * so the notice isn't repeated on every later failed write this turn. */
-  rotateGivenUp: boolean
+  /** Rejected content in the current migration chain; value records whether
+   * its repeated failure was reported. Cleared when pagination makes progress. */
+  cardCapacityFailures: Map<string, boolean>
+  /** Dedupe repeated notices for the same card/item/operation/error. An
+   * earlier unrelated failure must not hide later failures in this turn. */
+  cardWriteFailureNotices: Set<string>
+  /** Replacement open failed. Pause footer refreshes; later content or turn
+   * completion retries opening a card without disabling writes to the old one. */
+  cardRotationFailed: boolean
   /** 本 turn 已处理过的出站路径请求。包括合法绝对路径和被拒绝的非绝对路径,
    * 用来避免增量文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
   outboundSeenPaths: Set<string>

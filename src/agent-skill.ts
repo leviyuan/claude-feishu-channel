@@ -2,8 +2,15 @@ import { removeManagedSkill, syncManagedSkill } from './managed-skills'
 
 export const AGENT_SKILL_NAME = 'lodestar-agent'
 
+export const DELEGATED_AGENT_INSTRUCTIONS = [
+  'You are a delegated Agent working on a task assigned by the main Agent.',
+  'Complete this task yourself. You must not create or invoke any further Agents or subagents.',
+  'This includes Lodestar delegation, provider-native Agent/subagent tools, and delegation through CLIs or HTTP APIs.',
+  'If additional Agent work is needed, report the need to the main Agent so it can assign that work.',
+].join('\n')
+
 export function agentSkillBody(): string {
-  const description = 'Call a configured identity as its corresponding Agent through Lodestar for implementation, debugging, research, planning, review, testing, or parallel work. Use only for delegation to a different model or Agent. Self-calls MUST use your own Agent\'s native delegation capabilities and MUST NOT use this Skill.'
+  const description = 'Main Agents can delegate a task to a different configured model or Agent through Lodestar. Delegated Agents and subagents must not use this Skill or delegate further. Main-Agent self-calls use native delegation capabilities.'
   return [
     '---',
     `name: ${AGENT_SKILL_NAME}`,
@@ -16,15 +23,25 @@ export function agentSkillBody(): string {
     'Each identity resolves to its configured Token Source, provider Agent backend,',
     'model, and effort. The caller-supplied prompt becomes that Agent run\'s task.',
     '',
+    '## Single-level delegation',
+    '',
+    '- Only the main Agent may delegate work. If you are already a delegated',
+    '  Agent or subagent, complete your assigned task yourself: do not delegate further.',
+    '- This prohibition covers this Skill, `lodestar-agent run` / `follow-up`,',
+    '  native Agent/subagent tools, and delegation through provider CLIs or HTTP APIs.',
+    '- `LODESTAR_AGENT_ROLE=worker` identifies a Lodestar delegated process.',
+    '  Native subagents are also delegated Agents even when they inherit a main role environment.',
+    '- Return additional work requests to the main Agent. It can assign separate',
+    '  tasks, continue your session, or answer your questions.',
+    '',
     '## Hard rule: native Agent capabilities for self-calls',
     '',
-    '- When calling yourself or your own model/Agent, you MUST use your current',
+    '- For the main Agent only: when calling yourself or your own model/Agent, use your current',
     '  Agent\'s native Agent/subagent capabilities. You MUST NOT use this Skill',
     '  or the `lodestar-agent` command for self-calls.',
     '- For example, Codex calling Codex uses Codex native subagents; Claude',
     '  calling Claude uses Claude native Agent capabilities.',
-    '- This rule applies at every delegation depth and within multi-model tasks:',
-    '  handle self-calls natively and include only other models/Agents in this Skill.',
+    '- This does not exempt delegated Agents from the single-level rule above.',
     '- If native delegation is unavailable, report that limitation. It does not',
     '  permit routing a self-call through this Skill.',
     '',
@@ -42,6 +59,7 @@ export function agentSkillBody(): string {
     '   substitute, or silently downgrade an identity/model/effort.',
     '3. Give the child the complete task, relevant context, authority boundaries,',
     '   expected deliverable, and verification requirements in the raw prompt.',
+    '   Explicitly tell it to complete the work itself without further delegation.',
     '4. For the same prompt sent to several other models, pass every identity to one run',
     '   with repeated `--identity`; the daemon fans them out concurrently.',
     '5. Wait for the result. Attribute each result to its actual model and surface',

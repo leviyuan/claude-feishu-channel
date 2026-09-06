@@ -71,8 +71,7 @@ export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
 export const MANAGED_CLAUDE_PLUGIN_DIR = join(DATA_DIR, 'managed-claude-plugin')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
  *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow
- *  (CLI 按 [1m] 后缀记 1M)或爆窗错误(model_context_window_exceeded → 200K 降级)。
- *  纯观测零探测:不带 [1m] 的模型首报 200K 即锁定裸名;带 [1m] 报 1M 锁定后缀。 */
+ *  (CLI 按 [1m] 后缀记 1M)。仅使用 SDK 明确上报的数值，错误文本不构成容量观测。 */
 export const CONTEXT_WINDOW_CACHE_FILE = join(DATA_DIR, 'context-window-cache.json')
 /** Persisted registrations for `/notify` cards that carry interactive
  * buttons. Each entry binds a `notify_id` → caller-supplied loopback

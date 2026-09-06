@@ -29,7 +29,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input；不引入 tmux、JSONL 队列或旁路进程控制。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。
-- `AgentService` 的委派进程与主会话共用完整启动入口，任务约束来自主 Agent prompt。保留并发、递归委派、原生会话续跑与输入回填，具体生命周期约束见 `src/AGENTS.md`。
+- `AgentService` 的委派进程与主会话共用启动入口。委派仅一层：主 Agent 可并行派工、续跑与输入回填；被委派的 Agent 不得通过 Lodestar 或原生 Agent 工具继续委派。具体生命周期约束见 `src/AGENTS.md`。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
 - 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
@@ -39,6 +39,8 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 ## 运行中的 daemon
 
+- 接收时已晚到超过 30 秒的消息应丢弃，避免用户重发后重复执行；排队耗时不参与该判断。这是明确的产品规则。
+- WebSocket 恢复必须彻底关闭旧 client 并创建新的 `WSClient`，该方式已在实际环境反复验证；不能仅凭 SDK 显示 connected 就取消完整重建。
 - 修改代码不授权 stop、restart、reload、切换服务或接管。只有当前用户消息明确要求对应操作时才能执行；授权不跨消息、中断恢复或上下文压缩继承。
 - “测试”“预览”“发张卡看看”不授权停止、重启、shadow、并行启动 daemon 或改 service 指向。不能无扰验证时说明影响，等待明确许可。
 - 重启前只读确认实际 unit，比较 `systemctl --user show <unit> -p ActiveEnterTimestamp` 与源码 mtime。运行代码不落后则不重启，不用 commit 时间代替启动时间。

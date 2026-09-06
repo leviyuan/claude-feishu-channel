@@ -8,7 +8,6 @@ const originalDataDir = process.env.LODESTAR_DATA_DIR
 
 const {
   observeContextWindow,
-  downgradeContextWindow,
   resolveModelWithWindow,
   observedContextWindow,
   resetContextWindowCache,
@@ -45,9 +44,9 @@ describe('context-window-observe(纯观测,零探测)', () => {
     expect(resolveModelWithWindow('glm', 'GLM-4.7')).toBe('GLM-4.7')
   })
 
-  test('爆窗降级 → 记 200K,下轮裸名', () => {
-    observeContextWindow('glm', 'GLM-5.3', 1_000_000)  // 先误判 1M
-    downgradeContextWindow('glm', 'GLM-5.3[1m]')        // 真实爆窗纠正
+  test('新 SDK 观测可以纠正窗口为 200K', () => {
+    observeContextWindow('glm', 'GLM-5.3', 1_000_000)
+    observeContextWindow('glm', 'GLM-5.3[1m]', 200_000)
     expect(resolveModelWithWindow('glm', 'GLM-5.3')).toBe('GLM-5.3')
   })
 

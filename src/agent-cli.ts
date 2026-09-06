@@ -245,7 +245,6 @@ function formatRun(run: any): string {
     `# Lodestar agent ${run.run_id ?? 'MISS'}`,
     '',
     `- Status: ${run.status ?? 'MISS'}`,
-    `- Depth: ${run.depth ?? 'MISS'}`,
     ...(run.parent_run_id ? [`- Parent: ${run.parent_run_id} (${run.parent_kind ?? 'delegate'})`] : []),
   ]
   if (run.error) lines.push(`- Error: ${run.error}`)

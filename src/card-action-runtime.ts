@@ -209,6 +209,7 @@ function cardActionSemanticKey(data: any): string {
 export interface CardActionDedupeIdentity {
   deliveryKey?: string
   businessKey: string
+  repeatable?: boolean
 }
 
 export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
@@ -221,6 +222,7 @@ export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
   return {
     ...(eventId ? { deliveryKey: `event\u0000${eventId}` } : {}),
     businessKey: `semantic\u0000${cardActionSemanticKey(data)}`,
+    ...(data?.action?.value?.kind === 'agent_identity_page' ? { repeatable: true } : {}),
   }
 }
 
@@ -279,7 +281,7 @@ function settleAction(
   businessCompleted: boolean,
 ): void {
   if (identity.deliveryKey) deduper.complete(identity.deliveryKey)
-  if (businessCompleted) deduper.complete(identity.businessKey)
+  if (businessCompleted && !identity.repeatable) deduper.complete(identity.businessKey)
   else deduper.fail(identity.businessKey)
 }
 
@@ -326,7 +328,7 @@ export function createCardActionAdmission<TResult, TResponse>(
         } catch (error) {
           // The handler may have thrown after an external side effect. Keep a
           // short tombstone for both keys rather than risking destructive replay.
-          deps.deduper.completeAll(keys)
+          settleAction(deps.deduper, identity, true)
           await bestEffort(() => deps.presentExecutionFailure(data, error))
           return
         }

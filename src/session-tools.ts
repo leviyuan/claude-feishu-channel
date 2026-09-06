@@ -235,6 +235,7 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   // panels after this result lands.
   meta.output = output
   meta.isError = isError
+  if (s.currentTurn.cardRotationFailed) s.maybeMidTurnRotate()
   const autoSendPath = autoSendPathFromToolResult(meta.name, output, isError)
   if (autoSendPath) s.sendOutboundPath(autoSendPath, meta.name)
   // AskUserQuestion already had its final panel painted by resolveAsk
@@ -318,8 +319,9 @@ export function rebuildToolsOnRotate(
   newCardId: string,
   oldToolByUseId: TurnState['toolByUseId'],
   oldBatches: TurnState['toolBatches'],
+  owner: TurnState | null = s.currentTurn,
 ): void {
-  const turn = s.currentTurn
+  const turn = owner
   if (!turn) return
   // 实时任务总览区的重建在 startMidTurnRotate 里(swap 后、assistant 重建前)
   // 已先于本函数完成 —— 这里搬过来的 tool insert_before taskLiveAnchor(turn)

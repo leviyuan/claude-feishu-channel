@@ -6,7 +6,7 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
-import { startAgentWorker, type AgentWorkerHandle } from './agent-runner'
+import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
 import type {
   AgentAnswerRequest,
@@ -24,11 +24,10 @@ import type { Session } from './session'
 import type { AgentReasoningEffort } from './agent-process'
 
 const GLOBAL_AGENT_CONCURRENCY = 8
-const MAX_DELEGATION_DEPTH = 8
+const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 const MAX_RETAINED_RUNS = 512
 const MAX_WORKER_STEPS = 50
 const MAX_SESSION_ACTIVE_RUNS = 64
-const MAX_SUBTREE_ACTIVE_RUNS = 32
 const MAX_GLOBAL_INFLIGHT_WORKERS = 128
 
 export type AgentPrincipal =
@@ -40,6 +39,7 @@ interface AgentRunRecord {
   session: Session | null
   cardId: string | null
   handles: Map<string, AgentWorkerHandle>
+  slotOwners: Set<string>
   capabilityByIdentity: Map<string, string>
   progressTimers: Map<string, ReturnType<typeof setTimeout>>
   children: Set<string>
@@ -51,8 +51,7 @@ interface AgentRunRecord {
 
 interface CreateRunOptions {
   parentRunId?: string
-  parentKind?: 'delegate' | 'follow_up'
-  depth: number
+  parentKind?: 'follow_up'
   cancellationEpoch: number
   resumeByIdentity?: Map<string, string>
 }
@@ -101,7 +100,6 @@ export class AgentService {
   private readonly cancellationEpochBySession = new Map<string, number>()
   private startingWorkers = 0
   private readonly startingRunsBySession = new Map<string, number>()
-  private readonly startingRunsBySubtree = new Map<string, number>()
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
     this.loadDurableRuns()
@@ -116,16 +114,11 @@ export class AgentService {
   }
 
   async startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
-    const depth = principal.kind === 'session' ? 0 : principal.depth + 1
-    if (depth > MAX_DELEGATION_DEPTH) {
-      throw new Error(`delegation depth ${depth} exceeds ${MAX_DELEGATION_DEPTH}`)
-    }
+    if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
     const release = this.reserveCapacity(principal, request.identityIds.length)
     try {
       return await this.createRun(principal.session, request, {
-        depth,
         cancellationEpoch: this.currentCancellationEpoch(principal.session),
-        ...(principal.kind === 'worker' ? { parentRunId: principal.runId, parentKind: 'delegate' as const } : {}),
       })
     } finally {
       release()
@@ -137,9 +130,13 @@ export class AgentService {
     runId: string,
     request: AgentFollowUpRequest,
   ): Promise<AgentRunSnapshot> {
+    if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
     const source = this.requireMutableDescendant(principal, runId)
     if (!isTerminal(source.snapshot.status)) throw new Error('agent follow-up requires a terminal source run')
     const worker = selectWorker(source.snapshot, request.identityId)
+    if (source.handles.get(worker.identityId)?.isAlive?.()) {
+      throw new Error('Agent process has not stopped; cannot start follow-up yet')
+    }
     if (!worker.sessionId) throw new Error(`${worker.identityName} has no resumable native session id`)
     const effort = request.effort ?? worker.effort
     const release = this.reserveCapacity(principal, 1)
@@ -151,7 +148,6 @@ export class AgentService {
       }, {
         parentRunId: source.snapshot.runId,
         parentKind: 'follow_up',
-        depth: source.snapshot.depth,
         cancellationEpoch: this.currentCancellationEpoch(principal.session),
         resumeByIdentity: new Map([[worker.identityId, worker.sessionId]]),
       })
@@ -176,8 +172,10 @@ export class AgentService {
     const handle = run.handles.get(worker.identityId)
     if (!handle) throw new Error('waiting agent process is no longer alive; start a follow-up run')
     handle.answer(request.requestId, request.answers)
-    worker.status = 'running'
-    delete worker.pendingInput
+    const nextInput = handle.pendingInput()
+    worker.status = nextInput ? 'needs_input' : 'running'
+    if (nextInput) worker.pendingInput = nextInput
+    else delete worker.pendingInput
     delete worker.queuedReason
     this.refreshNonterminalStatus(run)
     this.persist(run)
@@ -203,7 +201,8 @@ export class AgentService {
       && run.snapshot.chatId === chatId
       && !run.snapshot.parentRunId
       && this.treeHasActiveRun(run))
-    await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    const results = await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    throwCancellationFailures(results)
   }
 
   async shutdown(reason: string): Promise<void> {
@@ -213,9 +212,11 @@ export class AgentService {
       this.bumpCancellationEpoch(sessionName, chatId)
     }
     const roots = [...this.runs.values()].filter(run => !run.snapshot.parentRunId && this.treeHasActiveRun(run))
-    await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    const results = await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
     const remaining = [...this.runs.values()].flatMap(run => [...run.handles.values()])
-    await Promise.allSettled(remaining.map(handle => handle.cancel(reason)))
+    const remainingResults = results.some(result => result.status === 'rejected')
+      ? [] : await Promise.allSettled(remaining.map(handle => handle.cancel(reason)))
+    throwCancellationFailures([...results, ...remainingResults])
   }
 
   private async createRun(
@@ -229,10 +230,6 @@ export class AgentService {
       parent = this.runs.get(options.parentRunId)
       if (!parent) throw new Error(`parent agent run not found: ${options.parentRunId}`)
       this.assertSameSession(parent, session)
-      if (
-        options.parentKind === 'delegate'
-        && (parent.cancelled || parent.finalizing || isTerminal(parent.snapshot.status))
-      ) throw new Error(`parent agent run is no longer accepting children: ${options.parentRunId}`)
     }
     const catalog = this.deps.getCatalog()
     const identities = request.identityIds.map(id => {
@@ -255,7 +252,7 @@ export class AgentService {
       prompt: request.prompt,
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
       ...(options.parentKind ? { parentKind: options.parentKind } : {}),
-      depth: options.depth,
+      depth: 0,
       status: 'queued',
       workers,
       createdAt: new Date().toISOString(),
@@ -278,6 +275,7 @@ export class AgentService {
       session,
       cardId,
       handles: new Map(),
+      slotOwners: new Set(),
       capabilityByIdentity: new Map(),
       progressTimers: new Map(),
       children: new Set(),
@@ -289,17 +287,16 @@ export class AgentService {
     this.runs.set(runId, run)
     if (options.parentRunId) parent?.children.add(runId)
     const invalidated = this.currentCancellationEpoch(session) !== options.cancellationEpoch
-      || (options.parentKind === 'delegate' && !!parent
-        && (parent.cancelled || parent.finalizing || isTerminal(parent.snapshot.status)))
     if (invalidated) {
       run.cancelled = true
-      const reason = 'Agent run was invalidated by parent or Session cancellation before launch'
+      const reason = '任务已在启动前取消'
       for (const worker of run.snapshot.workers) {
         worker.status = 'cancelled'
         worker.error = reason
         worker.finishedAt = new Date().toISOString()
       }
       this.persist(run)
+      await Promise.all(run.snapshot.workers.map(worker => this.updateWorkerCard(run, worker)))
       await this.finalizeRun(run, 'cancelled', reason)
       return cloneSnapshot(run.snapshot)
     }
@@ -321,12 +318,13 @@ export class AgentService {
   ): Promise<void> {
     const worker = run.snapshot.workers.find(item => item.identityId === identity.id)!
     await this.acquireSlot(() => {
-      worker.queuedReason = `等待全局并发槽位 (${GLOBAL_AGENT_CONCURRENCY})`
+      worker.queuedReason = `等待执行名额（最多同时运行 ${GLOBAL_AGENT_CONCURRENCY} 个 Agent）`
       this.persist(run)
       void this.updateWorkerCard(run, worker)
     })
+    run.slotOwners.add(identity.id)
     if (run.cancelled) {
-      this.releaseSlot()
+      this.releaseWorkerSlot(run, identity.id)
       return
     }
     let capability = ''
@@ -394,6 +392,12 @@ export class AgentService {
       this.persist(run)
       await this.updateWorkerCard(run, worker)
     } catch (error) {
+      if (error instanceof AgentWorkerFailure) {
+        worker.output = error.output
+        worker.outputTruncated = false
+        if (error.sessionId) worker.sessionId = error.sessionId
+        this.persist(run)
+      }
       if (!run.cancelled) {
         this.clearProgressTimer(run, identity.id)
         worker.status = 'failed'
@@ -405,10 +409,12 @@ export class AgentService {
         await this.updateWorkerCard(run, worker)
       }
     } finally {
-      run.handles.delete(identity.id)
+      if (!run.handles.get(identity.id)?.isAlive?.()) {
+        run.handles.delete(identity.id)
+        this.releaseWorkerSlot(run, identity.id)
+      }
       if (capability) this.capabilities.delete(capability)
       run.capabilityByIdentity.delete(identity.id)
-      this.releaseSlot()
       this.recomputeRun(run)
     }
   }
@@ -460,7 +466,8 @@ export class AgentService {
   }
 
   private async cancelTree(run: AgentRunRecord, reason: string): Promise<void> {
-    const activeSelf = !isTerminal(run.snapshot.status) && !run.cancelled
+    const activeSelf = (!isTerminal(run.snapshot.status) && !run.cancelled) || run.handles.size > 0
+    const failures: PromiseSettledResult<void>[] = []
     if (activeSelf) {
       run.cancelled = true
       for (const identityId of [...run.progressTimers.keys()]) this.clearProgressTimer(run, identityId)
@@ -472,18 +479,37 @@ export class AgentService {
         .map(childId => this.runs.get(childId))
         .filter((child): child is AgentRunRecord => !!child && this.treeHasActiveRun(child))
       if (children.length === 0) break
-      await Promise.allSettled(children.map(child => this.cancelTree(child, reason)))
+      const results = await Promise.allSettled(children.map(child => this.cancelTree(child, reason)))
+      failures.push(...results)
+      if (results.some(result => result.status === 'rejected')) break
     }
-    if (!activeSelf) return
-    await Promise.allSettled([...run.handles.values()].map(handle => handle.cancel(reason)))
+    if (!activeSelf) { throwCancellationFailures(failures); return }
+    failures.push(...await Promise.allSettled([...run.handles].map(async ([identityId, handle]) => {
+      await handle.cancel(reason)
+      if (handle.isAlive?.()) throw new Error(`${identityId}: Agent process is still alive after cancellation`)
+      run.handles.delete(identityId)
+      this.releaseWorkerSlot(run, identityId)
+    })))
+    if (failures.some(result => result.status === 'rejected')) {
+      const error = cancellationError(failures)
+      run.snapshot.status = 'failed'
+      run.snapshot.error = error.message
+      this.persist(run)
+      await this.deps.sendTextRaw(run.snapshot.chatId, `❌ Agent 取消未完成: ${error.message}`)
+        .catch(deliveryError => log(`agent: cancellation failure notice failed: ${messageOf(deliveryError)}`))
+      throw error
+    }
+    const cancelledWorkers: AgentWorkerResult[] = []
     for (const worker of run.snapshot.workers) {
       if (!isWorkerTerminal(worker.status)) {
         worker.status = 'cancelled'
         worker.error = reason
         worker.finishedAt = new Date().toISOString()
         delete worker.pendingInput
+        cancelledWorkers.push(worker)
       }
     }
+    await Promise.all(cancelledWorkers.map(worker => this.updateWorkerCard(run, worker)))
     await this.finalizeRun(run, 'cancelled', reason)
   }
 
@@ -534,9 +560,13 @@ export class AgentService {
       const landed = await this.deps.replaceElementChecked(
         run.cardId,
         cards.agentWorkerElementId(worker.identityId),
-        cards.agentWorkerElement(worker, cards.agentWorkerPreviewChars(run.snapshot.workers.length)),
+        cards.agentWorkerElement(worker, cards.agentWorkerPreviewChars(run.snapshot.workers.length), run.snapshot.workers.length === 1),
       )
       if (!landed) this.recordPresentationError(run, `agent worker card MISS: ${worker.identityName}`)
+      const progressLanded = await this.deps.replaceElementChecked(
+        run.cardId, cards.ELEMENTS.agentRunFooter, cards.agentRunFooterElement(run.snapshot),
+      )
+      if (!progressLanded) log(`agent: progress update MISS run=${run.snapshot.runId}; later updates will refresh it`)
       this.deps.patchSummaryThrottled(run.cardId, cards.agentRunSummary(run.snapshot))
     } catch (error) {
       this.recordPresentationError(run, `agent worker card update failed (${worker.identityName}): ${messageOf(error)}`)
@@ -610,6 +640,7 @@ export class AgentService {
   }
 
   private treeHasActiveRun(run: AgentRunRecord): boolean {
+    if (run.handles.size > 0) return true
     if (!isTerminal(run.snapshot.status)) return true
     for (const childId of run.children) {
       const child = this.runs.get(childId)
@@ -622,45 +653,27 @@ export class AgentService {
     const sessionKey = this.sessionKey(principal.session.sessionName, principal.session.chatId)
     const activeSessionRuns = [...this.runs.values()].filter(run =>
       this.sessionKey(run.snapshot.sessionName, run.snapshot.chatId) === sessionKey
-      && !isTerminal(run.snapshot.status)).length
+      && (!isTerminal(run.snapshot.status) || run.handles.size > 0)).length
     const startingSessionRuns = this.startingRunsBySession.get(sessionKey) ?? 0
     if (activeSessionRuns + startingSessionRuns >= MAX_SESSION_ACTIVE_RUNS) {
       throw new Error(`Session has reached ${MAX_SESSION_ACTIVE_RUNS} active Agent runs`)
     }
     const inflightWorkers = [...this.runs.values()].reduce((sum, run) =>
-      sum + run.snapshot.workers.filter(worker => !isWorkerTerminal(worker.status)).length, 0)
+      sum + run.snapshot.workers.filter(worker =>
+        !isWorkerTerminal(worker.status) || run.handles.get(worker.identityId)?.isAlive?.(),
+      ).length, 0)
     if (inflightWorkers + this.startingWorkers + workerCount > MAX_GLOBAL_INFLIGHT_WORKERS) {
       throw new Error(`global Agent worker limit ${MAX_GLOBAL_INFLIGHT_WORKERS} would be exceeded`)
     }
-    const subtreeKey = principal.kind === 'worker' ? principal.runId : null
-    if (subtreeKey) {
-      const activeSubtreeRuns = [...this.runs.values()].filter(run =>
-        !isTerminal(run.snapshot.status) && this.isRunInSubtree(run, subtreeKey)).length
-      const startingSubtreeRuns = this.startingRunsBySubtree.get(subtreeKey) ?? 0
-      if (activeSubtreeRuns + startingSubtreeRuns >= MAX_SUBTREE_ACTIVE_RUNS) {
-        throw new Error(`Agent subtree has reached ${MAX_SUBTREE_ACTIVE_RUNS} active runs`)
-      }
-    }
     this.startingWorkers += workerCount
     this.startingRunsBySession.set(sessionKey, startingSessionRuns + 1)
-    if (subtreeKey) this.startingRunsBySubtree.set(subtreeKey, (this.startingRunsBySubtree.get(subtreeKey) ?? 0) + 1)
     let released = false
     return () => {
       if (released) return
       released = true
       this.startingWorkers = Math.max(0, this.startingWorkers - workerCount)
       decrementMap(this.startingRunsBySession, sessionKey)
-      if (subtreeKey) decrementMap(this.startingRunsBySubtree, subtreeKey)
     }
-  }
-
-  private isRunInSubtree(run: AgentRunRecord, rootRunId: string): boolean {
-    let current: AgentRunRecord | undefined = run
-    while (current) {
-      if (current.snapshot.runId === rootRunId) return true
-      current = current.snapshot.parentRunId ? this.runs.get(current.snapshot.parentRunId) : undefined
-    }
-    return false
   }
 
   private sessionKey(sessionName: string, chatId: string): string {
@@ -687,11 +700,12 @@ export class AgentService {
 
   private releaseSlot(): void {
     const next = this.slotWaiters.shift()
-    if (next) {
-      next()
-      return
-    }
-    this.activeTurns = Math.max(0, this.activeTurns - 1)
+    if (next) { next(); return }
+    this.activeTurns--
+  }
+
+  private releaseWorkerSlot(run: AgentRunRecord, identityId: string): void {
+    if (run.slotOwners.delete(identityId)) this.releaseSlot()
   }
 
   private loadDurableRuns(): void {
@@ -714,6 +728,7 @@ export class AgentService {
         session: null,
         cardId: null,
         handles: new Map(),
+        slotOwners: new Set(),
         capabilityByIdentity: new Map(),
         progressTimers: new Map(),
         children: new Set(),
@@ -737,7 +752,7 @@ export class AgentService {
   private pruneRuns(): void {
     if (this.runs.size <= MAX_RETAINED_RUNS) return
     const terminal = [...this.runs.values()]
-      .filter(run => isTerminal(run.snapshot.status) && run.children.size === 0)
+      .filter(run => isTerminal(run.snapshot.status) && run.handles.size === 0 && run.slotOwners.size === 0 && run.children.size === 0)
       .sort((a, b) => Date.parse(a.snapshot.finishedAt ?? a.snapshot.createdAt) - Date.parse(b.snapshot.finishedAt ?? b.snapshot.createdAt))
     for (const run of terminal) {
       if (this.runs.size <= MAX_RETAINED_RUNS) break
@@ -826,6 +841,15 @@ function isAgentRunSnapshot(value: unknown): value is AgentRunSnapshot {
     && typeof run.createdAt === 'string'
 }
 
+function cancellationError(results: PromiseSettledResult<void>[]): AggregateError {
+  const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+  return new AggregateError(failures, `Agent cancellation failed: ${failures.map(messageOf).join('; ')}`)
+}
+
+function throwCancellationFailures(results: PromiseSettledResult<void>[]): void {
+  if (results.some(result => result.status === 'rejected')) throw cancellationError(results)
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -853,7 +877,7 @@ function assertArtifactName(name: string): void {
   if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`invalid Agent artifact name: ${name}`)
 }
 
-function decrementMap(map: Map<string, number>, key: string): void {
+function decrementMap<TKey>(map: Map<TKey, number>, key: TKey): void {
   const next = (map.get(key) ?? 0) - 1
   if (next > 0) map.set(key, next)
   else map.delete(key)

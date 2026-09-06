@@ -18,6 +18,8 @@ export interface AgentLaunchOptions {
   effort?: AgentReasoningEffort
   launch?: ConversationLaunch
   developerInstructions?: string
+  /** Only delegated workers disable delegation; main Sessions keep native capabilities. */
+  allowDelegation?: boolean
   profile?: ProjectProfile
   managedSkillPluginPath?: string
   hostEnv?: Record<string, string | undefined>
@@ -30,8 +32,8 @@ export interface CreatedAgentProcess {
 }
 
 /** Single source of truth for both the Feishu main Session and delegated
- * agents. Capability differences are expressed only by the caller's prompt;
- * this factory always launches the backend's full coding-agent surface. */
+ * agents. Workers use the same coding tools, with further delegation disabled
+ * according to the user's single-level delegation policy. */
 export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProcess {
   const source = opts.tokenSourceId ? getTokenSource(opts.tokenSourceId) : undefined
   if (opts.tokenSourceId && !source) throw new Error(`token source not found: ${opts.tokenSourceId}`)
@@ -73,6 +75,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
                 : {}),
             }),
         ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
+        ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
         ...(opts.profile ? { profile: opts.profile } : {}),
         ...(source ? { settingSources: source.settingSources ?? ['project', 'local'] } : {}),
         ...(opts.managedSkillPluginPath ? { managedSkillPluginPath: opts.managedSkillPluginPath } : {}),
@@ -92,6 +95,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
       effort: opts.effort,
       launch: opts.launch,
       ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
+      ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
       tokenSourceId: source?.id ?? null,
       transformEnv,
       hostEnv: opts.hostEnv,

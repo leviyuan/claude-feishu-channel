@@ -165,7 +165,7 @@ registerTokenSourceFactory({
       resolveSpawnModel(model: string): string | undefined {
         // [1m] 是 CLI 客户端侧后缀(剥后缀 + context-1m beta header,窗口按 1M 记账)。
         // 加不加 = 真实 turn 观测说了算(见 context-window-observe.ts):观测 1M 加、
-        // 观测/降级 200K 裸名、未观测默认加(端点不支持则首轮爆窗自动降级)。
+        // SDK 观测低于 1M 时使用裸名；未观测时保留已有 [1m] 路由约定。
         return resolveModelWithWindow('glm', model)
       },
       async verifyModel(model: string) {

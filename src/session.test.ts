@@ -203,8 +203,9 @@ function turnState(cardId = 'card_session_turn'): any {
     rotating: null,
     rotateCount: 0,
     failureRotateCount: 0,
-    cardWriteFailureNotified: false,
-    rotateGivenUp: false,
+    cardCapacityFailures: new Map(),
+    cardWriteFailureNotices: new Set(),
+    cardRotationFailed: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
   }
@@ -219,6 +220,31 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<vo
 }
 
 describe('Session fresh conversation state', () => {
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} shows the backend's concrete error in the final card`, async () => {
+      const session = new Session('backend-error-detail', 'chat_id') as any
+      const proc = new FakeAgentProc(provider, 'error-session')
+      const turn = turnState(`card_error_detail_${provider}`)
+      turn.provider = provider
+      turn.userOpenId = ''
+      session.proc = proc
+      session.currentTurn = turn
+      session.footerUsageSuffix = async () => ''
+      session.wireProc(proc)
+      cardkit.recordCardCreated(turn.cardId, 1)
+      proc.lastResult = { ...proc.lastResult, is_error: true, subtype: 'error_during_execution' }
+      try {
+        proc.emit('result', { is_error: true, error: 'Account quota exceeded: request was rejected' })
+        await session.waitForTurnCloses()
+        const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        expect(footer?.body.element).toContain('Account quota exceeded: request was rejected')
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
+
   test('resets visible turn numbering and per-conversation counters', () => {
     const session = new Session('probe', 'chat_id') as any
     session.turnCounter = 7
@@ -1086,6 +1112,48 @@ describe('Session automatic context compaction events', () => {
       await cardkit.dispose(turn.cardId)
     }
   })
+
+  for (const withStart of [false, true]) {
+    test(`an oversized compaction completion stops retrying unchanged content without blocking later output (start=${withStart})`, async () => {
+      const session = new Session('compact-oversized', 'chat_id') as any
+      const turn = turnState('card_compact_oversized_0')
+      turn.userOpenId = ''
+      session.currentTurn = turn
+      let replacementCount = 0
+      cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+        session.onCardWriteFailure(turn, 'card_compact_oversized_0', code, failure)
+      })
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+        const body = init?.body ? JSON.parse(String(init.body)) : null
+        calls.push({ method: String(init?.method ?? 'GET'), path, body })
+        const response = path === '/cards/id_convert'
+          ? { code: 0, data: { card_id: `card_compact_oversized_${++replacementCount}` } }
+          : String(body?.element ?? body?.elements).includes('✅ 🚨 上下文压缩')
+            ? { code: 200860, msg: 'card over max size' }
+            : { code: 0, data: {} }
+        return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+      }) as typeof fetch
+      const notice = { threadId: 'thread_oversized', turnId: 'turn_oversized', itemId: 'compact_oversized' }
+      try {
+        if (withStart) session.handleContextCompacted({ ...notice, phase: 'start' })
+        session.handleContextCompacted({ ...notice, phase: 'end' })
+        await waitUntil(() => !turn.contextCompactionCompleting.has('compact_oversized') && !turn.rotating)
+        expect(replacementCount).toBe(1)
+        expect(turn.contextCompactionCompleted.has('compact_oversized')).toBe(false)
+        expect(turn.cardRotationFailed).toBe(false)
+        expect(sentRawTexts).toHaveLength(1)
+        expect(sentRawTexts[0]).toContain('换卡后仍超出飞书容量，写入失败')
+        expect(await cardkit.addElementChecked(turn.cardId, {
+          tag: 'markdown', element_id: 'later_output', content: '后续回复仍可写入',
+        })).toBe(true)
+      } finally {
+        if (turn.rotating) await turn.rotating
+        session.stopFooterStatus(turn)
+        for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_compact_oversized_${i}`)
+      }
+    })
+  }
 
   test('a duplicate start-panel add reconciles with a terminal replace', async () => {
     const session = new Session('compact-start-add-retry', 'chat_id') as any
@@ -2203,6 +2271,60 @@ describe('Session turn close vs mid-turn rotation race', () => {
 
 describe('Session card size capacity', () => {
   for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} preserves live deltas and whitespace while earlier paragraphs migrate`, async () => {
+      const session = new Session('rotate-live-buffer', 'chat_id') as any
+      const turn = turnState('card_live_buffer_old')
+      turn.provider = provider
+      turn.userOpenId = ''
+      session.proc = new FakeAgentProc(provider, 'buffer-session')
+      session.currentTurn = turn
+      let migrationStarted!: () => void
+      let releaseMigration!: () => void
+      const started = new Promise<void>(resolve => { migrationStarted = resolve })
+      const gate = new Promise<void>(resolve => { releaseMigration = resolve })
+      cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+        session.onCardWriteFailure(turn, 'card_live_buffer_old', code, failure)
+      })
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+        const method = String(init?.method ?? 'GET')
+        const body = init?.body ? JSON.parse(String(init.body)) : null
+        calls.push({ method, path, body })
+        if (method === 'POST' && path === '/cards/card_live_buffer_new/elements'
+          && String(body.elements).includes('earlier paragraph')) {
+          migrationStarted()
+          await gate
+        }
+        const response = method === 'POST' && path === '/cards/card_live_buffer_old/elements'
+          ? { code: 200860, msg: 'card over max size' }
+          : { code: 0, data: path === '/cards/id_convert' ? { card_id: 'card_live_buffer_new' } : {} }
+        return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+      }) as typeof fetch
+      try {
+        session.appendAssistant('earlier paragraph')
+        session.finalizeCurrentAssistantSegment()
+        session.appendAssistant('hello ')
+        await started
+        session.appendAssistant('world')
+        session.finalizeCurrentAssistantSegment()
+        releaseMigration()
+        await turn.rotating
+        await session.closeTurnCard(undefined, { hasFreshResult: false })
+        const paragraphs = calls.filter(call => call.method === 'POST' && call.path === '/cards/card_live_buffer_new/elements')
+          .map(call => JSON.parse(call.body.elements)[0].content)
+        expect(paragraphs).toEqual(['earlier paragraph', 'hello world'])
+        expect(sentTexts).toEqual([])
+      } finally {
+        releaseMigration()
+        if (turn.rotating) await turn.rotating
+        session.stopFooterStatus(turn)
+        await cardkit.dispose('card_live_buffer_old')
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
     for (const operation of ['addElement', 'replaceElement', 'footer'] as const) {
       test(`${provider} preserves tool output when ${operation} exceeds card size below the element count limit`, async () => {
         const session = new Session('card-size', 'chat_id') as any
@@ -2253,7 +2375,7 @@ describe('Session card size capacity', () => {
           expect(turn.cardId).toBe(newCardId)
           expect(turn.rotateCount).toBe(1)
           expect(turn.failureRotateCount).toBe(1)
-          expect(turn.rotateGivenUp).toBe(false)
+          expect(turn.cardRotationFailed).toBe(false)
           expect(sentCards).toHaveLength(1)
           const migrated = calls.filter(call => call.path.startsWith(`/cards/${newCardId}/elements`))
           expect(JSON.stringify(migrated)).toContain('retained tool result')
@@ -2270,7 +2392,7 @@ describe('Session card size capacity', () => {
     }
   }
 
-  test('a tool too large for every replacement card exhausts the existing rotation cap', async () => {
+  test('an unchanged oversized tool reports its failure while later output stays writable', async () => {
     const session = new Session('card-size-persistent', 'chat_id') as any
     const turn = turnState('card_size_persistent_0')
     turn.userOpenId = ''
@@ -2285,7 +2407,7 @@ describe('Session card size capacity', () => {
       calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
       const response = path === '/cards/id_convert'
         ? { code: 0, data: { card_id: `card_size_persistent_${++replacementCount}` } }
-        : method === 'POST' && path.endsWith('/elements')
+        : method === 'POST' && path.endsWith('/elements') && String(init?.body).includes('超大工具结果')
           ? { code: 200860, msg: 'ErrMsg: card over max size;' }
           : { code: 0, data: {} }
       return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
@@ -2294,20 +2416,24 @@ describe('Session card size capacity', () => {
     try {
       sessionTools.addTool(session, 'oversized-tool', 'Bash', { command: '# desc: 超大工具结果\nprintf result' })
       await cardkit.flush('card_size_persistent_0')
-      for (let attempt = 0; attempt < 7 && !turn.rotateGivenUp; attempt++) {
-        await turn.rotating
-        await cardkit.flush(turn.cardId)
-      }
-      expect(replacementCount).toBe(5)
-      expect(turn.rotateGivenUp).toBe(true)
-      expect(turn.failureRotateCount).toBe(5)
-      expect(turn.footerStatusHandle).toBeNull()
-      expect(sentRawTexts.join('\n')).toContain('卡片容量超限换卡 5 次')
-      const before = calls.length
+      await waitUntil(() => replacementCount > 0 && !turn.rotating)
+      expect(replacementCount).toBe(1)
+      expect(turn.cardRotationFailed).toBe(false)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.footerStatusHandle).not.toBeNull()
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('换卡后仍超出飞书容量，写入失败')
+      expect(sentRawTexts[0]).toContain('其余输出继续处理')
       expect(await cardkit.addElementChecked(turn.cardId, {
-        tag: 'markdown', element_id: 'after_cap', content: 'x',
-      })).toBe(false)
-      expect(calls).toHaveLength(before)
+        tag: 'markdown', element_id: 'after_failure', content: '后续正文',
+      })).toBe(true)
+      sessionTools.addTool(session, 'later-tool', 'Bash', { command: '# desc: 后续工具\nprintf ok' })
+      await cardkit.flush(turn.cardId)
+      sessionTools.completeTool(session, 'later-tool', '后续工具结果', false)
+      await cardkit.flush(turn.cardId)
+      expect(JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`))))
+        .toContain('后续工具结果')
+      expect(replacementCount).toBe(1)
     } finally {
       if (turn.rotating) await turn.rotating
       session.stopFooterStatus(turn)
@@ -2358,12 +2484,75 @@ describe('Session workDir project profile override', () => {
   })
 })
 
-describe('Session rotate cap counts only failure-triggered rotations', () => {
-  // 2026-07-04 03:46 事故:turn 2 里 5 次正常满卡轮转(elementCount=50)把
-  // rotateCount 耗光,第 2 次真实写失败(300308)一来就撞 cap 放弃。cap 的
-  // 设计意图(session-types.ts)是只约束失败路径 —— 主动满卡轮转被真实输出
-  // 天然节流,不该消耗失败额度。
-  test('proactive full-card rotations do not consume the failure cap', async () => {
+describe('Session card pagination', () => {
+  for (const provider of ['codex', 'claude'] as const) {
+    for (const code of [200860, 300305]) {
+      test(`${provider} keeps identical tool results and the final reply visible after more than five capacity rotations (${code})`, async () => {
+        const session = new Session('unlimited-pagination', 'chat_id') as any
+        const turn = turnState('card_unlimited_0')
+        turn.provider = provider
+        turn.userOpenId = ''
+        session.proc = new FakeAgentProc(provider, 'native-session')
+        session.currentTurn = turn
+        let replacementCount = 0
+        const accepted = new Map<string, Set<string>>()
+        cardkit.recordCardCreated(turn.cardId, 1, (failureCode, failure) => {
+          session.onCardWriteFailure(turn, 'card_unlimited_0', failureCode, failure)
+        })
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+          const method = String(init?.method ?? 'GET')
+          const body = init?.body ? JSON.parse(String(init.body)) : null
+          calls.push({ method, path, body })
+          let response: any = { code: 0, data: {} }
+          if (path === '/cards/id_convert') {
+            response.data = { card_id: `card_unlimited_${++replacementCount}` }
+          } else if (method === 'POST' && path.endsWith('/elements')) {
+            const ids = accepted.get(path) ?? new Set<string>()
+            if (ids.size >= 1) response = { code, msg: 'card capacity exceeded' }
+            else {
+              ids.add(JSON.parse(body.elements)[0].element_id)
+              accepted.set(path, ids)
+            }
+          }
+          return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+        }) as typeof fetch
+
+        try {
+          // Every page contains the same text; successful pagination must not
+          // mistake a later, distinct tool call for a failed migration loop.
+          for (let i = 0; i < 10; i++) {
+            sessionTools.addTool(session, `tool_use_${i}`, 'Bash', { command: '# desc: 查看结果\nprintf result' })
+            await cardkit.flush(turn.cardId)
+            await waitUntil(() => !turn.rotating)
+            sessionTools.completeTool(session, `tool_use_${i}`, '相同的工具结果', false)
+            await cardkit.flush(turn.cardId)
+          }
+          expect(replacementCount).toBe(9)
+          expect(turn.failureRotateCount).toBe(9)
+          expect(turn.cardRotationFailed).toBe(false)
+          session.appendAssistant('完整的最终回复')
+          session.finalizeCurrentAssistantSegment()
+          await cardkit.flush(turn.cardId)
+          await waitUntil(() => !turn.rotating)
+          await session.closeTurnCard(undefined, { hasFreshResult: false })
+          expect(replacementCount).toBe(10)
+          expect(sentRawTexts).toEqual([])
+          expect(JSON.stringify(calls.filter(call => call.path === '/cards/card_unlimited_10/elements')))
+            .toContain('完整的最终回复')
+          const toolResults = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/tool_0'))
+          expect(toolResults).toHaveLength(10)
+          expect(toolResults.every(call => call.body.element.includes('相同的工具结果'))).toBe(true)
+        } finally {
+          if (turn.rotating) await turn.rotating
+          session.stopFooterStatus(turn)
+          for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_unlimited_${i}`)
+        }
+      })
+    }
+  }
+
+  test('proactive full-card rotations do not count as capacity failures', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-session-1')
     const turn = turnState('card_old')
@@ -2380,7 +2569,7 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
         message: 'component count exceeds limit',
       })
 
-      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.cardRotationFailed).toBe(false)
       expect(turn.rotating).not.toBeNull()
       await turn.rotating
       expect(turn.cardId).not.toBe('card_old') // 真的换到了新卡
@@ -2391,14 +2580,14 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     }
   })
 
-  test('give-up stops the footer ticker, blocks its restart, and kills card writes', async () => {
+  test('replacement-card send failure pauses the footer without poisoning the current card', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-session-1')
     const turn = turnState('card_dead')
     turn.userOpenId = ''
     session.currentTurn = turn
     cardkit.recordCardCreated('card_dead', 50)
-    turn.failureRotateCount = 5 // 失败额度已耗尽
+    const sendSpy = spyOn(feishu, 'sendCard').mockResolvedValue(null)
 
     try {
       session.startWritingFooter(turn)
@@ -2410,57 +2599,80 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
         code: 300305,
         message: 'component count exceeds limit',
       })
+      await turn.rotating
 
-      expect(turn.rotateGivenUp).toBe(true)
+      expect(turn.cardRotationFailed).toBe(true)
       expect(turn.rotating).toBeNull() // 不再尝试换卡
-      // 事故根因 1:log-only 后 footer 每秒 ticker 没停,对死卡刷了 11 分钟
-      // 663 条 300308。放弃时必须停表,且 phase 切换不能把它拉起来。
+      // 续卡失败时暂停 footer 定时刷新，真实输出到达后再恢复。
       expect(turn.footerStatusHandle).toBeNull()
       session.startWorkingFooter(turn)
       expect(turn.footerStatusHandle).toBeNull()
-      const cardsBeforeProactiveCheck = sentCards.length
-      session.maybeMidTurnRotate()
-      expect(sentCards.length).toBe(cardsBeforeProactiveCheck)
-      // log-only 语义:本轮剩余对该卡的写全部短路,不再打飞书。
+      // 续卡发送失败不证明旧卡全部不可写；新内容仍按实际写入结果处理。
       const before = calls.length
       await cardkit.replaceElement('card_dead', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
       await cardkit.addElement('card_dead', { tag: 'markdown', element_id: 'e_new', content: 'x' })
-      expect(calls.length).toBe(before)
-      // 告警文案说的是真实语义(换卡耗尽),不是「连续 N 次写入失败」
+      expect(calls.length).toBe(before + 2)
       expect(sentRawTexts.length).toBe(1)
-      expect(sentRawTexts[0]).toContain('换卡')
-      expect(sentRawTexts[0]).toContain('仅日志可见')
+      expect(sentRawTexts[0]).toContain('续卡发送失败')
+      expect(sentRawTexts[0]).toContain('后续内容到达时会再次尝试')
       expect(sentRawTexts[0]).not.toContain('连续 5 次写入失败')
     } finally {
+      sendSpy.mockRestore()
       session.stopFooterStatus(turn)
       await cardkit.dispose('card_dead')
     }
   })
 
-  test('a replacement-card send failure latches log-only and cannot retry forever', async () => {
-    const session = new Session('rotate-send-failure', 'chat_id') as any
-    const turn = turnState('card_rotate_send_failure')
-    turn.userOpenId = ''
-    session.currentTurn = turn
-    cardkit.recordCardCreated(turn.cardId, 50)
-    const sendSpy = spyOn(feishu, 'sendCard').mockResolvedValue(null)
-
-    try {
-      session.maybeMidTurnRotate()
-      await turn.rotating
-      expect(turn.rotateGivenUp).toBe(true)
-      expect(sentRawTexts).toHaveLength(1)
-      const attempts = sendSpy.mock.calls.length
-      session.maybeMidTurnRotate()
-      expect(sendSpy.mock.calls.length).toBe(attempts)
-    } finally {
-      sendSpy.mockRestore()
-      session.stopFooterStatus(turn)
-      await cardkit.dispose(turn.cardId)
+  for (const provider of ['codex', 'claude'] as const) {
+    for (const trigger of ['tool_result', 'turn_close'] as const) {
+      test(`${provider} recovers a failed replacement card on ${trigger}`, async () => {
+        const session = new Session('rotate-send-retry', 'chat_id') as any
+        const turn = turnState('card_rotate_send_retry')
+        turn.provider = provider
+        turn.userOpenId = ''
+        session.proc = new FakeAgentProc(provider, 'native-session')
+        session.currentTurn = turn
+        turn.toolByUseId.set('running-tool', {
+          i: 0, name: 'Bash', input: { command: '# desc: 运行任务\nprintf work' },
+        })
+        cardkit.recordCardCreated(turn.cardId, 50)
+        const sendSpy = spyOn(feishu, 'sendCard').mockResolvedValueOnce(null).mockResolvedValue('om_retry')
+        try {
+          session.maybeMidTurnRotate()
+          await turn.rotating
+          expect(turn.cardRotationFailed).toBe(true)
+          expect(turn.footerStatusHandle).toBeNull()
+          expect(sentRawTexts).toHaveLength(1)
+          if (trigger === 'tool_result') {
+            sessionTools.completeTool(session, 'running-tool', '恢复后完整的工具结果', false)
+            await turn.rotating
+            await cardkit.flush(turn.cardId)
+            expect(turn.cardRotationFailed).toBe(false)
+            expect(JSON.stringify(calls)).toContain('恢复后完整的工具结果')
+          } else {
+            turn.currentAssistantSegmentId = 'assistant_0'
+            turn.currentAssistantText = '完整的最终回复'
+            turn.segmentTexts.set('assistant_0', '完整的最终回复')
+            await session.closeTurnCard(undefined, { hasFreshResult: false })
+            expect(turn.cardRotationFailed).toBe(false)
+            expect(JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`))))
+              .toContain('完整的最终回复')
+            expect(sentTexts).toEqual([])
+          }
+          expect(sendSpy).toHaveBeenCalledTimes(2)
+          expect(sentRawTexts).toHaveLength(1)
+        } finally {
+          if (turn.rotating) await turn.rotating
+          sendSpy.mockRestore()
+          session.stopFooterStatus(turn)
+          await cardkit.dispose('card_rotate_send_retry')
+          await cardkit.dispose(turn.cardId)
+        }
+      })
     }
-  })
+  }
 
-  test('repeated validation/content failures stay on the current card and warn once', async () => {
+  test('distinct validation/content failures stay on the current card and are each reported', async () => {
     const session = new Session('validation-no-rotate', 'chat_id') as any
     const turn = turnState('card_validation')
     turn.userOpenId = ''
@@ -2497,10 +2709,10 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       expect(turn.rotating).toBeNull()
       expect(turn.rotateCount).toBe(0)
       expect(turn.failureRotateCount).toBe(0)
-      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.cardRotationFailed).toBe(false)
       expect(sentCards).toHaveLength(0)
       expect(calls.some(call => call.path === '/cards/id_convert')).toBe(false)
-      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(2)
       expect(sentRawTexts[0]).toContain('未识别为卡片容量超限')
     } finally {
       await cardkit.dispose(turn.cardId)
@@ -3536,13 +3748,13 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       await cardkit.flush(turn.cardId)
       expect(footerAttempts).toBe(1)
       expect(sentRawTexts).toHaveLength(0)
-      expect(turn.cardWriteFailureNotified).toBe(false)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
 
       session.startWritingFooter(turn)
       await cardkit.flush(turn.cardId)
       expect(footerAttempts).toBe(2)
       expect(sentRawTexts).toHaveLength(0)
-      expect(turn.cardWriteFailureNotified).toBe(false)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)

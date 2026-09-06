@@ -101,6 +101,43 @@ describe('cardkit card operations', () => {
     await cardkit.dispose(cardId)
   })
 
+  test('capacity fingerprints follow accepted content across renumbering, updates and deletions', async () => {
+    const ids = ['card_fingerprint_old', 'card_fingerprint_new']
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Response(JSON.stringify(String(init?.body).includes('oversized')
+        ? { code: 200860, msg: 'card over max size' }
+        : { code: 0, data: {} }), { headers: { 'Content-Type': 'application/json' } })
+    ) as typeof fetch
+    const element = (id: string, content: string) => ({
+      tag: 'column_set', element_id: id,
+      columns: [{ tag: 'column', elements: [{ tag: 'markdown', element_id: `${id}_text`, content }] }],
+    })
+    const reject = async (cardId: string, id: string) => {
+      const result = await cardkit.addElementResult(cardId, element(id, 'oversized'))
+      expect(result.landed).toBe(false)
+      expect(result.failure?.capacityFingerprint).toMatch(/^[a-f0-9]{64}$/)
+      return result.failure!.capacityFingerprint
+    }
+    try {
+      for (const id of ids) cardkit.recordCardCreated(id, 2)
+      await cardkit.addElement(ids[0]!, element('tool_0', 'previous'))
+      await cardkit.replaceElement(ids[0]!, 'tool_0', element('tool_0', 'current'))
+      const old = await reject(ids[0]!, 'assistant_5')
+      await cardkit.addElement(ids[1]!, element('tool_7', 'current'))
+      await cardkit.replaceElement(ids[1]!, 'footer', { tag: 'markdown', content: 'Thinking(17s)' })
+      expect(await reject(ids[1]!, 'assistant_0')).toBe(old)
+      await cardkit.replaceElement(ids[1]!, 'tool_7', element('tool_7', 'new output'))
+      expect(await reject(ids[1]!, 'assistant_1')).not.toBe(old)
+      await cardkit.deleteElement(ids[0]!, 'tool_0')
+      await cardkit.deleteElement(ids[1]!, 'tool_7')
+      const empty = await reject(ids[0]!, 'assistant_6')
+      expect(empty).not.toBe(old)
+      expect(await reject(ids[1]!, 'assistant_2')).toBe(empty)
+    } finally {
+      for (const id of ids) await cardkit.dispose(id)
+    }
+  })
+
   test('serializes safe markdown while preserving structured image components', async () => {
     const cardId = 'card_markdown_image_boundary'
     cardkit.recordCardCreated(cardId, 1)
@@ -182,23 +219,85 @@ describe('cardkit card operations', () => {
   })
 })
 
-describe('cardkit write-dead card', () => {
-  test('markCardWriteDead makes all subsequent writes no-ops', async () => {
-    cardkit.recordCardCreated('card_wd', 3)
-    cardkit.markCardWriteDead('card_wd')
-
-    await cardkit.addElement('card_wd', { tag: 'markdown', element_id: 'e1', content: 'x' })
-    await cardkit.replaceElement('card_wd', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
-    await cardkit.deleteElement('card_wd', 'e1')
-    await cardkit.patchSettings('card_wd', { config: {} })
-
-    expect(calls.length).toBe(0)
-    expect(cardkit.getElementCount('card_wd')).toBe(3)
-    await cardkit.dispose('card_wd')
-  })
-})
-
 describe('checked card writes', () => {
+  test('a queued tool result recreates a failed placeholder with its latest content and original placement', async () => {
+    const id = 'card_retry_missing_add'
+    cardkit.recordCardCreated(id, 1)
+    let attempt = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+      calls.push({ method: String(init?.method), path, body: JSON.parse(String(init?.body)) })
+      return new Response(JSON.stringify(++attempt === 1
+        ? { code: 300308, msg: 'temporary service error' }
+        : { code: 0, data: {} }), { headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+    try {
+      const added = cardkit.addElementChecked(id, {
+        tag: 'markdown', element_id: 'tool_0', content: 'working',
+      }, { type: 'insert_before', targetElementId: 'footer' })
+      const completed = cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'complete result',
+      })
+      expect(await added).toBe(false)
+      expect(await completed).toBe(true)
+      expect(calls.map(call => call.method)).toEqual(['POST', 'POST'])
+      expect(calls[1]!.body.target_element_id).toBe('footer')
+      expect(calls[1]!.body.elements).toContain('complete result')
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(false)
+      expect(cardkit.getElementCount(id)).toBe(2)
+    } finally {
+      await cardkit.dispose(id)
+    }
+  })
+
+  test('a rejected update can recover while explicitly deleted elements stay deleted', async () => {
+    const id = 'card_retry_failed_update'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElementChecked(id, { tag: 'markdown', element_id: 'tool_0', content: 'working' })
+    const succeed = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 200860, msg: 'card over max size' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    try {
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'oversized result',
+      })).toBe(false)
+      globalThis.fetch = succeed
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'updated result',
+      })).toBe(true)
+      expect(await cardkit.deleteElementChecked(id, 'tool_0')).toBe(true)
+      const before = calls.length
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'late result',
+      })).toBe(false)
+      expect(calls).toHaveLength(before)
+    } finally {
+      await cardkit.dispose(id)
+    }
+  })
+
+  test('deleting after a failed update actually removes the remote element', async () => {
+    const id = 'card_delete_after_failed_update'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElementChecked(id, { tag: 'markdown', element_id: 'tool_0', content: 'old content' })
+    const succeed = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300308, msg: 'temporary error' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    try {
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'new content',
+      })).toBe(false)
+      globalThis.fetch = succeed
+      expect(await cardkit.deleteElementChecked(id, 'tool_0')).toBe(true)
+      expect(calls.at(-1)?.method).toBe('DELETE')
+      expect(cardkit.getElementCount(id)).toBe(1)
+    } finally {
+      await cardkit.dispose(id)
+    }
+  })
+
   test('patchSettingsChecked reports whether the terminal PATCH landed', async () => {
     const cardId = 'card_checked_settings'
     cardkit.recordCardCreated(cardId, 1)
@@ -331,6 +430,25 @@ describe('checked card writes', () => {
 })
 
 describe('disposed card write guard (review #3)', () => {
+  test('closed cards stay unwritable after thousands of newer cards, and unknown cards are never created by a write', async () => {
+    const id = 'card_closed_long_ago'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.dispose(id)
+    for (let i = 0; i < 5001; i++) {
+      const newer = `card_disposal_${i}`
+      cardkit.recordCardCreated(newer, 1)
+      await cardkit.dispose(newer)
+    }
+    for (const target of [id, 'never_registered']) {
+      expect(cardkit.isDisposed(target)).toBe(true)
+      expect(await cardkit.addElementChecked(target, {
+        tag: 'markdown', element_id: 'late', content: 'late output',
+      })).toBe(false)
+      expect(await cardkit.patchSettingsChecked(target, { config: { streaming_mode: true } })).toBe(false)
+    }
+    expect(calls).toEqual([])
+  })
+
   test('dispose 后 addElement/replaceElement 不产生 HTTP 调用', async () => {
     const cardId = 'card_disposed_guard'
     cardkit.recordCardCreated(cardId, 1)

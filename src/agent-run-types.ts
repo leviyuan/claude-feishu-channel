@@ -80,6 +80,7 @@ export interface AgentRunSnapshot {
   promptArtifact?: string
   parentRunId?: string
   parentKind?: 'delegate' | 'follow_up'
+  /** Legacy history metadata. New tasks are always main-Agent delegates (0). */
   depth: number
   status: AgentRunStatus
   workers: AgentWorkerResult[]

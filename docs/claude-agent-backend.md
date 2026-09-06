@@ -46,7 +46,9 @@ Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行
 
 `claude-agent-process.ts` 将 SDK 文本、工具、结果、用量、压缩和后台任务转换成 `AgentProcess` 事件。共享事件由 Session 和卡片消费，保留两种后端在初始化、上下文和后台任务上的差异。
 
-委派 Agent 使用完整工具集和项目 MCP，并拥有独立、可撤销的调用凭据。`AgentService` 负责并发、父子运行关系、输入回填、原生会话续跑和递归取消。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
+委派只有一层：主 Agent 可以并行派工、回答问题和续跑原生会话，被委派的 Agent 不得继续调用其他 Agent。Skill、worker 提示词及运行时入口共同遵循该规则；worker 关闭 Codex `multi_agent` 或 Claude `Agent`/`Task`，保留其余代码工具、项目 MCP 和独立调用凭据。历史父子记录仍保留以便读取与清理。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
+
+委派卡片将整体进度放在顶部，按执行者展示结果、待回答问题和失败原因。单个 Agent 的完成结果默认展开，多个 Agent 的结果分别折叠；不展示 depth、session id 或 request id。
 
 ## 源码与验证
 

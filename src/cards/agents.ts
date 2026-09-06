@@ -22,7 +22,7 @@ export function agentIdentityListCard(opts: AgentIdentityListCardOpts): object {
     element_id: ELEMENTS.agentIdentityPanel,
     content: [
       '**全局 Agent 身份**',
-      '每个 Token Source 的每个模型都是一个可直接执行任务的完整 Agent；具体约束完全来自主 Agent 传入的 prompt。',
+      '选择一个或多个 Agent 执行任务，由主 Agent 统一分配和汇总结果。',
       `目录第 ${opts.page + 1}/${opts.totalPages} 页`,
     ].join('\n'),
   }]
@@ -41,7 +41,7 @@ export function agentIdentityListCard(opts: AgentIdentityListCardOpts): object {
   return {
     schema: '2.0',
     config: { update_multi: true },
-    header: { title: { tag: 'plain_text', content: '🧠 agents' }, template: 'purple' },
+    header: { title: { tag: 'plain_text', content: '🧠 可用 Agent' }, template: 'purple' },
     body: { elements },
   }
 }
@@ -56,54 +56,58 @@ export function agentRunCard(run: AgentRunSnapshot): object {
       summary: { content: agentRunSummary(run) },
     },
     header: {
-      title: { tag: 'plain_text', content: `🧠 agent · depth ${run.depth}` },
-      template: run.status === 'failed' ? 'red' : run.status === 'completed' ? 'green' : run.status === 'needs_input' ? 'orange' : 'purple',
+      title: { tag: 'plain_text', content: `🧠 ${run.parentKind === 'follow_up' ? '继续委派任务' : '委派任务'} · ${run.workers.length} 位 Agent` },
+      template: 'purple',
     },
     body: {
       elements: [
+        agentRunFooterElement(run),
         {
           tag: 'collapsible_panel',
-          header: { title: { tag: 'plain_text', content: run.parentKind === 'follow_up' ? '续跑 prompt' : '任务 prompt' } },
+          header: { title: { tag: 'plain_text', content: `任务说明 · ${shortText(run.prompt, 56)}` } },
           expanded: false,
           elements: [{ tag: 'markdown', content: promptPreview(run.prompt) }],
         },
-        ...run.workers.map(worker => agentWorkerElement(worker, previewChars)),
-        agentRunFooterElement(run),
+        ...run.workers.map(worker => agentWorkerElement(worker, previewChars, run.workers.length === 1)),
       ],
     },
   }
 }
 
-export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS): object {
+export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS, expandResult = false): object {
   const status = workerStatusLabel(worker)
-  const body: string[] = [`**${escapeMarkdown(status)}**`]
+  const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
+  if (worker.durationMs != null) body.push(`用时 ${durationLabel(worker.durationMs)}`)
+  if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
   if (worker.pendingInput) {
     body.push('', '**等待主 Agent 回答**')
     for (const question of worker.pendingInput.questions) {
       body.push(`- ${escapeMarkdown(question.question)}`)
       if (question.options.length) body.push(`  选项：${question.options.map(option => inlineCode(option.label)).join(' / ')}`)
     }
-    body.push(`request: ${inlineCode(worker.pendingInput.requestId)}`)
   }
-  if (worker.output) body.push('', truncate(sanitizeMarkdownForCardKit(worker.output), outputPreviewChars))
-  if (worker.error) body.push('', `<font color='red'>${sanitizeMarkdownForCardKit(worker.error)}</font>`)
+  if (worker.error) body.push('', worker.status === 'cancelled' ? '**停止原因**' : '**失败原因**', sanitizeMarkdownForCardKit(worker.error))
+  if (worker.output) body.push('', worker.status === 'failed' || worker.status === 'cancelled' ? '**已生成的内容**' : '**结果**', truncate(sanitizeMarkdownForCardKit(worker.output), outputPreviewChars))
   if (!worker.output && !worker.error && !worker.pendingInput) {
-    body.push('', worker.status === 'completed' ? '_Agent 已完成，没有正文输出。_' : '_等待结果…_')
+    body.push('', worker.status === 'completed'
+      ? '_任务已完成，没有正文输出。_'
+      : worker.status === 'cancelled'
+        ? '_任务已取消。_'
+        : worker.status === 'queued' ? '_等待开始执行。_' : '_正在执行任务，结果会显示在这里。_')
   }
   if (worker.steps.length) {
     body.push('', '**最近动作**')
-    for (const step of worker.steps.slice(-8)) {
-      const icon = step.phase === 'completed' ? '✓' : step.phase === 'started' ? '→' : '·'
-      body.push(`- ${icon} ${inlineCode(step.tool)} ${escapeMarkdown(shortText(step.detail, 180))}`)
+    for (const step of worker.steps.slice(-3)) {
+      const icon = step.tool === 'tool error' ? '❌' : step.phase === 'completed' ? '✓' : step.phase === 'started' ? '→' : '·'
+      const label = step.tool === 'tool error' ? '工具执行失败' : step.tool === 'tool result' ? '工具执行完成' : step.tool
+      body.push(`- ${icon} ${inlineCode(label)} ${escapeMarkdown(shortText(step.detail, 180))}`)
     }
   }
-  body.push('', `${inlineCode(worker.tokenSourceId)} · ${inlineCode(worker.model)} · ${inlineCode(worker.effort)}`)
-  if (worker.sessionId) body.push(`session: ${inlineCode(worker.sessionId)}`)
   return {
     tag: 'collapsible_panel',
     element_id: agentWorkerElementId(worker.identityId),
     header: { title: { tag: 'plain_text', content: `${status} · ${shortText(worker.identityName, 48)}` } },
-    expanded: worker.status === 'failed' || worker.status === 'needs_input',
+    expanded: worker.status === 'failed' || worker.status === 'needs_input' || (expandResult && worker.status === 'completed' && !!worker.output),
     elements: [{ tag: 'markdown', content: body.join('\n') }],
   }
 }
@@ -112,21 +116,24 @@ export function agentRunFooterElement(run: AgentRunSnapshot): object {
   const completed = run.workers.filter(item => item.status === 'completed').length
   const failed = run.workers.filter(item => item.status === 'failed').length
   const waiting = run.workers.filter(item => item.status === 'needs_input').length
-  const label = run.status === 'completed'
-    ? '✅ Agent 完成'
-    : run.status === 'failed'
-      ? '❌ Agent 失败'
-      : run.status === 'cancelled'
-        ? '🛑 Agent 已取消'
-        : run.status === 'needs_input'
-          ? '❓ 等待主 Agent 输入'
-          : run.status === 'queued'
-            ? '⏳ Agent 排队中'
-            : '⏳ Agent 运行中'
+  const running = run.workers.filter(item => item.status === 'running').length
+  const queued = run.workers.filter(item => item.status === 'queued').length
+  const cancelled = run.workers.filter(item => item.status === 'cancelled').length
+  const counts = [
+    running ? `执行中 ${running}` : '', queued ? `排队 ${queued}` : '',
+    waiting ? `待答 ${waiting}` : '', failed ? `失败 ${failed}` : '', cancelled ? `已取消 ${cancelled}` : '',
+  ].filter(Boolean)
+  const duration = run.finishedAt ? Date.parse(run.finishedAt) - Date.parse(run.createdAt) : null
+  const lines = [
+    `**${runStatusLabel(run)}** · 完成 ${completed}/${run.workers.length}`,
+    ...(counts.length ? [counts.join(' · ')] : []),
+    ...(duration != null && Number.isFinite(duration) ? [`⏱ 用时 ${durationLabel(duration)}`] : []),
+    ...(run.error ? [escapeMarkdown(run.error)] : []),
+  ]
   return {
     tag: 'markdown',
     element_id: ELEMENTS.agentRunFooter,
-    content: `${label} · 完成 ${completed}/${run.workers.length} · 等待 ${waiting} · 失败 ${failed}`,
+    content: lines.join('\n'),
   }
 }
 
@@ -141,17 +148,16 @@ export function agentWorkerPreviewChars(workerCount: number): number {
 
 export function agentRunSummary(run: AgentRunSnapshot): string {
   const done = run.workers.filter(item => item.status === 'completed').length
-  const icon = run.status === 'completed' ? '✅' : run.status === 'failed' ? '❌' : run.status === 'cancelled' ? '🛑' : run.status === 'needs_input' ? '❓' : '⏳'
-  return `${icon} agent · ${done}/${run.workers.length} · depth ${run.depth}`
+  return `${runStatusLabel(run)} · ${done}/${run.workers.length}`
 }
 
 function identityRow(identity: AgentIdentity): object {
   const ready = identity.status === 'ready'
-  const detail = ready ? 'ready' : `${identity.status}: ${identity.reason ?? 'MISS'}`
+  const detail = ready ? '可用' : `不可用：${identity.reason ?? 'MISS'}`
   return {
     tag: 'markdown',
     content: [
-      `**${escapeMarkdown(identity.displayName)}** ${identity.sourceDefault ? '· default' : ''}`,
+      `**${escapeMarkdown(identity.displayName)}** ${identity.sourceDefault ? '· 默认' : ''}`,
       `${inlineCode(identity.id)}\n${inlineCode(identity.model)} · 默认 ${inlineCode(identity.defaultEffort)} · ${escapeMarkdown(detail)}`,
     ].join('\n'),
   }
@@ -195,16 +201,37 @@ function isTerminal(status: AgentRunSnapshot['status']): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled'
 }
 
+function runStatusLabel(run: AgentRunSnapshot): string {
+  switch (run.status) {
+    case 'completed': return '✅ 委派完成'
+    case 'failed': return '❌ 委派失败'
+    case 'cancelled': return '🛑 委派已取消'
+    case 'needs_input': return '❓ 等待主 Agent 回复'
+    case 'queued': return '⏳ 等待执行'
+    case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
+      ? '⏳ 正在收尾' : '⏳ 正在执行'
+  }
+}
+
+function durationLabel(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`
+}
+
 function promptPreview(value: string): string {
   const sanitized = sanitizeMarkdownForCardKit(value)
   if (sanitized.length <= PROMPT_PREVIEW_CHARS) return sanitized
-  const receipt = '_卡片 prompt 预览已截断；完整 prompt 已原样交给 Agent 并持久化。_'
+  const receipt = '_这里仅显示任务预览，Agent 使用的是完整任务内容。_'
   return `${sanitized.slice(0, PROMPT_PREVIEW_CHARS - receipt.length - 2)}\n\n${receipt}`
 }
 
 function truncate(value: string, max: number): string {
   if (value.length <= max) return value
-  const receipt = '_卡片输出已截断，完整结果由 CLI/API 返回。_'
+  const receipt = '_这里仅显示结果预览，完整内容已保存。_'
   return `${value.slice(0, Math.max(0, max - receipt.length - 2))}\n\n${receipt}`
 }
 

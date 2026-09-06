@@ -10,7 +10,7 @@ const {
   claudeTranscriptPath,
   readLastCallUsageFromTranscript,
   readProjectMcpServers,
-  resetClaudeContextWindowMaxCache,
+  resetClaudeContextWindowCache,
   resolveClaudeExecutableConfig,
   settingSourcesFromProfile,
   toolsFromProfile,
@@ -21,9 +21,9 @@ const {
 } = await import('./claude-models')
 const { config } = await import('./config')
 
-// context window max 是 daemon 全局缓存(按路由 key 跨 session 共享),
+// context window 是 daemon 全局缓存(按路由 key 跨 session 共享),
 // 每个用例前重置,避免互相污染。
-beforeEach(() => resetClaudeContextWindowMaxCache())
+beforeEach(() => resetClaudeContextWindowCache())
 
 describe('Claude model profiles', () => {
   test('loads daemon-managed Skills as a plugin only when user settings are excluded', () => {
@@ -912,9 +912,7 @@ describe('Claude token accounting', () => {
   })
 
   test('single SDK context-window report becomes the locked denominator', () => {
-    // 分母取该路由 SDK contextWindow 的全局历史 max;单次上报 → max 即该值。
-    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.2[1m] → 1M)跑几轮才上报,
-    // 见下方 lock-max 与跨 session 共享测试。
+    // 优先采用 SDK 当前明确上报的窗口。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -951,9 +949,8 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextTokens).toBeNull()
   })
 
-  test('context window locks to historical max and never decreases', () => {
-    // 分母锁定 SDK 历史 max(单调不降):首轮回落默认 200K,真实窗口 1M 上报
-    // 后升上去,再回 200K / 异常 258K 都不再覆盖 → 百分比不会忽高忽低。
+  test('context window follows fresh reports even when capacity decreases', () => {
+    // 新上报的窗口无论变大还是变小，都不能被历史缓存覆盖。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -982,15 +979,14 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextWindow).toBe(1_000_000) // 升到真实窗口
     expect(events[1].contextWindow).toBe(1_000_000)
     result(200_000)
-    expect(proc.lastContextWindow).toBe(1_000_000) // 不降
-    expect(events[2].contextWindow).toBe(1_000_000)
+    expect(proc.lastContextWindow).toBe(200_000)
+    expect(events[2].contextWindow).toBe(200_000)
     result(258_000)
-    expect(proc.lastContextWindow).toBe(1_000_000) // 异常值也不覆盖
+    expect(proc.lastContextWindow).toBe(258_000)
   })
 
-  test('context window max is shared across sessions (daemon-global per route)', () => {
-    // 全局锁定:任一 session 探测到真实窗口后, 同路由的其它 session 立即用作
-    // 分母, 不各自首轮回落 200K。context window 是路由属性, 与 session 无关。
+  test('fresh context windows update their route without crossing sources', () => {
+    // 同路由新的 SDK 上报可更新缓存，不同来源与路由仍然隔离。
     const proc1 = new ClaudeAgentProcess({
       workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'glm',
     }) as any
@@ -1002,7 +998,7 @@ describe('Claude token accounting', () => {
     })
     expect(proc1.lastContextWindow).toBe(1_000_000)
 
-    // 全新 session/实例, 同路由; 即便 SDK 首轮报 200K 也立即取全局锁定的 1M
+    // 同路由的新实例收到更小的明确数值，应采用该值。
     const proc2 = new ClaudeAgentProcess({
       workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'glm',
     }) as any
@@ -1012,7 +1008,7 @@ describe('Claude token accounting', () => {
       usage: { input_tokens: 1000, output_tokens: 10 },
       modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
     })
-    expect(proc2.lastContextWindow).toBe(1_000_000) // 全局锁定, 不是首轮 200K
+    expect(proc2.lastContextWindow).toBe(200_000)
 
     // 不同路由不串扰:default 路由的探测独立于 glm 路由
     const proc3 = new ClaudeAgentProcess({
@@ -1036,6 +1032,29 @@ describe('Claude token accounting', () => {
       modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
     })
     expect(proc4.lastContextWindow).toBe(200_000) // 同 model slug、不同 source 不串扰
+  })
+
+  test('context errors preserve the observed window and expose the actual SDK error list', async () => {
+    const { observedContextWindow } = await import('./context-window-observe')
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'audit-window[1m]', tokenSourceId: 'audit-window-source',
+    }) as any
+    const results: any[] = []
+    proc.on('result', (result: any) => results.push(result))
+    proc.handleMessage({
+      type: 'result', subtype: 'success', session_id: 'window-session', is_error: false,
+      modelUsage: { 'audit-window[1m]': { inputTokens: 100, outputTokens: 10, contextWindow: 1_000_000 } },
+    })
+    proc.handleMessage({
+      type: 'result', subtype: 'error_during_execution', session_id: 'window-session', is_error: true,
+      result: 'prompt is too long', errors: ['Request exceeds the context window', 'Reduce this request'],
+      modelUsage: {},
+    })
+    expect(observedContextWindow('audit-window-source', 'audit-window')).toBe(1_000_000)
+    expect(proc.opts.model).toBe('audit-window[1m]')
+    expect(results.at(-1)).toMatchObject({
+      is_error: true, error: 'Request exceeds the context window\nReduce this request',
+    })
   })
 
   test('context window stays null when SDK does not report one', () => {
